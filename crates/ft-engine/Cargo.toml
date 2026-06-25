@@ -1,0 +1,35 @@
+[package]
+name = "ft-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ft-core = { workspace = true }
+ft-hash = { workspace = true }
+ft-chunker = { workspace = true }
+ft-block = { workspace = true }
+ft-manifest = { workspace = true }
+ft-fsmap = { workspace = true }
+ft-index = { workspace = true }
+ft-vault = { workspace = true }
+ft-coordinator = { workspace = true }
+ft-watcher = { workspace = true }
+ft-diff = { workspace = true }
+ft-conflict = { workspace = true }
+
+tokio = { workspace = true }
+walkdir = { workspace = true }
+rand = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+convex = "0.10"

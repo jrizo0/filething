@@ -1,0 +1,12 @@
+[package]
+name = "ft-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ft-core = { workspace = true }
+ft-hash = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

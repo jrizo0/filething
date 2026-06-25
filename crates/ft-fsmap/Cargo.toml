@@ -1,0 +1,13 @@
+[package]
+name = "ft-fsmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ft-core = { workspace = true }
+thiserror = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

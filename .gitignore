@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+
+# Node / Bun / Turborepo
+node_modules/
+.turbo/
+dist/
+*.tsbuildinfo
+.convex/
+
+# Local data
+*.db
+*.db-shm
+*.db-wal
+.filething/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

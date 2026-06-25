@@ -1,0 +1,38 @@
+[package]
+name = "filething"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "filething"
+path = "src/main.rs"
+
+[dependencies]
+ft-engine = { workspace = true }
+ft-daemon = { workspace = true }
+# Foundation crates the CLI touches directly while orchestrating the engine:
+# the FS adapter (status mount), manifest::build (local-change detection),
+# FileType (ls output), and Index (opening a Space's local index).
+ft-core = { workspace = true }
+ft-fsmap = { workspace = true }
+ft-manifest = { workspace = true }
+ft-index = { workspace = true }
+ft-vault = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# To read the single space_state row out of a Space's local index when resolving
+# a dir to its Space id (ft-index keys space_state by id, no "only row" getter).
+rusqlite = { workspace = true }
+# The CLI builds the Coordinator's ConvexClient itself so it can attach admin
+# auth (self-hosted MVP); the same pattern the engine's live tests use.
+convex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

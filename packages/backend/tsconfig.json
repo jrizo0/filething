@@ -1,0 +1,25 @@
+{
+  /* Convex backend tsconfig. Scopes type-checking to the convex/ functions dir.
+     Mirrors the config `convex dev`/`convex codegen` expect. */
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "strict": true,
+    "noEmit": true,
+    "isolatedModules": true,
+
+    /* Convex codegen writes generated server/client types here. */
+    "jsx": "react-jsx"
+  },
+  "include": ["convex/**/*.ts", "convex/_generated/**/*"],
+  "exclude": ["node_modules"]
+}

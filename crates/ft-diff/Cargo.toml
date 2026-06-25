@@ -1,0 +1,20 @@
+[package]
+name = "ft-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ft-core = { workspace = true }
+ft-hash = { workspace = true }
+ft-block = { workspace = true }
+ft-manifest = { workspace = true }
+ft-fsmap = { workspace = true }
+ft-vault = { workspace = true }
+async-trait = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "ft-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ft-core = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# S3 backend (MinIO local / Cloudflare R2). Path-style addressing.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

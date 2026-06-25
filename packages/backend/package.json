@@ -1,0 +1,19 @@
+{
+  "name": "@filething/backend",
+  "private": true,
+  "version": "0.0.0",
+  "description": "filething Coordinator — Convex backend (control plane). Stores manifest metadata, the Space head, the Revision chain and pairing — never file bytes.",
+  "type": "module",
+  "scripts": {
+    "dev": "convex dev",
+    "codegen": "convex codegen",
+    "deploy": "convex deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "convex": "^1.27.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

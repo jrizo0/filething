@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ft-core",
+    "crates/ft-hash",
+    "crates/ft-chunker",
+    "crates/ft-block",
+    "crates/ft-manifest",
+    "crates/ft-fsmap",
+    "crates/ft-index",
+    "crates/ft-vault",
+    "crates/ft-coordinator",
+    "crates/ft-watcher",
+    "crates/ft-diff",
+    "crates/ft-conflict",
+    "crates/ft-engine",
+    "crates/ft-daemon",
+    "apps/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+# Internal crates (path deps) — declared here so members reference them with { workspace = true }.
+ft-core = { path = "crates/ft-core" }
+ft-hash = { path = "crates/ft-hash" }
+ft-chunker = { path = "crates/ft-chunker" }
+ft-block = { path = "crates/ft-block" }
+ft-manifest = { path = "crates/ft-manifest" }
+ft-fsmap = { path = "crates/ft-fsmap" }
+ft-index = { path = "crates/ft-index" }
+ft-vault = { path = "crates/ft-vault" }
+ft-coordinator = { path = "crates/ft-coordinator" }
+ft-watcher = { path = "crates/ft-watcher" }
+ft-diff = { path = "crates/ft-diff" }
+ft-conflict = { path = "crates/ft-conflict" }
+ft-engine = { path = "crates/ft-engine" }
+ft-daemon = { path = "crates/ft-daemon" }
+
+# Common external dependencies — members opt in with { workspace = true }.
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+thiserror = "2"
+anyhow = "1"
+blake3 = "1"
+hex = "0.4"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+bytes = "1"
+tracing = "0.1"
+# Pre-declarados para Fase 1 (evita contienda en Cargo.lock entre agentes paralelos).
+unicode-normalization = "0.1"  # ft-fsmap: NFC solo en la key
+walkdir = "2"                   # ft-fsmap / ft-engine: recorrer el arbol del Space
+futures = "0.3"                 # ft-coordinator / ft-diff: streams del change feed
+rand = "0.8"                    # generar chunk secret / dedup secret aleatorios
+tempfile = "3"                  # tests (dirs temporales)
+convex = "0.10"                 # ft-coordinator: cliente Convex; apps/cli: admin auth
+clap = { version = "4", features = ["derive"] }  # apps/cli: parseo de subcomandos
+serde_json = "1"               # apps/cli: store de config (config.json)
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # apps/cli: logs

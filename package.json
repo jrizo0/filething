@@ -1,0 +1,15 @@
+{
+  "name": "filething",
+  "private": true,
+  "version": "0.0.0",
+  "description": "filething — developer-focused folder sync CLI (Bun workspace root)",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd packages/backend dev",
+    "codegen": "bun run --cwd packages/backend codegen",
+    "deploy": "bun run --cwd packages/backend deploy",
+    "typecheck": "bun run --cwd packages/backend typecheck"
+  }
+}

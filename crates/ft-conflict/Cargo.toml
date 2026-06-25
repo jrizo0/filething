@@ -1,0 +1,12 @@
+[package]
+name = "ft-conflict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Three-way per-file resolution is a PURE function over ft-core's FileEntry /
+# CanonicalPath / CasefoldKey types — it inspects snapshots the engine has
+# already loaded (from ft-index / ft-manifest) and returns a verdict, so it does
+# not link those crates itself.
+ft-core = { workspace = true }

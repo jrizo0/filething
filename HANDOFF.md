@@ -1,7 +1,24 @@
 # filething — Handoff: implementar el MVP con un equipo grande de agentes
 
 **Fecha:** 2026-06-24
-**Próxima sesión:** construir el MVP de filething orquestando muchos agentes en paralelo (Workflow / multi-agente). El diseño ya está cerrado; ahora toca **codear**.
+
+---
+
+## ✅ ESTADO 2026-06-25 — MVP IMPLEMENTADO Y VALIDADO END-TO-END
+
+El MVP está **construido y funcionando**. Cómo correrlo: **`DEMO.md`**. Estado detallado: **`TODO.md`**.
+
+- **Monorepo:** Cargo workspace con 14 crates Rust (`crates/ft-*`, `apps/cli` = binario `filething`) + `packages/backend` (Convex TS) + `infra/` (docker-compose MinIO + Convex self-hosted) + Bun workspace.
+- **Componentes (todos con TDD):** ft-core, ft-hash, ft-chunker (FastCDC NC-2), ft-block, ft-manifest (B-tree CBOR canónico), ft-fsmap, ft-index (SQLite), ft-vault (trait + S3/MinIO + fs), ft-coordinator (cliente Convex), ft-watcher, ft-diff, ft-conflict, ft-engine (integrador: scan+commit §7, pull/reconcile §10, clone, watch loop con supresión de eco), ft-daemon, apps/cli.
+- **Verificación:** **268 tests** unitarios verdes + clippy `-D warnings` + fmt limpios. Auditoría adversarial de 7 áreas de riesgo → hallazgos reales arreglados (coordinator seq Int64→Float64 que rompía el feed; diff symlink/blocklist/metadata; conflict identidad por tipo; block magic).
+- **Demo en vivo (criterios de éxito a–d):** `scripts/demo-gates.sh` PASA contra Convex+MinIO reales: (a) init→clone; (b) bidireccional sin eco/falsos conflictos; (c) corte de red + edición offline en ambos → reconcilia con copia de conflicto sin pérdida; (d) 1 línea → solo 1 bloque nuevo (36→37 en MinIO).
+- **10 ADRs** en `docs/adr/`. Aclaración del formato en `docs/format.md §4.3` (cid==pcid en MVP).
+- **Decisiones de build:** infra local Docker (no cloud); 2 Devices simulados en este Linux (sin Mac → adaptador macOS codificado, no probado en runtime); auth = pairing mínimo por código (Better Auth reservado); gestor JS = **Bun**.
+- **Limitaciones conocidas (no bloquean):** `ft-fsmap` casefold = `to_lowercase` (no Unicode full); ver `TODO.md`.
+- **No commiteado:** todo está en la rama `mvp-implementation` sin commitear (commitear solo si el usuario lo pide).
+- **Nota de entorno:** el disco del VPS está ~98% lleno (target/ de Rust + imágenes Docker). El dashboard de Convex se quitó para liberar espacio (se recrea con `docker compose up -d`).
+
+> Lo de abajo es el **plan original** previo a construir (queda como contexto histórico).
 
 ---
 

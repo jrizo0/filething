@@ -127,7 +127,7 @@ cid = BLAKE3-256( nonce || payload )
 Razones (corrige fallas altas de los tres diseños):
 - Excluir la data key envuelta del `cid` permite que **rotar la Space key** re-envuelva data keys sin cambiar el `cid` ⇒ sin renombrar objetos (rotación barata, decisión del proyecto). Por eso la data key envuelta vive en sidecar (§4.5), fuera de los bytes hasheados.
 - Incluir el `nonce` hace que dos Blocks con el mismo claro pero distinto cifrado tengan `cid` distinto cuando deban tenerlo; y como el nonce es DETERMINISTA por contenido (§4.4), el mismo claro en la misma Account produce el mismo `nonce` ⇒ el mismo `cid` ⇒ dedup cross-Device real.
-- En MVP `nonce` son ceros ⇒ `cid = BLAKE3-256(payload) = pcid`. Coherente.
+- En MVP `nonce` son ceros ⇒ `cid = BLAKE3-256(payload) = pcid`. **Aclaración normativa (v1.0.1):** para que esta igualdad sea EXACTA, en MVP (`alg=0`) el `cid` se computa sobre el payload SIN anteponer el nonce de 24 bytes (el nonce efectivo en el hash es vacío), de modo que `cid = BLAKE3-256(payload) = pcid`. El nonce de 24 ceros vive en el header como campo reservado pero no entra al hash en MVP. Solo con cifrado (`alg=1`) el `cid` se computa sobre `nonce_24 ‖ ciphertext`. Esto resuelve la aparente contradicción "nonce de 24 ceros vs `BLAKE3(payload)`" y es lo que implementa `ft-block`.
 
 **Verificación de integridad del wire (regla DURA):** al bajar un Block, se recomputa `BLAKE3-256(nonce || payload)` extraídos del objeto y se compara con el `cid` esperado. NUNCA se hashea el objeto entero (eso fallaría tras una rotación, que cambia el sidecar pero no el objeto). El header (`alg`, `nonce`, etc.) se autentica adicionalmente, con cifrado on, como **AAD del AEAD** del payload, de modo que no sea maleable.
 

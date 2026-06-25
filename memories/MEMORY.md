@@ -1,0 +1,2 @@
+- [Communication style](communication-style.md) — concise, plain Spanish, no unexplained jargon
+- [filething project](filething-project.md) — diseño de la CLI de sync tipo Dropbox-para-devs: arquitectura y negocio

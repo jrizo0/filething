@@ -55,8 +55,10 @@ services:
     volumes:
       - convex_data:/convex/data
     healthcheck:
-      test:
-        ["CMD", "curl", "-fsS", "http://localhost:3210/version", "||", "exit", "1"]
+      # Forma exec (CMD): sin shell, así que un "|| exit 1" serían argumentos
+      # literales para curl (el bug que tenía al contenedor "unhealthy" para
+      # siempre). curl -f ya sale con código != 0 si el HTTP falla.
+      test: ["CMD", "curl", "-fsS", "http://localhost:3210/version"]
       interval: 5s
       timeout: 5s
       retries: 12

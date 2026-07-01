@@ -84,30 +84,80 @@ Gates (validados a nivel engine; falta correrlos vía CLI real para el demo):
 ## Cierre
 - [x] Actualizar `HANDOFF.md` y `memories/filething-project.md` con el estado real del código
 - [x] `DEMO.md` — correr la demo (2 Devices) + `scripts/demo-gates.sh` + migrar a R2/Convex cloud
-- [ ] (cuando el usuario lo pida) commit de la rama `mvp-implementation`
-- [ ] (opcional) liberar más disco / recrear el dashboard de Convex (`docker compose up -d`)
+- [x] Commit de la rama `mvp-implementation` (2 commits pusheados a origin, 2026-07-01)
+- [x] Disco del VPS liberado (~80 GB libres al 2026-07-01); dashboard de Convex se recrea con `docker compose up -d` cuando haga falta
+- [ ] Arreglar el healthcheck de Convex en `infra/docker-compose.yml` (el contenedor aparece "unhealthy" pero el servicio responde 200 — el comando de chequeo falla por timeout)
+- [ ] Mergear `mvp-implementation` → `main` (tras validar la prueba real Mac↔VPS con los fixes)
 
 ---
 
-## Hallazgos de prueba manual Mac↔VPS (2026-06-25) — sin investigar aún
-Observados por el usuario corriendo daemon en ambos lados (Mac release + VPS debug, vía túnel SSH).
-Anotados tal cual; pendientes de diagnóstico/fix.
+## Hallazgos de prueba manual Mac↔VPS (2026-06-25) — DIAGNOSTICADOS Y ARREGLADOS (2026-07-01)
+Diagnóstico por 3 vías: forense de las 13 Revisions en Convex, reproducción local con 2 devices
+y red estable, y lectura del código. Detalle completo en `diary/2026-07-01.md`. Conclusión
+central: **los commits nunca fallaron** (todo lo editado/borrado llegó a Convex); lo que se
+rompía era el lado que *recibe* y dos huecos de resiliencia del daemon.
 
-> ⚠️ Caveat de captura: durante la ventana de prueba (~20:57–21:19) el túnel SSH y el daemon del VPS
-> se cayeron por un parpadeo de red/VPN. Los hallazgos de **VPS→Mac que no se propagaron** podrían ser
-> artefactos de esa caída, no bugs reales — RE-VERIFICAR con el entorno estable antes de tratarlos como
-> confirmados. (Mitigado después: daemon VPS detached + túnel con auto-reconexión.)
+- [x] **Modificación no se propaga (C2)** → era un bug real y reproducible: el buffer de
+  coalescing de `ft-watcher` nunca expiraba — la 2ª edición del mismo archivo jamás se
+  reenviaba en la vida del daemon. FIX: ventana real de 50 ms (`CoalesceBuffer`) + 6 tests.
+  (En la prueba del 25, además, la Mac no aplicó la Revision seq 8 pese a estar commiteada —
+  ver el fix del pull de respaldo.)
+- [x] **Borrado VPS→Mac no se propaga (C4)** → NO reproduce con red estable (el borrado sí se
+  commiteó: seq 9, justo al inicio del corte). Era artefacto del corte, agravado por dos huecos
+  reales, ambos arreglados: (1) el daemon no hacía commit inicial al arrancar (`startup_sync()`
+  en `run.rs`: cambios offline se commitean al montar); (2) el feed podía morir en silencio sin
+  recuperación (pull de respaldo cada 30 s, `FALLBACK_PULL_INTERVAL`).
+- [x] **Latencia de borrados (C1)** → el commit fue inmediato (seq 7); la demora era del lado
+  que aplica (feed dormido). El pull de respaldo acota el peor caso a ~30 s; con feed sano la
+  propagación medida es ~2 s.
+- [x] **Extra**: el `.DS_Store` de la Mac se sincronizó al Space → `.DS_Store`/`Thumbs.db`/
+  `desktop.ini` ya no se sincronizan nunca (built-in, ADR 0011); un Space que ya los tenga se
+  auto-limpia en el siguiente commit.
+- [ ] Re-correr la prueba manual Mac↔VPS con los fixes (guía `docs/MAC-SETUP.md`, ya
+  actualizada con túnel auto-reconectable y daemon detached con log en append).
 
-Probables bugs:
-- [ ] **Modificación VPS→Mac no se propaga**: creé un `.txt` con contenido desde el VPS → apareció en la Mac con su contenido (OK). Luego modifiqué el contenido desde el VPS y el archivo en la Mac NO cambió (esperé y no se vio el cambio).
-- [ ] **Borrado VPS→Mac no se propaga para archivo originado en la Mac**: agregué un archivo desde la Mac → llegó al VPS. Luego lo borré desde el VPS y NO se borró en la Mac.
-  - Nota: aparente contradicción con el caso que sí funcionó (ver abajo "borrado VPS→Mac inmediato"). La diferencia podría ser el origen del archivo (creado en VPS vs creado en Mac). Sin investigar.
+---
 
-Latencia (mejora, no romper):
-- [ ] **Propagación de borrados Mac→VPS lenta**: borré un Excel en la Mac y tardó en desaparecer del VPS (al final desapareció, correcto). Se quiere que sea casi inmediato, tipo Dropbox/iCloud.
+## Roadmap a producción — Convex Cloud + R2 (agregado 2026-07-01)
+Objetivo: salir de la infra de juguete (Docker en el VPS) a la infra gestionada real, y dejar
+el producto usable en producción. Orden pensado para que cada fase sea usable por sí sola.
 
-Funcionó bien (referencia):
-- [x] Borrado VPS→Mac casi inmediato para un archivo creado en el VPS (esperado ✅).
+### Fase A — Infra gestionada (uso propio, multi-red real)
+La migración de datos es barata: los Blocks son content-addressed (re-subir o `aws s3 sync`
+al bucket nuevo) y el Coordinator se re-crea (re-init de Spaces si no se migran los docs).
+- [ ] **Convex Cloud**: crear proyecto/deployment, `npx convex deploy` de `packages/backend`,
+  apuntar `CONVEX_SELF_HOSTED_URL` → URL del deployment. ⚠️ No es 100% config: el cliente Rust
+  hoy se autentica con el **admin key self-hosted**; en cloud eso no existe para clientes — para
+  uso personal se puede usar un deploy key (aceptable solo mientras todos los devices sean tuyos),
+  y para terceros exige la Fase B (auth real). Verificar también que el change feed (WebSocket)
+  funciona igual contra cloud.
+- [ ] **Cloudflare R2**: crear bucket + API token con scope al bucket; apuntar
+  `S3_ENDPOINT`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`/`S3_BUCKET`. El backend S3 de `ft-vault` ya
+  habla R2 (mismo protocolo); sin egress fees. Validar `scripts/demo-gates.sh` completo (a–f)
+  contra R2 + Convex Cloud antes de dar por buena la migración.
+- [ ] **Secretos fuera del repo**: env/secret manager para las credenciales R2 y Convex
+  (hoy viven en `infra/.env` local, que no se commitea — mantenerlo así).
+- [ ] Sin túnel SSH: con infra gestionada, Mac y VPS hablan directo a Convex/R2 por HTTPS —
+  desaparece la fragilidad del túnel que contaminó la prueba del 25.
+- [ ] Re-correr la prueba Mac↔VPS contra la infra gestionada (el escenario real de uso).
+
+### Fase B — Endurecer para usuarios reales (desbloquea cobrar)
+En orden de prioridad; los [R] de abajo guardan los huecos ya cableados en el formato:
+- [ ] **Auth real** (Better Auth): login por navegador + tokens por device emitidos en el
+  pairing; el cliente deja de necesitar cualquier key privilegiada. Prerrequisito para todo lo demás.
+- [ ] **Cifrado en runtime** (`alg=1`, huecos ya reservados): antes de guardar bytes de
+  terceros en R2. Data key determinista por cuenta (ADR 0003), sidecars `keys/<cid>`.
+- [ ] **Daemon como servicio** (launchd en macOS, systemd en Linux) con logs rotados —
+  hoy es foreground/nohup y el log se pierde al relanzar con `>`.
+- [ ] **Binarios por SO** (cargo-dist o similar) + firma/notarización en macOS.
+- [ ] **GC/retención** (grace-period + `retentionFloorSeq`, schema ya lo reserva): sin esto el
+  Vault solo crece.
+- [ ] **Observabilidad mínima**: métricas de sync (commits, pulls, conflictos, errores del
+  feed) y alerta si un daemon queda >N min sin ver el head.
+- [ ] Validación de nombres Windows (antes de soportar Windows) y packing de bloques chicos
+  (costo/latencia en R2) — según demanda.
+- [ ] **Billing (Polar) + dashboard (Next.js)**: cuando haya usuarios que cobrar (Seats por
+  device, storage gestionado como add-on medido).
 
 ---
 

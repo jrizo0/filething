@@ -6,12 +6,18 @@
 //!   [`AppliedState`] with this context (so [`pull`](SpaceContext::pull) marks
 //!   every file it writes, `§9`);
 //! - subscribes to the Space head (the change feed, `§8`);
+//! - runs a [`startup_sync`](SpaceContext::startup_sync): an initial `pull` AND
+//!   an initial `commit_and_reconcile`, so a Device that was edited (or had files
+//!   deleted) while the daemon was down pushes those changes at mount, without
+//!   waiting for the next FS event to arm the commit debounce (`§7`/`§9`);
 //! - `select!`s between:
 //!   - a watcher event → canonicalize, read the real `(mtime, pcid)`, and
 //!     [`is_echo`](ft_watcher::is_echo). A NON-echo (a real user edit) arms a short
 //!     debounce; when it fires, [`commit_and_reconcile`](SpaceContext::commit_and_reconcile)
 //!     pushes the change (coalescing a burst into one commit);
 //!   - a head update from the feed → [`pull`](SpaceContext::pull);
+//!   - a periodic tick ([`FALLBACK_PULL_INTERVAL`]) → a backstop `pull` that
+//!     recovers a feed gone silent on a flaky link;
 //!   - `shutdown` resolving → a clean exit.
 //!
 //! The echo loop is broken structurally: applying from the feed marks the write,
@@ -33,13 +39,26 @@ use crate::error::Result;
 /// editor's save (write + rename + chmod) into a single commit.
 const COMMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// A safety-net interval for pulling the head even when the change feed is quiet.
+///
+/// The `head_stream` branch of the `select!` is normally the ONLY way remote
+/// changes reach this Device after startup: the convex client reconnects and
+/// re-subscribes on its own. But on a flaky link (unstable SSH tunnel / VPN) we
+/// observed a daemon that kept committing yet went deaf to the feed
+/// indefinitely — no error, just silence. A periodic pull is the backstop: it is
+/// cheap when nothing moved (`read_head` sees the same root and `apply_head`
+/// returns [`PullOutcome::UpToDate`](crate::PullOutcome) early, `pull.rs:143-150`),
+/// and it recovers a stuck feed without a restart.
+const FALLBACK_PULL_INTERVAL: Duration = Duration::from_secs(30);
+
 impl SpaceContext {
     /// Runs the continuous sync loop until `shutdown` resolves (`§8`/`§9`).
     ///
-    /// Requires a Coordinator (it subscribes to the head and commits). Does an
-    /// initial [`pull`](SpaceContext::pull) so a just-mounted Device catches up
-    /// before watching, then loops watcher-events ↔ feed-updates ↔ shutdown. See
-    /// the module docs.
+    /// Requires a Coordinator (it subscribes to the head and commits). Runs
+    /// [`startup_sync`](SpaceContext::startup_sync) once — an initial pull AND an
+    /// initial commit, so offline edits/deletes are pushed at mount without
+    /// waiting for the next FS event — then loops watcher-events ↔ feed-updates ↔
+    /// a [`FALLBACK_PULL_INTERVAL`] backstop pull ↔ shutdown. See the module docs.
     pub async fn run(&mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         // Start the watcher; share its echo-suppression marks with this context so
         // pull() can mark every file it writes (§9).
@@ -71,14 +90,26 @@ impl SpaceContext {
         let head_stream = head_coord.subscribe_head(&space_id).await?;
         tokio::pin!(head_stream);
 
-        // Initial catch-up so a freshly mounted Device is current before watching.
-        self.pull().await?;
+        // Initial catch-up so a freshly mounted Device is current before watching:
+        // pull the head AND commit any local edits/deletes made while the daemon
+        // was down (§7/§9).
+        self.startup_sync().await?;
 
         tokio::pin!(shutdown);
         let mut dirty = false;
         // A debounce timer that is only polled while `dirty`.
         let debounce = tokio::time::sleep(COMMIT_DEBOUNCE);
         tokio::pin!(debounce);
+
+        // The backstop pull timer. `interval_at` with a first tick one PERIOD out
+        // (not the immediate default) so the loop's first fallback pull waits a
+        // full interval — the startup_sync above already brought us current. Delay
+        // (not Burst) skipped ticks: a slow pull must not queue a thundering herd.
+        let mut fallback = tokio::time::interval_at(
+            tokio::time::Instant::now() + FALLBACK_PULL_INTERVAL,
+            FALLBACK_PULL_INTERVAL,
+        );
+        fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -105,6 +136,19 @@ impl SpaceContext {
                     }
                 }
 
+                // Backstop: pull on a timer in case the feed died silently on a
+                // flaky link (FALLBACK_PULL_INTERVAL). Cheap when the head has not
+                // moved (apply_head short-circuits to UpToDate). Unlike the feed
+                // branch (which only runs while connected), this timer also fires
+                // mid-outage — so a transient failure here is EXPECTED and must not
+                // kill the daemon; warn and let the next tick retry. A persistent
+                // fault stays visible as a warning every interval.
+                _ = fallback.tick() => {
+                    if let Err(e) = self.pull().await {
+                        tracing::warn!(error = %e, "backstop pull failed; retrying next interval");
+                    }
+                }
+
                 // Debounce fired: if there were real edits, commit them as one.
                 _ = &mut debounce, if dirty => {
                     dirty = false;
@@ -114,6 +158,31 @@ impl SpaceContext {
         }
 
         drop(bridge);
+        Ok(())
+    }
+
+    /// The startup catch-up the [`run`](SpaceContext::run) loop performs once
+    /// before watching: pull the head, THEN commit any local changes (`§7`/`§9`).
+    ///
+    /// The initial pull alone (the old behavior) left a gap: edits or deletes made
+    /// on disk while the daemon was DOWN were never pushed until some later FS
+    /// event happened to arm the commit debounce — a file deleted offline could
+    /// sit uncommitted indefinitely. Committing here closes that gap.
+    ///
+    /// The commit is cheap when there is nothing to push: with no local change the
+    /// scanned `manifestRoot` equals `last_synced.root`, so `commit` returns
+    /// [`CommitOutcome::NoChange`](crate::CommitOutcome) after only a scan + a pure
+    /// `ft_manifest::build`, touching neither the Vault nor the Coordinator
+    /// (`commit.rs:94-96`: `if self.last_synced.seq >= 0 && root ==
+    /// self.last_synced.root { return Ok(CommitOutcome::NoChange); }`).
+    ///
+    /// Split out of `run` so the arrival-time behavior is testable offline (the
+    /// full loop needs a live head subscription; this needs only a Coordinator for
+    /// the commit path). Order matters: pull first so the commit's `expected_base`
+    /// reflects the current head and a first commit reconciles instead of looping.
+    pub async fn startup_sync(&mut self) -> Result<()> {
+        self.pull().await?;
+        self.commit_and_reconcile().await?;
         Ok(())
     }
 

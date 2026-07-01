@@ -25,7 +25,9 @@ rm -rf "$WORK"; mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 
 hr "SETUP — login A (bootstrap) + login B (claim por codigo)"
 OUT_A=$(a login --name device-a); echo "$OUT_A"
-CODE=$(echo "$OUT_A" | grep -oE '[A-Z0-9]{6,10}' | head -1)
+# Anclado a "--code XXXX": un grep suelto de [A-Z0-9]{6,10} puede capturar
+# digitos del account id impreso arriba (flake real observado).
+CODE=$(echo "$OUT_A" | sed -n 's/.*--code \([A-Z0-9]\{1,\}\).*/\1/p' | head -1)
 [ -n "$CODE" ] || fail "no pairing code de A"
 echo ">> pairing code = $CODE"
 b login --code "$CODE" --name device-b; echo
@@ -91,3 +93,117 @@ HAVE_B=$(grep -rl "version de B (offline)" "$B_DIR" | wc -l)
 
 hr "RESULTADO"
 echo "Gates a, b, c, d: PASARON via la CLI real contra Convex+MinIO."
+
+# ---------------------------------------------------------------------------
+# Gates (e) y (f) — daemons de verdad (no `sync` puntual), Space/HOMEs propios
+# para no pisar el estado de los gates a-d.
+# ---------------------------------------------------------------------------
+
+DWORK=/tmp/ft-demo-daemons
+DA_HOME="$DWORK/devA-home"; DB_HOME="$DWORK/devB-home"
+DA_DIR="$DWORK/dirA";       DB_DIR="$DWORK/dirB"
+DA_LOG="$DWORK/daemon-a.log"; DB_LOG="$DWORK/daemon-b.log"
+DA_PID=""; DB_PID=""
+
+da() { FILETHING_HOME="$DA_HOME" "$BIN" "$@"; }
+db() { FILETHING_HOME="$DB_HOME" "$BIN" "$@"; }
+
+# Mata cualquier daemon que hayamos lanzado, por PID guardado. Se llama en las
+# salidas normal y en fail() via trap.
+cleanup_daemons() {
+    [ -n "$DA_PID" ] && kill "$DA_PID" >/dev/null 2>&1
+    [ -n "$DB_PID" ] && kill "$DB_PID" >/dev/null 2>&1
+}
+trap cleanup_daemons EXIT
+
+# Sondea hasta ~$2 segundos (por defecto 30) a que el comando $1 sea verdadero.
+wait_for() {
+    local desc="$1"; local timeout="${2:-30}"; local check="$3"
+    local waited=0
+    while [ "$waited" -lt "$timeout" ]; do
+        if eval "$check"; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo ">> TIMEOUT esperando: $desc (despues de ${timeout}s)"
+    return 1
+}
+
+command rm -rf "$DWORK"; mkdir -p "$DA_HOME" "$DB_HOME" "$DA_DIR" "$DB_DIR"
+
+hr "SETUP (e/f) — login A (bootstrap) + login B (claim por codigo), init+clone"
+OUT_DA=$(da login --name device-a-daemon); echo "$OUT_DA"
+DCODE=$(echo "$OUT_DA" | sed -n 's/.*--code \([A-Z0-9]\{1,\}\).*/\1/p' | head -1)
+[ -n "$DCODE" ] || fail "(e/f) no pairing code de A"
+db login --code "$DCODE" --name device-b-daemon; echo
+
+echo "seed inicial" > "$DA_DIR/seed.txt"
+OUT_DINIT=$(da init "$DA_DIR" --name demo-daemons); echo "$OUT_DINIT"
+DSPACE=$(echo "$OUT_DINIT" | grep -oE '[a-z0-9]{30,}' | head -1)
+[ -n "$DSPACE" ] || fail "(e/f) no space_id de init"
+echo ">> space_id = $DSPACE"
+db clone "$DSPACE" "$DB_DIR"; echo
+[ -f "$DB_DIR/seed.txt" ] || fail "(e/f) B no clono el seed inicial"
+
+hr "GATE (e) — segunda edicion: coalesce del watcher NO debe tragarse la 2a modificacion"
+# OJO: lanzar el daemon directo con `env` (no via las funciones da()/db()) para
+# que "$!" sea el PID real del binario. Backgrounding una FUNCION de shell deja
+# "$!" apuntando al subshell de la funcion, no al binario que ejecuta adentro
+# (una fork extra) — eso huerfana el proceso real al matar solo "$!".
+env FILETHING_HOME="$DA_HOME" "$BIN" daemon "$DA_DIR" >"$DA_LOG" 2>&1 &
+DA_PID=$!
+env FILETHING_HOME="$DB_HOME" "$BIN" daemon "$DB_DIR" >"$DB_LOG" 2>&1 &
+DB_PID=$!
+echo ">> daemon A pid=$DA_PID  daemon B pid=$DB_PID"
+sleep 2  # deja que ambos daemons terminen su startup_sync antes de tocar el FS
+
+echo "version 1" > "$DA_DIR/coalesce.txt"
+wait_for "(e) B recibe la creacion de coalesce.txt" 30 \
+    '[ -f "'"$DB_DIR"'/coalesce.txt" ] && grep -qx "version 1" "'"$DB_DIR"'/coalesce.txt" 2>/dev/null' \
+    || fail "(e) B nunca recibio la creacion de coalesce.txt"
+echo "OK (e): B recibio la 1a version de coalesce.txt"
+
+echo "version 2" > "$DA_DIR/coalesce.txt"
+wait_for "(e) B recibe la 1a edicion" 30 \
+    'grep -qx "version 2" "'"$DB_DIR"'/coalesce.txt" 2>/dev/null' \
+    || fail "(e) B nunca recibio la 1a edicion de coalesce.txt"
+echo "OK (e): B recibio la 1a edicion (version 2)"
+
+echo "version 3" > "$DA_DIR/coalesce.txt"
+wait_for "(e) B recibe la 2a edicion (el bug viejo del coalesce fallaba aqui)" 30 \
+    'grep -qx "version 3" "'"$DB_DIR"'/coalesce.txt" 2>/dev/null' \
+    || fail "(e) B nunca recibio la 2a edicion de coalesce.txt (bug de coalesce del watcher)"
+echo "OK (e): B recibio la 2a edicion (version 3) — el coalesce NO se tildo"
+
+hr "GATE (f) — arranque offline: apagar B, borrar+crear en B, prender B => A ve ambos cambios via startup_sync"
+kill "$DB_PID" >/dev/null 2>&1
+wait "$DB_PID" 2>/dev/null
+DB_PID=""
+echo ">> daemon B apagado"
+
+# Un archivo YA sincronizado (seed.txt, presente desde el clone) se borra en B;
+# uno nuevo se crea en B. Ambos cambios se hacen con el daemon de B APAGADO.
+command rm -f "$DB_DIR/seed.txt"
+echo "nuevo mientras B estaba offline" > "$DB_DIR/offline_new.txt"
+
+env FILETHING_HOME="$DB_HOME" "$BIN" daemon "$DB_DIR" >>"$DB_LOG" 2>&1 &
+DB_PID=$!
+echo ">> daemon B reiniciado pid=$DB_PID"
+
+wait_for "(f) A ve el archivo nuevo creado offline en B" 30 \
+    'grep -qx "nuevo mientras B estaba offline" "'"$DA_DIR"'/offline_new.txt" 2>/dev/null' \
+    || fail "(f) A nunca recibio offline_new.txt (startup_sync no comprometio el cambio offline)"
+echo "OK (f): A recibio offline_new.txt"
+
+wait_for "(f) A refleja el borrado offline de seed.txt" 30 \
+    '[ ! -f "'"$DA_DIR"'/seed.txt" ]' \
+    || fail "(f) A todavia tiene seed.txt (startup_sync no comprometio el borrado offline)"
+echo "OK (f): A ya no tiene seed.txt (borrado offline propagado)"
+
+cleanup_daemons
+DA_PID=""; DB_PID=""
+
+hr "RESULTADO FINAL"
+echo "Gates a, b, c, d, e, f: PASARON via la CLI real contra Convex+MinIO."

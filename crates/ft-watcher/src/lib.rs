@@ -3,9 +3,10 @@
 //! Two cooperating pieces:
 //!
 //! 1. A recursive [`Watcher`] over a Space's local root. It uses the `notify`
-//!    crate with a short debounce/coalescing window and emits coalesced
-//!    [`ChangeEvent`]s ([`ChangeKind::Created`] / [`ChangeKind::Modified`] /
-//!    [`ChangeKind::Removed`]) on a channel the engine drains.
+//!    crate with a short debounce/coalescing window ([`CoalesceBuffer`]) and
+//!    emits coalesced [`ChangeEvent`]s ([`ChangeKind::Created`] /
+//!    [`ChangeKind::Modified`] / [`ChangeKind::Removed`]) on a channel the
+//!    engine drains.
 //!
 //! 2. Echo suppression (`§9`). After the engine writes a file it pulled from the
 //!    change feed, it calls [`Watcher::mark_applied`] to record the REAL `mtime`
@@ -26,10 +27,10 @@
 //! (`docs/BUILD-PLAN.md §3`, `format.md §9`).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ft_core::{CanonicalPath, Pcid};
 use notify::{
@@ -160,7 +161,69 @@ pub fn is_echo(state: &AppliedState, path: &CanonicalPath, mtime: i64, pcid: &Pc
 /// Debounce/coalescing window for raw `notify` events. Short so the feedback
 /// loop stays snappy; long enough to fold an editor's write burst into one
 /// event per path.
+///
+/// SAFETY REQUIREMENT: this MUST stay `<=` ft-engine's `COMMIT_DEBOUNCE` (300ms,
+/// `crates/ft-engine/src/run.rs`). The engine scans the disk 300ms after the
+/// last *forwarded* event; any write whose own event was suppressed inside this
+/// window must already be on disk by the time that scan runs, i.e. it must have
+/// happened at least `DEBOUNCE` before the forwarded event that triggers the
+/// scan's timer. At 50ms we have wide margin under the 300ms scan delay.
 const DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Coalescing decision for raw `notify` events, extracted from the `notify`
+/// callback so it is testable without a real filesystem (`docs/BUILD-PLAN.md
+/// §3`).
+///
+/// Tracks, per `(kind, path)`, the [`Instant`] the event was last FORWARDED
+/// (not merely seen). [`Self::should_forward`] answers "should this occurrence
+/// be forwarded now?" and, if so, records `now` as the new last-forwarded time.
+///
+/// This is a debounce, not a one-shot filter: unlike a plain
+/// `HashSet<(kind, path)>` that would remember a key forever and suppress
+/// every later occurrence for the life of the process, a forwarded key's timer
+/// resets, so a change that keeps recurring after the window elapses keeps
+/// being forwarded (at most once per [`DEBOUNCE`] window per key).
+///
+/// Suppressed occurrences do NOT update the recorded time — otherwise a
+/// continuous burst (writes closer together than `DEBOUNCE`) would keep
+/// pushing the window forward and starve the callback indefinitely.
+#[derive(Debug, Default)]
+struct CoalesceBuffer {
+    last_forwarded: HashMap<(ChangeKind, PathBuf), Instant>,
+}
+
+impl CoalesceBuffer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if a `(kind, path)` occurrence at `now` should be
+    /// forwarded: either it is the first time this key is seen, or at least
+    /// [`DEBOUNCE`] has elapsed since the last time it was forwarded. When
+    /// `true`, records `now` as the key's new last-forwarded time.
+    ///
+    /// Also opportunistically purges entries older than [`DEBOUNCE`] so the
+    /// map does not grow unbounded over a long-lived watch (`§3`). The map
+    /// only ever holds keys touched recently, so this scan is cheap.
+    fn should_forward(&mut self, kind: ChangeKind, path: &Path, now: Instant) -> bool {
+        let forward = match self.last_forwarded.get(&(kind, path.to_path_buf())) {
+            Some(last) => now.duration_since(*last) >= DEBOUNCE,
+            None => true,
+        };
+        if forward {
+            self.last_forwarded.insert((kind, path.to_path_buf()), now);
+        }
+        self.last_forwarded
+            .retain(|_, last| now.duration_since(*last) < DEBOUNCE);
+        forward
+    }
+
+    /// Number of tracked keys (test helper).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.last_forwarded.len()
+    }
+}
 
 /// A recursive filesystem watcher over a Space's local root.
 ///
@@ -180,17 +243,20 @@ impl Watcher {
     /// Starts a recursive watcher over `root`, emitting coalesced
     /// [`ChangeEvent`]s on `sender`.
     ///
-    /// Raw `notify` events are debounced/coalesced into at most one
-    /// [`ChangeEvent`] per `(kind, path)` per [`DEBOUNCE`] window before being
-    /// sent. Suppression of our own writes is NOT done here (notify has no
-    /// `pcid`); the engine applies [`is_echo`] against [`Watcher::applied_state`].
+    /// Raw `notify` events are debounced/coalesced via [`CoalesceBuffer`]: at
+    /// most one [`ChangeEvent`] per `(kind, path)` per [`DEBOUNCE`] window is
+    /// sent, but — unlike a one-shot dedup — a `(kind, path)` that keeps
+    /// recurring keeps being forwarded, once per window, for as long as the
+    /// watcher runs. Suppression of our own writes is NOT done here (notify has
+    /// no `pcid`); the engine applies [`is_echo`] against
+    /// [`Watcher::applied_state`].
     pub fn new(root: PathBuf, sender: Sender<ChangeEvent>) -> Result<Self> {
         let applied = Arc::new(AppliedState::new());
 
-        // Coalescing buffer: collapse a burst of raw events into one event per
-        // (kind, path). Cheap and deterministic; the engine re-stats anyway.
-        let coalesce: Arc<Mutex<HashMap<(ChangeKind, PathBuf), ()>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        // Coalescing buffer: collapse a burst of raw events into at most one
+        // event per (kind, path) per DEBOUNCE window. Cheap and deterministic;
+        // the engine re-stats anyway.
+        let coalesce: Arc<Mutex<CoalesceBuffer>> = Arc::new(Mutex::new(CoalesceBuffer::new()));
 
         let cb_sender = sender.clone();
         let mut inner = RecommendedWatcher::new(
@@ -206,11 +272,10 @@ impl Watcher {
                     Some(k) => k,
                     None => return, // access/other: not a content change we report
                 };
+                let now = Instant::now();
                 let mut buf = coalesce.lock().expect("coalesce mutex poisoned");
                 for path in event.paths {
-                    // Dedup within the window: only the first occurrence of a
-                    // (kind, path) pair is forwarded.
-                    if buf.insert((kind, path.clone()), ()).is_none() {
+                    if buf.should_forward(kind, &path, now) {
                         let _ = cb_sender.send(ChangeEvent { kind, path });
                     }
                 }
@@ -255,7 +320,6 @@ fn map_kind(kind: &EventKind) -> Option<ChangeKind> {
 mod tests {
     use super::*;
     use std::sync::mpsc::channel;
-    use std::time::Instant;
 
     fn cp(s: &str) -> CanonicalPath {
         CanonicalPath(s.to_string())
@@ -320,6 +384,104 @@ mod tests {
         // Old mark gone, new mark recognized.
         assert!(!is_echo(&state, &path, 1, &Pcid::new([1u8; 32])));
         assert!(is_echo(&state, &path, 2, &Pcid::new([2u8; 32])));
+    }
+
+    // ---- CoalesceBuffer (coalescing debounce, not one-shot dedup) --------
+
+    // THE bug test: the same (kind, path) occurring twice, separated by more
+    // than DEBOUNCE, must be forwarded BOTH times. A plain "first occurrence
+    // wins forever" dedup fails this because it never forgets the key.
+    #[test]
+    fn same_key_forwarded_again_after_debounce_elapses() {
+        let mut buf = CoalesceBuffer::new();
+        let path = PathBuf::from("/space/file.txt");
+        let t0 = Instant::now();
+
+        assert!(buf.should_forward(ChangeKind::Modified, &path, t0));
+        // Well past the window.
+        let t1 = t0 + DEBOUNCE + Duration::from_millis(1);
+        assert!(buf.should_forward(ChangeKind::Modified, &path, t1));
+    }
+
+    // Same (kind, path) twice within the window: only the first is forwarded.
+    #[test]
+    fn same_key_suppressed_within_window() {
+        let mut buf = CoalesceBuffer::new();
+        let path = PathBuf::from("/space/file.txt");
+        let t0 = Instant::now();
+
+        assert!(buf.should_forward(ChangeKind::Modified, &path, t0));
+        let t1 = t0 + DEBOUNCE / 2;
+        assert!(!buf.should_forward(ChangeKind::Modified, &path, t1));
+    }
+
+    // A continuous burst every 10ms for 200ms must still be forwarded roughly
+    // every DEBOUNCE (~50ms), not just once at the very start. Suppressed
+    // occurrences must not push the window forward indefinitely.
+    #[test]
+    fn continuous_burst_forwards_periodically_not_just_once() {
+        let mut buf = CoalesceBuffer::new();
+        let path = PathBuf::from("/space/file.txt");
+        let t0 = Instant::now();
+        let step = Duration::from_millis(10);
+
+        let mut forwarded = 0;
+        let mut t = t0;
+        while t < t0 + Duration::from_millis(200) {
+            if buf.should_forward(ChangeKind::Modified, &path, t) {
+                forwarded += 1;
+            }
+            t += step;
+        }
+
+        // ~200ms / 50ms window => ~4 forwards; assert loosely to avoid
+        // over-fitting to exact boundary rounding.
+        assert!(
+            forwarded >= 3,
+            "expected at least 3 forwards over a 200ms burst, got {forwarded}"
+        );
+    }
+
+    // Different kind, same path: independent keys, neither suppresses the
+    // other.
+    #[test]
+    fn different_kind_same_path_not_suppressed() {
+        let mut buf = CoalesceBuffer::new();
+        let path = PathBuf::from("/space/file.txt");
+        let t0 = Instant::now();
+
+        assert!(buf.should_forward(ChangeKind::Created, &path, t0));
+        assert!(buf.should_forward(ChangeKind::Modified, &path, t0));
+    }
+
+    // Same kind, different path: independent keys, neither suppresses the
+    // other.
+    #[test]
+    fn same_kind_different_path_not_suppressed() {
+        let mut buf = CoalesceBuffer::new();
+        let t0 = Instant::now();
+
+        assert!(buf.should_forward(ChangeKind::Modified, Path::new("/a"), t0));
+        assert!(buf.should_forward(ChangeKind::Modified, Path::new("/b"), t0));
+    }
+
+    // Opportunistic purge: once "now" moves past the window, stale entries
+    // must not linger in the map forever.
+    #[test]
+    fn stale_entries_are_purged() {
+        let mut buf = CoalesceBuffer::new();
+        let t0 = Instant::now();
+
+        assert!(buf.should_forward(ChangeKind::Modified, Path::new("/a"), t0));
+        assert!(buf.should_forward(ChangeKind::Created, Path::new("/b"), t0));
+        assert_eq!(buf.len(), 2);
+
+        // Advance well past the window and touch an unrelated key: the purge
+        // is opportunistic (runs on each call), so this should sweep the old
+        // entries instead of letting the map grow unbounded.
+        let t1 = t0 + DEBOUNCE * 10;
+        assert!(buf.should_forward(ChangeKind::Modified, Path::new("/c"), t1));
+        assert_eq!(buf.len(), 1, "stale entries should have been purged");
     }
 
     // (3) Optional, with tempfile: a real filesystem change fires an event.

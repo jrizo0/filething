@@ -76,10 +76,15 @@ filething --help
 
 ## 3. Abrir el túnel SSH (déjalo en una terminal aparte)
 
-Reemplaza `usuario@IP-DEL-VPS` por tu acceso real:
+Reemplaza `usuario@IP-DEL-VPS` por tu acceso real. Con auto-reconexión (aprendido en la
+prueba del 2026-06-25: un parpadeo de red mata el túnel y sin este loop se queda muerto):
 
 ```bash
-ssh -N -L 9000:localhost:9000 -L 3210:localhost:3210 usuario@IP-DEL-VPS
+while true; do
+  ssh -N -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+    -L 9000:localhost:9000 -L 3210:localhost:3210 usuario@IP-DEL-VPS
+  echo "túnel caído; reintentando en 3s…"; sleep 3
+done
 ```
 
 Verifica desde otra terminal de la Mac que el túnel sirve:
@@ -139,11 +144,14 @@ ls ~/space-demo            # debe aparecer saludo.txt
 ## 6. Sync continuo (la "magia") — un daemon en cada lado
 
 ```bash
-# VPS:
-target/release/filething daemon ~/space-demo
+# VPS (detached: sobrevive cortes de SSH; log con >> para no perder historia al relanzar):
+nohup target/debug/filething daemon ~/space-demo >> ~/ft-daemon-vps.log 2>&1 & disown
 # Mac (otra terminal, túnel arriba):
 filething daemon ~/space-demo
 ```
+
+> Lanza **un solo** daemon por lado: si relanzas tras un corte, primero
+> `pkill -f "filething daemon"` — en la prueba del 25 quedaron dos daemons vivos en el VPS.
 
 Ahora edita archivos en `~/space-demo` en cualquiera de los dos y míralos aparecer en el otro.
 Para la prueba de conflicto: corta el túnel SSH, edita el **mismo** archivo en ambos, reconecta

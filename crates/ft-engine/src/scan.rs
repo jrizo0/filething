@@ -2,9 +2,10 @@
 //! Blocks to upload (`docs/format.md §3`, `§5.1`, `§5.2`, `§9`).
 //!
 //! `scan` is the first step of a commit (`§7` step 1). It walks `local_root`
-//! with `walkdir`, skipping the `.filething/` control directory and any path
-//! excluded by `.filethingignore` (empty by default ⇒ nothing excluded, `§Ignore
-//! file`). For every entry it:
+//! with `walkdir`, skipping the `.filething/` control directory, the built-in
+//! platform-junk file names ([`JUNK_NAMES`], ADR 0011) and any path excluded by
+//! `.filethingignore` (empty by default ⇒ nothing excluded, `§Ignore file`).
+//! For every surviving entry it:
 //!
 //! - derives the canonical path ([`ft_fsmap::canonicalize`]) and its
 //!   [`CasefoldKey`] ([`ft_fsmap::casefold_key`]);
@@ -45,6 +46,23 @@ pub const CONTROL_DIR: &str = ".filething";
 
 /// The per-Space ignore-file name (`§Ignore file`). Empty by default.
 pub const IGNORE_FILE: &str = ".filethingignore";
+
+/// Platform-junk file names ALWAYS excluded from the Manifest, independent of
+/// the user's `.filethingignore` (ADR 0011). These are OS-generated sidecars
+/// (macOS Finder / Windows Explorer) that carry no user data and must never
+/// contaminate a Space — Dropbox/iCloud exclude them too.
+///
+/// The match is by EXACT entry name, case-sensitive as written (no glob, no
+/// extension match): `.DS_Store.bak`, `Thumbs.db.old` or `mythumbs.db` still
+/// sync. It applies only on the scanner (outbound) side: the walk never emits
+/// these into the Manifest. The apply/diff side is untouched, so a Space that
+/// already committed one converges by deletion (ADR 0011).
+pub const JUNK_NAMES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// True if `name` is an exact platform-junk file name (see [`JUNK_NAMES`]).
+fn is_junk_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| JUNK_NAMES.contains(&n))
+}
 
 /// The full output of [`SpaceContext::scan`].
 ///
@@ -174,6 +192,15 @@ impl SpaceContext {
                 if dent.file_type().is_dir() {
                     walker.skip_current_dir();
                 }
+                continue;
+            }
+
+            // Skip built-in platform junk (`.DS_Store`, `Thumbs.db`,
+            // `desktop.ini`) in ANY directory, regardless of .filethingignore
+            // (ADR 0011). Matched by exact entry name; scanner side only, so it
+            // never enters the Manifest and a Space already carrying one
+            // converges by deletion.
+            if is_junk_name(dent.file_name()) {
                 continue;
             }
 

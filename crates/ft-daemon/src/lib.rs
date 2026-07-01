@@ -70,6 +70,13 @@ pub async fn serve(spaces: Vec<SpaceContext>, shutdown: impl Future<Output = ()>
     // every loop.
     let (stop_tx, stop_rx) = watch::channel(false);
 
+    // An empty Daemon has nothing to supervise but still honors the signal
+    // (documented contract; `run_loops` would otherwise return immediately).
+    if spaces.is_empty() {
+        shutdown.await;
+        return Ok(());
+    }
+
     // One supervised loop future per Space, each with its own shutdown receiver
     // and a stop sender so a loop that fails tears the others down too. (`!Send`
     // is fine; these stay on the current task.)
@@ -99,29 +106,42 @@ pub async fn serve(spaces: Vec<SpaceContext>, shutdown: impl Future<Output = ()>
         }
     });
 
-    // Drive all loops concurrently with a supervisor that, when the external
-    // `shutdown` resolves, flips the watch so every loop exits. `join_all` then
-    // resolves once they have all stopped.
-    let all = join_all(loops);
+    // Drive all loops to completion while fanning the external shutdown out
+    // through the watch. Surface the first real error.
+    let results = run_loops(join_all(loops), shutdown, &stop_tx).await;
+    for outcome in results {
+        outcome?;
+    }
+    Ok(())
+}
+
+/// Drives `all` (the joined Space loops) to completion, flipping `stop_tx` when
+/// `shutdown` resolves so every loop exits.
+///
+/// Must return AS SOON AS every loop has ended — even when `shutdown` never
+/// resolves. A plain `join(all, shutdown)` also waits for the shutdown: a Daemon
+/// whose every loop had died (e.g. a poisoned pull) sat alive-but-deaf until
+/// Ctrl-C, its error invisible until then (the "daemon zombi" bug).
+async fn run_loops<F: Future>(
+    all: futures::future::JoinAll<F>,
+    shutdown: impl Future<Output = ()>,
+    stop_tx: &watch::Sender<bool>,
+) -> Vec<F::Output> {
     let supervisor = async {
         shutdown.await;
         // Signal every loop to stop. The send only fails if every receiver has
         // already dropped (all loops exited), which is fine.
         let _ = stop_tx.send(true);
     };
-
-    // Run the loops and the supervisor together. `join_all` over an empty set
-    // resolves immediately, so an empty Daemon waits on `supervisor` (the
-    // shutdown) before returning.
-    let (results, ()) = futures::future::join(all, supervisor).await;
-
-    // Surface the first real error. A loop that errored already flipped nothing;
-    // but the supervisor's signal (sent on shutdown) tears the rest down, and an
-    // erroring loop simply ends — so we propagate the first failure here.
-    for outcome in results {
-        outcome?;
+    tokio::pin!(all);
+    tokio::pin!(supervisor);
+    tokio::select! {
+        // All loops ended on their own (an error tears the siblings down via
+        // the watch): return now, do not wait for the shutdown.
+        results = &mut all => results,
+        // Shutdown fired: the watch is flipped; now await the loops' exit.
+        () = &mut supervisor => all.await,
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -146,5 +166,41 @@ mod tests {
         };
         let r = serve(Vec::new(), shutdown).await;
         assert!(r.is_ok());
+    }
+
+    /// REGRESSION ("daemon zombi", diario 2026-07-01): once every loop has
+    /// ended (e.g. errored), the supervision must return WITHOUT waiting for a
+    /// shutdown that never fires. With `join` semantics this hangs: process
+    /// alive, no loops running, the error invisible until Ctrl-C.
+    #[tokio::test]
+    async fn run_loops_returns_when_all_loops_end_without_shutdown() {
+        let (tx, _rx) = watch::channel(false);
+        let all = join_all(vec![async { Err::<(), &str>("boom") }]);
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_loops(all, std::future::pending::<()>(), &tx),
+        )
+        .await
+        .expect("must return once all loops ended; hanging here = zombie daemon");
+        assert_eq!(results, vec![Err("boom")]);
+    }
+
+    /// The shutdown path still works: the signal flips the watch, a loop
+    /// observing it exits, and its result is collected.
+    #[tokio::test]
+    async fn run_loops_shutdown_flips_watch_and_collects_results() {
+        let (tx, mut rx) = watch::channel(false);
+        let waiter = async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+            7usize
+        };
+        let all = join_all(vec![waiter]);
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_loops(all, async {}, &tx),
+        )
+        .await
+        .expect("shutdown must end the loops promptly");
+        assert_eq!(results, vec![7]);
     }
 }

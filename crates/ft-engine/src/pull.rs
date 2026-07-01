@@ -254,7 +254,26 @@ impl SpaceContext {
     /// Upserts the local-index row for a freshly materialized [`FileEntry`] and
     /// records its Blocks as locally present (`§9`). The per-path `base_seq` is set
     /// to the head `seq` we are advancing to.
+    ///
+    /// Only for entries whose bytes came FROM the Vault: the block table is what
+    /// lets `upload_blocks` skip a PUT, so claiming a Block here asserts it is
+    /// already up there. For bytes that came from the local disk use
+    /// [`index_upsert_row`](Self::index_upsert_row) instead.
     fn index_upsert_materialized(&self, entry: &FileEntry) -> Result<()> {
+        self.index_upsert_row(entry)?;
+        let space_id = self.space_id.as_str();
+        for cid in &entry.bk {
+            self.index.put_block(space_id, cid)?;
+        }
+        Ok(())
+    }
+
+    /// Upserts the local-index row WITHOUT claiming its Blocks are in the Vault.
+    /// For entries written from LOCAL bytes (a conflict-copy loser whose edit was
+    /// never committed): the next commit must still see those Blocks as
+    /// not-yet-uploaded, or it publishes a Manifest referencing objects the Vault
+    /// does not have and every other Device's pull fails with `object not found`.
+    fn index_upsert_row(&self, entry: &FileEntry) -> Result<()> {
         use ft_index::{BlockRef, LocalEntry};
         let space_id = self.space_id.as_str();
         let casefold_key = ft_fsmap::casefold_key(&entry.p);
@@ -289,9 +308,6 @@ impl SpaceContext {
                 local_only,
             },
         )?;
-        for cid in &entry.bk {
-            self.index.put_block(space_id, cid)?;
-        }
         Ok(())
     }
 
@@ -450,6 +466,12 @@ impl SpaceContext {
             .map(|l| join_canonical(&self.local_root, &l.p))
             .unwrap_or_else(|| join_canonical(&self.local_root, &loser.p));
 
+        // Whether the copy's bytes verifiably came FROM the Vault. Decides which
+        // index upsert runs below: an offline loser's Blocks were never uploaded
+        // by anyone, and claiming them in the block table would make the next
+        // commit skip their upload — publishing a Manifest that references
+        // objects the Vault does not have (the "bloque fantasma" bug).
+        let mut from_vault = false;
         match loser.t {
             FileType::Symlink => {
                 let target = loser.lt.clone().unwrap_or_default();
@@ -472,11 +494,16 @@ impl SpaceContext {
                             loser,
                         )
                         .await?;
+                        from_vault = true;
                     }
                 }
             }
         }
-        self.index_upsert_materialized(loser)?;
+        if from_vault {
+            self.index_upsert_materialized(loser)?;
+        } else {
+            self.index_upsert_row(loser)?;
+        }
         let pcid = match loser.t {
             FileType::File => loser.pcid,
             _ => Pcid::new([0u8; 32]),

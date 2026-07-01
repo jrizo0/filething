@@ -468,3 +468,79 @@ async fn applied_writes_are_marked_as_echoes() {
     let other = Pcid::new([0xAB; 32]);
     assert!(!is_echo(&applied, &path, mtime, &other));
 }
+
+// ---------------------------------------------------------------------------
+// (5) OFFLINE CONFLICT REGRESSION ("bloque fantasma", diario 2026-07-01): the
+// conflict-copy LOSER's content came from the local disk and was never
+// committed by anyone — the next stage/commit MUST upload its Block, or the
+// published Manifest references an object the Vault does not have and every
+// other Device's pull dies with `object not found`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn conflict_copy_loser_block_reaches_vault_on_next_stage() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    // base: notes.txt = "BASE"; remote head: notes.txt = "REMOTE".
+    let base = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"BASE", false).await],
+    )
+    .await;
+    let remote = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"REMOTE", false).await],
+    )
+    .await;
+
+    // Device B at the base; the divergent edit happened with the daemon DOWN,
+    // so "LOCAL" was never scanned by a commit nor uploaded anywhere.
+    let bdir = tempfile::tempdir().unwrap();
+    write(bdir.path(), "notes.txt", b"BASE");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-phantom";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap();
+    write(bdir.path(), "notes.txt", b"LOCAL");
+
+    // The startup pull reconciles: REMOTE wins the path, LOCAL survives as the
+    // conflict copy on disk.
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    let conflicts = match outcome {
+        PullOutcome::Reconciled { conflicts } => conflicts,
+        other => panic!("expected Reconciled, got {other:?}"),
+    };
+    assert_eq!(conflicts.len(), 1);
+    let copy = conflicts[0].clone();
+
+    // The startup commit stages the merged tree. The loser's Block must land in
+    // the Vault HERE — nobody else ever had its bytes.
+    let staged = ctx.stage_to_vault().await.unwrap();
+    let loser_cid = ft_block::cid_for(b"LOCAL");
+    assert!(
+        vault.head(&ft_hash::block_key(&loser_cid)).await.unwrap(),
+        "the conflict-copy loser's Block must be uploaded by the next stage \
+         (a Manifest referencing a missing Block poisons every other Device's pull)"
+    );
+
+    // End-to-end: a Device already at the remote head pulls the reconciled
+    // root — the exact pull that died with `object not found` on the VPS.
+    let cdir = tempfile::tempdir().unwrap();
+    write(cdir.path(), "notes.txt", b"REMOTE");
+    let index_c = Index::open_in_memory().unwrap();
+    seed_state(&index_c, space_id, cdir.path(), remote, 1);
+    let mut ctx_c = mount(index_c, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx_c.scan().unwrap();
+    let applied = ctx_c
+        .apply_head(staged.root, Some(2), None)
+        .await
+        .expect("a peer must be able to materialize the reconciled head");
+    assert_eq!(applied, PullOutcome::FastForwarded { applied: 1 });
+    assert_eq!(
+        read(cdir.path(), &copy),
+        b"LOCAL",
+        "loser content intact on the peer"
+    );
+}

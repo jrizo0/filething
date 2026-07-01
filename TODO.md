@@ -89,6 +89,28 @@ Gates (validados a nivel engine; falta correrlos vía CLI real para el demo):
 
 ---
 
+## Hallazgos de prueba manual Mac↔VPS (2026-06-25) — sin investigar aún
+Observados por el usuario corriendo daemon en ambos lados (Mac release + VPS debug, vía túnel SSH).
+Anotados tal cual; pendientes de diagnóstico/fix.
+
+> ⚠️ Caveat de captura: durante la ventana de prueba (~20:57–21:19) el túnel SSH y el daemon del VPS
+> se cayeron por un parpadeo de red/VPN. Los hallazgos de **VPS→Mac que no se propagaron** podrían ser
+> artefactos de esa caída, no bugs reales — RE-VERIFICAR con el entorno estable antes de tratarlos como
+> confirmados. (Mitigado después: daemon VPS detached + túnel con auto-reconexión.)
+
+Probables bugs:
+- [ ] **Modificación VPS→Mac no se propaga**: creé un `.txt` con contenido desde el VPS → apareció en la Mac con su contenido (OK). Luego modifiqué el contenido desde el VPS y el archivo en la Mac NO cambió (esperé y no se vio el cambio).
+- [ ] **Borrado VPS→Mac no se propaga para archivo originado en la Mac**: agregué un archivo desde la Mac → llegó al VPS. Luego lo borré desde el VPS y NO se borró en la Mac.
+  - Nota: aparente contradicción con el caso que sí funcionó (ver abajo "borrado VPS→Mac inmediato"). La diferencia podría ser el origen del archivo (creado en VPS vs creado en Mac). Sin investigar.
+
+Latencia (mejora, no romper):
+- [ ] **Propagación de borrados Mac→VPS lenta**: borré un Excel en la Mac y tardó en desaparecer del VPS (al final desapareció, correcto). Se quiere que sea casi inmediato, tipo Dropbox/iCloud.
+
+Funcionó bien (referencia):
+- [x] Borrado VPS→Mac casi inmediato para un archivo creado en el VPS (esperado ✅).
+
+---
+
 ## Reservado — NO construir en el MVP (huecos ya cableados en el formato)
 - [R] Cifrado en runtime (`alg=1`, sidecars `keys/*`, derivación+cifrado AEAD)
 - [R] Zero-knowledge (cifrar páginas de Manifest, `reach/*` para GC)

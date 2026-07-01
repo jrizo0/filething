@@ -7,8 +7,9 @@
 //!
 //! What this crate does:
 //! - per-Space state ([`SpaceState`]): `last_synced_seq`/`last_synced_root`, the
-//!   FastCDC `chunk_secret`, the optional Account `dedup_secret`, and the
-//!   `local_root_path`;
+//!   optional `last_synced_revision_id` (the head's Revision id, for the
+//!   `behind?` check `§7`), the FastCDC `chunk_secret`, the optional Account
+//!   `dedup_secret`, and the `local_root_path`;
 //! - per-path entries ([`LocalEntry`]) keyed by `(space_id, path)`, with the
 //!   ordered `{pcid, cid}` Block list of §9 stored CBOR-encoded in the `blocks`
 //!   BLOB column;
@@ -19,7 +20,10 @@
 //! What this crate does NOT do (per `docs/BUILD-PLAN.md §3`): no sync, dedup,
 //! conflict or re-scan LOGIC lives here — only the storage those subsystems read
 //! and write. Schema is created with `CREATE TABLE IF NOT EXISTS` on open, so
-//! opening an existing DB is a no-op migration.
+//! opening an existing DB is a no-op migration. The one additive migration —
+//! the `space_state.last_synced_revision_id` column — is applied with an
+//! idempotent `ALTER TABLE ADD COLUMN` (see [`Index::init`]) because
+//! `CREATE TABLE IF NOT EXISTS` never alters a table that already exists.
 
 use std::path::Path;
 
@@ -70,10 +74,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Per-Space state on this Device (`space_state` table, §9).
 ///
 /// Mirrors the columns one-to-one: `last_synced_seq`/`last_synced_root` are the
-/// base Revision of the last sync (for the next diff), `chunk_secret` is the
-/// local copy of the Space's FastCDC secret, `dedup_secret` is the Account dedup
-/// secret (NULL in the cleartext MVP), and `local_root_path` is the folder mapped
-/// to this Space.
+/// base Revision of the last sync (for the next diff), `last_synced_revision_id`
+/// is that base Revision's id (the `expected_base` of the next commit's CAS and
+/// the value `status` compares against the remote head, `§7`), `chunk_secret` is
+/// the local copy of the Space's FastCDC secret, `dedup_secret` is the Account
+/// dedup secret (NULL in the cleartext MVP), and `local_root_path` is the folder
+/// mapped to this Space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceState {
     /// Space identifier (primary key).
@@ -82,6 +88,12 @@ pub struct SpaceState {
     pub last_synced_seq: i64,
     /// `manifestRootCid` of that base Revision (for diffing the next head).
     pub last_synced_root: Cid,
+    /// `RevisionId` of that base Revision, as the raw Convex id string. `None`
+    /// when no base is committed yet (a fresh/just-cloned Space) or for a DB
+    /// migrated before this column existed and not yet re-synced. Kept as
+    /// `Option<String>` so `ft-index` stays decoupled from `ft-coordinator`'s
+    /// `RevisionId`; the engine wraps/unwraps it (`§7`/`§9`).
+    pub last_synced_revision_id: Option<String>,
     /// Local copy of the Space's FastCDC chunk secret.
     pub chunk_secret: Vec<u8>,
     /// Local copy of the Account dedup secret. `None` in the cleartext MVP.
@@ -144,6 +156,7 @@ CREATE TABLE IF NOT EXISTS space_state (
   space_id        TEXT PRIMARY KEY,
   last_synced_seq INTEGER NOT NULL,
   last_synced_root TEXT NOT NULL,
+  last_synced_revision_id TEXT,
   chunk_secret    BLOB NOT NULL,
   dedup_secret    BLOB,
   local_root_path TEXT NOT NULL
@@ -206,6 +219,20 @@ impl Index {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        // Additive migration: `CREATE TABLE IF NOT EXISTS` never touches a table
+        // that already exists, so a DB created before `last_synced_revision_id`
+        // existed would be missing that column. Add it idempotently — SQLite
+        // raises a "duplicate column name" error if the column is already there
+        // (fresh DBs, where the CREATE above made it), which we swallow. Any
+        // OTHER SQLite error still propagates.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE space_state ADD COLUMN last_synced_revision_id TEXT",
+            [],
+        ) {
+            if !is_duplicate_column(&e) {
+                return Err(e.into());
+            }
+        }
         Ok(Self { conn })
     }
 
@@ -221,11 +248,12 @@ impl Index {
     pub fn upsert_space_state(&self, state: &SpaceState) -> Result<()> {
         self.conn.execute(
             "INSERT INTO space_state \
-               (space_id, last_synced_seq, last_synced_root, chunk_secret, dedup_secret, local_root_path) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+               (space_id, last_synced_seq, last_synced_root, last_synced_revision_id, chunk_secret, dedup_secret, local_root_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(space_id) DO UPDATE SET \
                last_synced_seq = excluded.last_synced_seq, \
                last_synced_root = excluded.last_synced_root, \
+               last_synced_revision_id = excluded.last_synced_revision_id, \
                chunk_secret = excluded.chunk_secret, \
                dedup_secret = excluded.dedup_secret, \
                local_root_path = excluded.local_root_path",
@@ -233,6 +261,7 @@ impl Index {
                 state.space_id,
                 state.last_synced_seq,
                 state.last_synced_root.to_hex(),
+                state.last_synced_revision_id,
                 state.chunk_secret,
                 state.dedup_secret,
                 state.local_root_path,
@@ -245,7 +274,7 @@ impl Index {
     pub fn get_space_state(&self, space_id: &str) -> Result<Option<SpaceState>> {
         self.conn
             .query_row(
-                "SELECT space_id, last_synced_seq, last_synced_root, chunk_secret, dedup_secret, local_root_path \
+                "SELECT space_id, last_synced_seq, last_synced_root, last_synced_revision_id, chunk_secret, dedup_secret, local_root_path \
                  FROM space_state WHERE space_id = ?1",
                 params![space_id],
                 |row| {
@@ -253,19 +282,29 @@ impl Index {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()?
             .map(
-                |(space_id, last_synced_seq, root_hex, chunk_secret, dedup_secret, local_root_path)| {
+                |(
+                    space_id,
+                    last_synced_seq,
+                    root_hex,
+                    last_synced_revision_id,
+                    chunk_secret,
+                    dedup_secret,
+                    local_root_path,
+                )| {
                     Ok(SpaceState {
                         space_id,
                         last_synced_seq,
                         last_synced_root: Cid::from_hex(&root_hex)?,
+                        last_synced_revision_id,
                         chunk_secret,
                         dedup_secret,
                         local_root_path,
@@ -491,6 +530,16 @@ fn decode_blocks(bytes: &[u8]) -> Result<Vec<BlockRef>> {
     ciborium::de::from_reader(bytes).map_err(|e| Error::DecodeBlocks(e.to_string()))
 }
 
+/// `true` when `e` is the "duplicate column name" error SQLite raises from
+/// `ALTER TABLE ... ADD COLUMN` when the column already exists. The C API
+/// reports this as a generic `SQLITE_ERROR` (no dedicated extended code), so we
+/// match on the message text — but ONLY that text, so any other failure of the
+/// migration still surfaces. Lets the additive migration in [`Index::init`] run
+/// unconditionally on both fresh DBs (column already created) and old ones.
+fn is_duplicate_column(e: &rusqlite::Error) -> bool {
+    e.to_string().contains("duplicate column name")
+}
+
 /// Converts a 32-byte BLOB into a [`Cid`], validating length.
 fn cid_from_blob(bytes: &[u8]) -> Result<Cid> {
     let arr: [u8; 32] = bytes
@@ -516,6 +565,7 @@ mod tests {
             space_id: "space-1".to_string(),
             last_synced_seq: 42,
             last_synced_root: Cid::new([7u8; 32]),
+            last_synced_revision_id: Some("rev-abc123".to_string()),
             chunk_secret: vec![1, 2, 3, 4],
             dedup_secret: None,
             local_root_path: "/home/dev/space-1".to_string(),
@@ -593,6 +643,70 @@ mod tests {
         assert_eq!(got, sample_state());
     }
 
+    #[test]
+    fn migration_adds_revision_id_column_to_a_pre_migration_db() {
+        // Simulate a DB created BEFORE `last_synced_revision_id` existed: the old
+        // `space_state` shape with a row already in it. Then open it through the
+        // normal path and confirm the additive ALTER TABLE runs (no "duplicate
+        // column" panic), the column reads NULL as `None`, and re-syncing writes
+        // a real id. This is the `~/.filething-{mac,vps}` upgrade case.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE space_state (
+                   space_id        TEXT PRIMARY KEY,
+                   last_synced_seq INTEGER NOT NULL,
+                   last_synced_root TEXT NOT NULL,
+                   chunk_secret    BLOB NOT NULL,
+                   dedup_secret    BLOB,
+                   local_root_path TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            // `last_synced_root` is a 32-byte Cid hex (64 chars), as the real
+            // schema stores it.
+            let root_hex = Cid::new([7u8; 32]).to_hex();
+            conn.execute(
+                "INSERT INTO space_state \
+                   (space_id, last_synced_seq, last_synced_root, chunk_secret, dedup_secret, local_root_path) \
+                 VALUES ('space-1', 7, ?1, x'0102', NULL, '/tmp/space-1')",
+                params![root_hex],
+            )
+            .unwrap();
+        }
+
+        // Opening migrates the schema in place and must not error.
+        let idx = Index::open(&path).unwrap();
+        let got = idx.get_space_state("space-1").unwrap().unwrap();
+        // The pre-existing row's new column is NULL -> None.
+        assert_eq!(got.last_synced_revision_id, None);
+        assert_eq!(got.last_synced_seq, 7);
+
+        // A subsequent sync writes a real id into the migrated column.
+        let mut updated = got;
+        updated.last_synced_revision_id = Some("rev-after-migration".to_string());
+        idx.upsert_space_state(&updated).unwrap();
+        let reread = idx.get_space_state("space-1").unwrap().unwrap();
+        assert_eq!(
+            reread.last_synced_revision_id,
+            Some("rev-after-migration".to_string())
+        );
+
+        // Reopening the (now-migrated) DB must still be a no-op — the ALTER is
+        // swallowed because the column already exists.
+        drop(idx);
+        let idx2 = Index::open(&path).unwrap();
+        assert_eq!(
+            idx2.get_space_state("space-1")
+                .unwrap()
+                .unwrap()
+                .last_synced_revision_id,
+            Some("rev-after-migration".to_string())
+        );
+    }
+
     // ----- space_state roundtrip -----
 
     #[test]
@@ -612,6 +726,25 @@ mod tests {
         idx.upsert_space_state(&state).unwrap();
         let got = idx.get_space_state("space-1").unwrap().unwrap();
         assert_eq!(got.dedup_secret, Some(vec![10, 20, 30]));
+    }
+
+    #[test]
+    fn space_state_revision_id_roundtrips_some_and_none() {
+        let idx = Index::open_in_memory().unwrap();
+        // Some(...) survives the roundtrip.
+        let mut state = sample_state();
+        state.last_synced_revision_id = Some("rev-XYZ".to_string());
+        idx.upsert_space_state(&state).unwrap();
+        let got = idx.get_space_state("space-1").unwrap().unwrap();
+        assert_eq!(got.last_synced_revision_id, Some("rev-XYZ".to_string()));
+        assert_eq!(got, state);
+
+        // None (the fresh/just-cloned convention) round-trips and OVERWRITES the
+        // previous Some — the upsert must null the column, not leave it stale.
+        state.last_synced_revision_id = None;
+        idx.upsert_space_state(&state).unwrap();
+        let got = idx.get_space_state("space-1").unwrap().unwrap();
+        assert_eq!(got.last_synced_revision_id, None);
     }
 
     #[test]

@@ -80,6 +80,7 @@ fn seed_state(index: &Index, space_id: &str, root: &Path, base_root: Cid, base_s
             space_id: space_id.to_string(),
             last_synced_seq: base_seq,
             last_synced_root: base_root,
+            last_synced_revision_id: None,
             chunk_secret: [0x42; 32].to_vec(),
             dedup_secret: None,
             local_root_path: root.to_string_lossy().into_owned(),

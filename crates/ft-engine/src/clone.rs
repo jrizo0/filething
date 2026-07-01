@@ -82,6 +82,9 @@ impl SpaceContext {
             space_id: space_id.as_str().to_string(),
             last_synced_seq: -1,
             last_synced_root: empty_root,
+            // "No base yet": the `pull` in step (5) fast-forwards to the head and
+            // persists the real Revision id via `advance_base_to` (`§9`).
+            last_synced_revision_id: None,
             chunk_secret: chunk_secret.to_vec(),
             dedup_secret: None,
             local_root_path: local_root.to_string_lossy().into_owned(),

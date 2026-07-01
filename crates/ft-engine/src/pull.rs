@@ -136,10 +136,15 @@ impl SpaceContext {
         };
 
         // Head unchanged vs the synced base -> up to date. Adopt the head's
-        // RevisionId if we did not have it (e.g. after a fresh open).
+        // RevisionId if we did not have it (e.g. after a fresh open) and PERSIST it
+        // (`§9`): on an already-synced Space this is the only path that learns the
+        // base id, so without persisting here `status` (a fresh process) would
+        // reload `None` and forever report a false "behind — pull pending".
         if head_root == self.last_synced.root {
-            if self.last_synced_revision_id.is_none() {
+            if self.last_synced_revision_id.is_none() && head.revision_id.is_some() {
                 self.last_synced_revision_id = head.revision_id.clone();
+                // Best-effort persist; a failure surfaces on the next index op.
+                let _ = self.persist_space_state();
             }
             return Ok(PullOutcome::UpToDate);
         }

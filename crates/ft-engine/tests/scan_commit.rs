@@ -75,6 +75,7 @@ fn seed_space_state(index: &Index, space_id: &str, local_root: &Path, chunk_secr
             // seq = -1: never synced, so a stage/commit is never short-circuited.
             last_synced_seq: -1,
             last_synced_root: ft_manifest::build(Vec::new()).root,
+            last_synced_revision_id: None,
             chunk_secret: chunk_secret.to_vec(),
             dedup_secret: None,
             local_root_path: local_root.to_string_lossy().into_owned(),

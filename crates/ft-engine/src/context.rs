@@ -188,7 +188,15 @@ impl SpaceContext {
                 seq: state.last_synced_seq,
                 root: state.last_synced_root,
             },
-            last_synced_revision_id: None,
+            // Recover the persisted head Revision id (`§9`). Without this the
+            // `behind?` check in `status` always saw `None` on a fresh process and
+            // reported a false "pull pending"; now a synced Device reloads its
+            // real base id. `None` for a fresh/just-cloned Space or a DB migrated
+            // before the column existed (filled in by the next commit/pull).
+            last_synced_revision_id: state
+                .last_synced_revision_id
+                .as_ref()
+                .map(|s| RevisionId::new(s.clone())),
             applied: None,
         })
     }
@@ -218,6 +226,14 @@ impl SpaceContext {
             space_id: self.space_id.as_str().to_string(),
             last_synced_seq: self.last_synced.seq,
             last_synced_root: self.last_synced.root,
+            // Persist the head Revision id so a later fresh process (e.g. a one-shot
+            // `status`) recovers the real base instead of defaulting to `None` and
+            // reporting a false "behind — pull pending" (`§7`/`§9`). Stored as the
+            // raw id string to keep `ft-index` decoupled from `RevisionId`.
+            last_synced_revision_id: self
+                .last_synced_revision_id
+                .as_ref()
+                .map(|r| r.as_str().to_string()),
             chunk_secret: self.chunk_secret.to_vec(),
             dedup_secret: None, // cleartext MVP: cid == pcid, no dedup secret (§4.4).
             local_root_path: self.local_root.to_string_lossy().into_owned(),

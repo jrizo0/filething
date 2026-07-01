@@ -273,6 +273,9 @@ impl SpaceContext {
             space_id: space_id.as_str().to_string(),
             last_synced_seq: -1,
             last_synced_root: empty_root,
+            // No Revision committed yet (the first `commit` below sets it and
+            // re-persists); `None` is the correct seed (`§7`/`§9`).
+            last_synced_revision_id: None,
             chunk_secret: chunk_secret.to_vec(),
             dedup_secret: None,
             local_root_path: local_root.to_string_lossy().into_owned(),

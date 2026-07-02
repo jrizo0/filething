@@ -1,0 +1,41 @@
+name: Backend
+
+# Corre en cada PR y solo en push directo a main (tras el merge).
+# El filtro `paths` hace que solo arranque cuando cambia el backend Convex.
+on:
+  pull_request:
+    paths:
+      - 'packages/**'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/backend.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/backend.yml'
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Convex backend (Coordinator): install deps + typecheck the schema/functions.
+  check:
+    name: bun install + tsc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      - name: tsc --noEmit
+        run: bun run --cwd packages/backend typecheck

@@ -25,7 +25,7 @@
 
 use std::future::Future;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ft_watcher::{is_echo, ChangeEvent, ChangeKind, Watcher};
 use futures::StreamExt;
@@ -33,6 +33,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::context::{join_canonical, SpaceContext};
 use crate::error::Result;
+use crate::metrics::SyncMetrics;
+use crate::{CommitOutcome, PullOutcome};
 
 /// How long to wait for the filesystem to go quiet before committing a burst of
 /// edits as one Revision. Short enough to feel live, long enough to fold an
@@ -50,6 +52,15 @@ const COMMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 /// returns [`PullOutcome::UpToDate`](crate::PullOutcome) early, `pull.rs:143-150`),
 /// and it recovers a stuck feed without a restart.
 const FALLBACK_PULL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the head may go unconfirmed — no feed update AND no successful
+/// backstop pull — before the daemon logs a staleness alert (`TODO.md` Fase B,
+/// "alerta si un daemon queda >N min sin ver el head"). ~10× the backstop
+/// interval: a healthy Device confirms the head at least every 30s.
+const STALE_HEAD_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+/// How often the watchdog checks head-staleness and emits a metrics heartbeat.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 
 impl SpaceContext {
     /// Runs the continuous sync loop until `shutdown` resolves (`§8`/`§9`).
@@ -90,10 +101,24 @@ impl SpaceContext {
         let head_stream = head_coord.subscribe_head(&space_id).await?;
         tokio::pin!(head_stream);
 
+        // Observability (Fase B): a per-Space counter set persisted under the
+        // control dir so `filething metrics` can read this daemon's activity. It
+        // is telemetry only — a failed write never disturbs sync.
+        let mut metrics = SyncMetrics::load(&self.local_root);
+        metrics.mark_started();
+        metrics.save(&self.local_root);
+        // Head-staleness watchdog state: when the head was last confirmed (feed
+        // update OR a successful pull), and whether we have already alerted for
+        // the current stale episode (so we warn once, not every tick).
+        let mut last_head_seen = Instant::now();
+        let mut stale_alerted = false;
+
         // Initial catch-up so a freshly mounted Device is current before watching:
         // pull the head AND commit any local edits/deletes made while the daemon
         // was down (§7/§9).
         self.startup_sync().await?;
+        metrics.record_head_seen();
+        metrics.save(&self.local_root);
 
         tokio::pin!(shutdown);
         let mut dirty = false;
@@ -110,6 +135,13 @@ impl SpaceContext {
             FALLBACK_PULL_INTERVAL,
         );
         fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // The watchdog + heartbeat timer.
+        let mut watchdog = tokio::time::interval_at(
+            tokio::time::Instant::now() + WATCHDOG_INTERVAL,
+            WATCHDOG_INTERVAL,
+        );
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -131,8 +163,21 @@ impl SpaceContext {
                 Some(update) = head_stream.next() => {
                     // A parse error on one pushed value is logged, not fatal.
                     match update {
-                        Ok(_) => { self.pull().await?; }
-                        Err(e) => tracing::warn!(error = %e, "head feed parse error"),
+                        Ok(_) => {
+                            // The feed is alive: the head is confirmed regardless of
+                            // whether the pull changes anything.
+                            last_head_seen = Instant::now();
+                            stale_alerted = false;
+                            metrics.record_head_seen();
+                            let outcome = self.pull().await?;
+                            record_pull_outcome(outcome, &mut metrics);
+                            metrics.save(&self.local_root);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "head feed parse error");
+                            metrics.record_feed_error();
+                            metrics.save(&self.local_root);
+                        }
                     }
                 }
 
@@ -144,19 +189,59 @@ impl SpaceContext {
                 // kill the daemon; warn and let the next tick retry. A persistent
                 // fault stays visible as a warning every interval.
                 _ = fallback.tick() => {
-                    if let Err(e) = self.pull().await {
-                        tracing::warn!(error = %e, "backstop pull failed; retrying next interval");
+                    match self.pull().await {
+                        Ok(outcome) => {
+                            // A successful backstop pull confirms the head is
+                            // reachable even when the feed is silent.
+                            last_head_seen = Instant::now();
+                            stale_alerted = false;
+                            metrics.record_head_seen();
+                            record_pull_outcome(outcome, &mut metrics);
+                            metrics.save(&self.local_root);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "backstop pull failed; retrying next interval");
+                        }
                     }
                 }
 
                 // Debounce fired: if there were real edits, commit them as one.
                 _ = &mut debounce, if dirty => {
                     dirty = false;
-                    self.commit_and_reconcile().await?;
+                    if let CommitOutcome::Committed { .. } = self.commit_and_reconcile().await? {
+                        metrics.record_commit();
+                    }
+                    metrics.save(&self.local_root);
+                }
+
+                // Watchdog + heartbeat: alert once if the head has gone unseen past
+                // the threshold, and log a periodic metrics line either way.
+                _ = watchdog.tick() => {
+                    if last_head_seen.elapsed() > STALE_HEAD_THRESHOLD && !stale_alerted {
+                        tracing::warn!(
+                            space = %self.space_id,
+                            unseen_secs = last_head_seen.elapsed().as_secs(),
+                            "head not confirmed past staleness threshold"
+                        );
+                        metrics.record_stale();
+                        stale_alerted = true;
+                    }
+                    tracing::info!(
+                        space = %self.space_id,
+                        commits = metrics.commits,
+                        pulls = metrics.pulls_applied,
+                        conflicts = metrics.conflicts,
+                        feed_errors = metrics.feed_errors,
+                        stale_alerts = metrics.stale_alerts,
+                        "sync metrics"
+                    );
+                    metrics.save(&self.local_root);
                 }
             }
         }
 
+        // Persist a final snapshot on clean shutdown.
+        metrics.save(&self.local_root);
         drop(bridge);
         Ok(())
     }
@@ -240,5 +325,17 @@ impl SpaceContext {
                 !is_echo(applied, &canonical, mtime, &pcid)
             }
         }
+    }
+}
+
+/// Folds a [`PullOutcome`] into the [`SyncMetrics`] counters: an applied
+/// fast-forward or reconcile bumps `pulls_applied` (and adds any conflict
+/// copies); an up-to-date pull is not counted.
+fn record_pull_outcome(outcome: PullOutcome, metrics: &mut SyncMetrics) {
+    match outcome {
+        PullOutcome::UpToDate => {}
+        PullOutcome::FastForwarded { applied } if applied > 0 => metrics.record_pull_applied(0),
+        PullOutcome::FastForwarded { .. } => {}
+        PullOutcome::Reconciled { conflicts } => metrics.record_pull_applied(conflicts.len()),
     }
 }

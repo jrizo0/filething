@@ -1,46 +1,80 @@
 //! Building the engine's collaborators from the environment (`docs/BUILD-PLAN.md
-//! §3`, the MVP self-hosted credential model).
+//! §3`, the credential model).
 //!
-//! For the local MVP the Coordinator URL + admin key and the Vault `S3_*`
-//! credentials come from the environment (mirroring `infra/.env`); in production
-//! they would come from a real auth flow. These helpers centralize that wiring so
-//! every subcommand builds a [`Coordinator`] (with admin auth) and a [`Vault`] the
-//! same way.
+//! The Coordinator URL + admin/deploy key and the Vault `S3_*` credentials come
+//! from the environment. The same wiring serves two deployments (see
+//! `docs/PRODUCTION-SETUP.md`):
+//!
+//! - **Local Docker infra** (self-hosted Convex + MinIO): the legacy
+//!   `CONVEX_SELF_HOSTED_URL` / `CONVEX_SELF_HOSTED_ADMIN_KEY` vars.
+//! - **Managed cloud** (Convex Cloud + Cloudflare R2): the cloud-neutral
+//!   `CONVEX_URL` + `CONVEX_DEPLOY_KEY` (or `CONVEX_ADMIN_KEY`) vars, which take
+//!   precedence. For personal use the Convex Cloud **deploy key** is fed through
+//!   the same `set_admin_auth` path (acceptable only while every Device is the
+//!   owner's — real per-user auth is a reserved hole, `TODO.md` Fase B).
+//!
+//! These helpers centralize that wiring so every subcommand builds a
+//! [`Coordinator`] (with admin auth) and a [`Vault`] the same way.
 
 use std::path::Path;
 
 use anyhow::Context as _;
 use ft_engine::{Coordinator, Vault};
 
-/// Env var holding the self-hosted Convex URL (default `http://localhost:3210`).
-const ENV_URL: &str = "CONVEX_SELF_HOSTED_URL";
-/// Env var holding the self-hosted Convex deployment admin key. Required to call
-/// the contract functions on a self-hosted backend.
-const ENV_ADMIN_KEY: &str = "CONVEX_SELF_HOSTED_ADMIN_KEY";
+/// Cloud-neutral Convex deployment URL (Convex Cloud `https://<name>.convex.cloud`).
+/// Preferred; falls back to [`ENV_URL_SELF_HOSTED`].
+const ENV_URL: &str = "CONVEX_URL";
+/// Legacy/self-hosted alias for the Convex URL (the local Docker infra).
+const ENV_URL_SELF_HOSTED: &str = "CONVEX_SELF_HOSTED_URL";
+/// Cloud-neutral admin credential. Preferred name.
+const ENV_ADMIN_KEY: &str = "CONVEX_ADMIN_KEY";
+/// Convex Cloud deploy key, used as client admin auth for personal-use Devices.
+const ENV_DEPLOY_KEY: &str = "CONVEX_DEPLOY_KEY";
+/// Legacy/self-hosted alias for the admin key (the local Docker infra).
+const ENV_ADMIN_KEY_SELF_HOSTED: &str = "CONVEX_SELF_HOSTED_ADMIN_KEY";
 /// The CONTROL_DIR subfolder of a Space root holding the local index.
 pub const CONTROL_DIR: &str = ".filething";
 /// The local index filename under the control dir.
 pub const INDEX_FILE: &str = "index.db";
 
-/// The Coordinator URL for this run: the env override, else the localhost
-/// default. Used both for `login` (no config yet) and to verify a config's URL.
+/// The first of `names` set to a non-empty value in the environment, if any.
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
+/// The Coordinator URL for this run: `CONVEX_URL`, then the self-hosted alias,
+/// else the localhost default. Used both for `login` (no config yet) and to
+/// verify a config's URL.
 pub fn coordinator_url_from_env() -> String {
-    std::env::var(ENV_URL).unwrap_or_else(|_| "http://localhost:3210".to_string())
+    first_env(&[ENV_URL, ENV_URL_SELF_HOSTED])
+        .unwrap_or_else(|| "http://localhost:3210".to_string())
 }
 
 /// Builds a [`Coordinator`] connected to `url` with deployment admin auth
-/// attached (the self-hosted MVP pattern: construct a [`convex::ConvexClient`],
-/// `set_admin_auth`, then [`Coordinator::from_client`]).
+/// attached (construct a [`convex::ConvexClient`], `set_admin_auth`, then
+/// [`Coordinator::from_client`]).
 ///
-/// The admin key is read from `CONVEX_SELF_HOSTED_ADMIN_KEY` and never persisted.
+/// The credential is resolved in precedence order — `CONVEX_ADMIN_KEY`,
+/// `CONVEX_DEPLOY_KEY` (Convex Cloud), `CONVEX_SELF_HOSTED_ADMIN_KEY` (local
+/// infra) — and is never persisted. When NONE is set the client connects WITHOUT
+/// admin auth: Convex functions are public by default over the sync protocol, so
+/// a personal-use Cloud deployment (whose functions have no `ctx.auth` checks)
+/// still works; a self-hosted deploy, however, needs a key. See
+/// `docs/PRODUCTION-SETUP.md`.
 pub async fn connect_coordinator(url: &str) -> anyhow::Result<Coordinator> {
-    let admin_key = std::env::var(ENV_ADMIN_KEY).with_context(|| {
-        format!("{ENV_ADMIN_KEY} must be set (the self-hosted Convex admin key)")
-    })?;
     let mut client = convex::ConvexClient::new(url)
         .await
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
-    client.set_admin_auth(admin_key, None).await;
+    match first_env(&[ENV_ADMIN_KEY, ENV_DEPLOY_KEY, ENV_ADMIN_KEY_SELF_HOSTED]) {
+        Some(admin_key) => client.set_admin_auth(admin_key, None).await,
+        None => tracing::warn!(
+            "no Convex credential set (CONVEX_DEPLOY_KEY / CONVEX_ADMIN_KEY / \
+             CONVEX_SELF_HOSTED_ADMIN_KEY); connecting without admin auth — fine for Convex \
+             Cloud public functions, but a self-hosted deployment needs a key"
+        ),
+    }
     Ok(Coordinator::from_client(client))
 }
 

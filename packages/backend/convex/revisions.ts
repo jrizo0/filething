@@ -89,6 +89,38 @@ export const commit = mutation({
   },
 });
 
+// List every Revision at or above `minSeq` — the GC's "retained" set (§6.3,
+// docs/adr/0007). Returns just the fields the sweeper needs (id + seq + the
+// Manifest root it must keep reachable), newest last (by_space_seq is ascending).
+// The GC unions the Manifest trees rooted at these `manifestRootCid`s; objects
+// reachable from none of them (and older than the grace-period) are swept.
+export const listFromSeq = query({
+  args: {
+    spaceId: v.id("spaces"),
+    minSeq: v.number(),
+  },
+  returns: v.array(
+    v.object({
+      revisionId: v.id("revisions"),
+      seq: v.number(),
+      manifestRootCid: v.bytes(),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("revisions")
+      .withIndex("by_space_seq", (q) =>
+        q.eq("spaceId", args.spaceId).gte("seq", args.minSeq),
+      )
+      .collect();
+    return rows.map((r) => ({
+      revisionId: r._id,
+      seq: r.seq,
+      manifestRootCid: r.manifestRootCid,
+    }));
+  },
+});
+
 // Fetch a Revision by its (spaceId, seq) via the by_space_seq index.
 export const bySeq = query({
   args: {

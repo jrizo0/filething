@@ -15,7 +15,7 @@
 // All hashes (manifestRootCid, metaBlobCid) cross the wire as v.bytes()
 // (ArrayBuffer <-> Vec<u8>), never v.string() (format.md §6.2, constraint 1).
 
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import { mutation, query } from "./_generated/server";
 
 // Create a Space with no head (the first Revision is committed later via
@@ -108,5 +108,56 @@ export const head = query({
       manifestRootCid: headRev.manifestRootCid,
       parent: headRev.parent,
     };
+  },
+});
+
+// Recompute and persist the Space's GC retention floor (§6.3, docs/adr/0007).
+//
+// The floor = min(baseSeqInUse) over every Device on the owning Account: the GC
+// must never sweep objects reachable from a Revision with seq >= floor, so an
+// offline Device sitting on an old base can still diff/reconcile against it.
+// A Device reports its base via devices:setBaseSeq; the GC calls this right
+// before a sweep so the floor reflects the freshest telemetry.
+//
+// Conservative by construction: baseSeqInUse is a single per-Device scalar (not
+// per-Space), so a Device behind on ANOTHER Space drags this floor down and the
+// GC over-retains — the safe direction for a destructive operation. Clamped to
+// [0, headSeq]; with no Devices the floor stays 0 (retain all history).
+export const refreshRetentionFloor = mutation({
+  args: {
+    spaceId: v.id("spaces"),
+  },
+  returns: v.object({
+    retentionFloorSeq: v.number(),
+    headSeq: v.union(v.number(), v.null()),
+  }),
+  handler: async (ctx, args) => {
+    const space = await ctx.db.get(args.spaceId);
+    if (space === null) {
+      throw new ConvexError({ code: "space_not_found", message: "no such Space" });
+    }
+
+    // The head seq is the upper bound the floor can never exceed.
+    let headSeq: number | null = null;
+    if (space.headRevisionId !== null) {
+      const headRev = await ctx.db.get(space.headRevisionId);
+      headSeq = headRev === null ? null : headRev.seq;
+    }
+
+    const devices = await ctx.db
+      .query("devices")
+      .withIndex("by_account", (q) => q.eq("accountId", space.accountId))
+      .collect();
+
+    // No Devices → retain everything (floor 0). Otherwise the minimum base.
+    let floor = 0;
+    if (devices.length > 0) {
+      floor = Math.min(...devices.map((d) => d.baseSeqInUse));
+    }
+    if (floor < 0) floor = 0;
+    if (headSeq !== null && floor > headSeq) floor = headSeq;
+
+    await ctx.db.patch(args.spaceId, { retentionFloorSeq: floor });
+    return { retentionFloorSeq: floor, headSeq };
   },
 });

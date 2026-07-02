@@ -122,38 +122,43 @@ rompía era el lado que *recibe* y dos huecos de resiliencia del daemon.
 Objetivo: salir de la infra de juguete (Docker en el VPS) a la infra gestionada real, y dejar
 el producto usable en producción. Orden pensado para que cada fase sea usable por sí sola.
 
-### Fase A — Infra gestionada (uso propio, multi-red real)
+### Fase A — Infra gestionada (uso propio, multi-red real) — CÓDIGO/CONFIG LISTO (2026-07-02)
 La migración de datos es barata: los Blocks son content-addressed (re-subir o `aws s3 sync`
 al bucket nuevo) y el Coordinator se re-crea (re-init de Spaces si no se migran los docs).
-- [ ] **Convex Cloud**: crear proyecto/deployment, `npx convex deploy` de `packages/backend`,
-  apuntar `CONVEX_SELF_HOSTED_URL` → URL del deployment. ⚠️ No es 100% config: el cliente Rust
-  hoy se autentica con el **admin key self-hosted**; en cloud eso no existe para clientes — para
-  uso personal se puede usar un deploy key (aceptable solo mientras todos los devices sean tuyos),
-  y para terceros exige la Fase B (auth real). Verificar también que el change feed (WebSocket)
-  funciona igual contra cloud.
-- [ ] **Cloudflare R2**: crear bucket + API token con scope al bucket; apuntar
-  `S3_ENDPOINT`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`/`S3_BUCKET`. El backend S3 de `ft-vault` ya
-  habla R2 (mismo protocolo); sin egress fees. Validar `scripts/demo-gates.sh` completo (a–f)
-  contra R2 + Convex Cloud antes de dar por buena la migración.
-- [ ] **Secretos fuera del repo**: env/secret manager para las credenciales R2 y Convex
-  (hoy viven en `infra/.env` local, que no se commitea — mantenerlo así).
-- [ ] Sin túnel SSH: con infra gestionada, Mac y VPS hablan directo a Convex/R2 por HTTPS —
-  desaparece la fragilidad del túnel que contaminó la prueba del 25.
-- [ ] Re-correr la prueba Mac↔VPS contra la infra gestionada (el escenario real de uso).
+Runbook completo: `docs/PRODUCTION-SETUP.md`. ADR: `docs/adr/0013`.
+- [x] **Auth cloud-neutral en el cliente**: `apps/cli/src/env.rs` lee `CONVEX_URL` +
+  `CONVEX_DEPLOY_KEY`/`CONVEX_ADMIN_KEY` (fallback a `CONVEX_SELF_HOSTED_*`); si no hay
+  credencial, conecta sin auth (funciones Convex públicas por defecto). Deploy key vía la ruta
+  `set_admin_auth` (`#[doc(hidden)]`) → **verificar en vivo** con `scripts/cloud-smoke.sh`.
+- [x] **Convex Cloud**: `scripts/cloud-deploy.sh` (deploy no interactivo con `CONVEX_DEPLOY_KEY`).
+- [x] **Cloudflare R2**: config-only (`ft-vault` ya habla R2; `S3_REGION=auto`, path-style).
+  Plantilla `infra/.env.cloud.example`.
+- [x] **Secretos fuera del repo**: `infra/.env.cloud` (gitignored, en `.gitignore`).
+- [ ] **Provisionar cuentas + validar en vivo** (pendiente de credenciales del usuario):
+  crear R2 bucket + token y proyecto Convex Cloud (guía en el runbook), correr
+  `cloud-deploy.sh` + `cloud-smoke.sh`, y re-correr la prueba Mac↔VPS contra la nube (sin túnel
+  SSH — Mac y VPS hablan directo por HTTPS).
 
 ### Fase B — Endurecer para usuarios reales (desbloquea cobrar)
-En orden de prioridad; los [R] de abajo guardan los huecos ya cableados en el formato:
+En orden de prioridad; los [R] de abajo guardan los huecos ya cableados en el formato.
+Entró en la tanda del 2026-07-02: daemon-servicio + observabilidad + GC/retención.
 - [ ] **Auth real** (Better Auth): login por navegador + tokens por device emitidos en el
-  pairing; el cliente deja de necesitar cualquier key privilegiada. Prerrequisito para todo lo demás.
+  pairing; el cliente deja de necesitar cualquier key privilegiada. Prerrequisito para terceros.
 - [ ] **Cifrado en runtime** (`alg=1`, huecos ya reservados): antes de guardar bytes de
   terceros en R2. Data key determinista por cuenta (ADR 0003), sidecars `keys/<cid>`.
-- [ ] **Daemon como servicio** (launchd en macOS, systemd en Linux) con logs rotados —
-  hoy es foreground/nohup y el log se pierde al relanzar con `>`.
+- [x] **Daemon como servicio** (`filething service install/uninstall/status`): launchd en
+  macOS, systemd `--user` en Linux; env file 0600 con las credenciales + logs en
+  `<config_dir>/daemon.log`, reinicio al fallar. `apps/cli/src/service.rs` (generadores puros
+  testeados; carga/descarga vía launchctl/systemctl).
 - [ ] **Binarios por SO** (cargo-dist o similar) + firma/notarización en macOS.
-- [ ] **GC/retención** (grace-period + `retentionFloorSeq`, schema ya lo reserva): sin esto el
-  Vault solo crece.
-- [ ] **Observabilidad mínima**: métricas de sync (commits, pulls, conflictos, errores del
-  feed) y alerta si un daemon queda >N min sin ver el head.
+- [~] **GC/retención** (`filething gc`, dry-run por defecto): mark-and-sweep **account-wide de
+  huérfanos** (retiene TODO el historial; borra solo objetos que ninguna Revision referencia) +
+  grace-period + guard de concurrencia. Validado en vivo (demo-gates gate g). ADR 0012. La
+  **poda de historial** (retention floor) queda diferida: necesita telemetría por-(Device,Space)
+  para un floor sound (el escalar `baseSeqInUse` actual no basta). Andamiaje reservado.
+- [x] **Observabilidad mínima**: `SyncMetrics` (commits, pulls, conflictos, errores del feed,
+  alertas de staleness) persistida en `<root>/.filething/metrics.json`; `filething metrics`;
+  watchdog que alerta si el head queda >5 min sin confirmarse; heartbeat por `tracing`.
 - [ ] Validación de nombres Windows (antes de soportar Windows) y packing de bloques chicos
   (costo/latencia en R2) — según demanda.
 - [ ] **Billing (Polar) + dashboard (Next.js)**: cuando haya usuarios que cobrar (Seats por

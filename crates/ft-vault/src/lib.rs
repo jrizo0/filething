@@ -1,7 +1,7 @@
 //! ft-vault — content-addressed storage (the data plane). `docs/format.md §6.1`.
 //!
-//! The async [`Vault`] trait ([`Vault::head`]/[`Vault::get`]/[`Vault::put`]) with
-//! two backends:
+//! The async [`Vault`] trait ([`Vault::head`]/[`Vault::get`]/[`Vault::put`], plus
+//! [`Vault::list`]/[`Vault::delete`] for garbage collection) with two backends:
 //!
 //! - [`S3Vault`] — talks to MinIO locally / Cloudflare R2 in prod, via the AWS
 //!   SDK with **path-style** addressing forced on (`force_path_style(true)`) so a
@@ -18,6 +18,7 @@
 //! Coordinator never reads the Vault (§6.1).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -61,6 +62,19 @@ pub enum VaultError {
 /// `Result` alias over [`VaultError`].
 pub type VaultResult<T> = std::result::Result<T, VaultError>;
 
+/// One object surfaced by [`Vault::list`]: its full Vault key plus a best-effort
+/// last-modified time. The GC uses `last_modified` for the grace-period guard
+/// (never sweep an object younger than the grace window, `docs/adr/0007`), so a
+/// backend that cannot report it (`None`) forces the safe choice: such an object
+/// is treated as "too young to sweep".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultObject {
+    /// The object's full fan-out key (e.g. `blocks/9f/9f86…`).
+    pub key: String,
+    /// The object's last-modified time, when the backend reports one.
+    pub last_modified: Option<SystemTime>,
+}
+
 // ---------------------------------------------------------------------------
 // The Vault trait (docs/BUILD-PLAN.md §3, F9)
 // ---------------------------------------------------------------------------
@@ -87,6 +101,19 @@ pub trait Vault: Send + Sync {
     /// Stores `body` at `key`. Idempotent: storing the same content-addressed
     /// object again is a no-op from the caller's point of view.
     async fn put(&self, key: &str, body: Vec<u8>) -> VaultResult<()>;
+
+    /// Lists every object whose key starts with `prefix`, following backend
+    /// pagination to completion. The GC calls this over the `blocks/`,
+    /// `manifest/`, `blocklist/` and `meta/` prefixes to enumerate the physical
+    /// object set it then diffs against the reachable set (`docs/adr/0007`).
+    /// Order is unspecified.
+    async fn list(&self, prefix: &str) -> VaultResult<Vec<VaultObject>>;
+
+    /// Deletes the object at `key`. **Idempotent**: deleting a key that does not
+    /// exist is `Ok(())`, never [`VaultError::NotFound`] — a GC sweep that races
+    /// another sweep (or a manual cleanup) must not fail on an already-gone
+    /// object.
+    async fn delete(&self, key: &str) -> VaultResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +185,70 @@ impl Vault for FsVault {
                 key: key.to_string(),
                 source,
             })
+    }
+
+    async fn list(&self, prefix: &str) -> VaultResult<Vec<VaultObject>> {
+        // Iterative walk of the whole store rooted at `self.root`, filtering by
+        // the (forward-slash) key prefix. Iterative (an explicit stack) rather
+        // than recursive to avoid boxing an async recursion. A missing directory
+        // is simply an empty listing (the vault may be brand new).
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(VaultError::Io {
+                        key: dir.to_string_lossy().into_owned(),
+                        source,
+                    })
+                }
+            };
+            while let Some(entry) = rd.next_entry().await.map_err(|source| VaultError::Io {
+                key: dir.to_string_lossy().into_owned(),
+                source,
+            })? {
+                let path = entry.path();
+                let file_type = entry.file_type().await.map_err(|source| VaultError::Io {
+                    key: path.to_string_lossy().into_owned(),
+                    source,
+                })?;
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                // Reconstruct the Vault key from the path relative to root, always
+                // with forward slashes (the fan-out key shape) regardless of OS.
+                let Ok(rel) = path.strip_prefix(&self.root) else {
+                    continue;
+                };
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                let last_modified = entry.metadata().await.ok().and_then(|m| m.modified().ok());
+                out.push(VaultObject { key, last_modified });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> VaultResult<()> {
+        let path = self.path_for(key);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            // Idempotent: an already-absent object is a successful delete.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(VaultError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
     }
 }
 
@@ -327,6 +418,66 @@ impl Vault for S3Vault {
             })?;
         Ok(())
     }
+
+    async fn list(&self, prefix: &str) -> VaultResult<Vec<VaultObject>> {
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = continuation.take() {
+                req = req.continuation_token(token);
+            }
+            let resp = req.send().await.map_err(|err| VaultError::S3 {
+                key: format!("list {prefix}"),
+                message: format!("{}", err.into_service_error()),
+            })?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    out.push(VaultObject {
+                        key: key.to_string(),
+                        last_modified: obj.last_modified().and_then(datetime_to_systemtime),
+                    });
+                }
+            }
+            // Follow pagination only while the response says it is truncated AND
+            // hands back a token; otherwise we have the full listing.
+            match (resp.is_truncated(), resp.next_continuation_token()) {
+                (Some(true), Some(token)) => continuation = Some(token.to_string()),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> VaultResult<()> {
+        // S3 DELETE is idempotent: deleting an absent key returns success.
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| VaultError::S3 {
+                key: key.to_string(),
+                message: format!("{}", err.into_service_error()),
+            })?;
+        Ok(())
+    }
+}
+
+/// Converts an S3 SDK [`DateTime`](aws_sdk_s3::primitives::DateTime) to a
+/// [`SystemTime`]. Returns `None` for a pre-epoch timestamp (never expected for a
+/// stored object) so the caller treats it conservatively.
+fn datetime_to_systemtime(dt: &aws_sdk_s3::primitives::DateTime) -> Option<SystemTime> {
+    let secs = dt.secs();
+    if secs < 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::new(secs as u64, dt.subsec_nanos()))
 }
 
 #[cfg(test)]
@@ -403,6 +554,46 @@ mod tests {
         vault.put(key, Vec::new()).await.unwrap();
         assert!(vault.head(key).await.unwrap());
         assert_eq!(vault.get(key).await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn fs_vault_list_filters_by_prefix_and_reports_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+
+        vault.put("blocks/9f/9f86aa", b"a".to_vec()).await.unwrap();
+        vault.put("blocks/af/af1349", b"b".to_vec()).await.unwrap();
+        vault.put("manifest/ab/abc", b"c".to_vec()).await.unwrap();
+        vault.put("meta/de/def", b"d".to_vec()).await.unwrap();
+
+        let mut blocks = vault.list("blocks/").await.unwrap();
+        blocks.sort_by(|a, b| a.key.cmp(&b.key));
+        let keys: Vec<&str> = blocks.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, vec!["blocks/9f/9f86aa", "blocks/af/af1349"]);
+        // FsVault reports a real mtime for every listed object.
+        assert!(blocks.iter().all(|o| o.last_modified.is_some()));
+
+        // A prefix that matches nothing is an empty listing, not an error.
+        assert!(vault.list("nope/").await.unwrap().is_empty());
+
+        // Listing the whole store sees every object across prefixes.
+        assert_eq!(vault.list("").await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fs_vault_delete_removes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+        let key = "blocks/9f/9f86aa";
+        vault.put(key, b"payload".to_vec()).await.unwrap();
+        assert!(vault.head(key).await.unwrap());
+
+        vault.delete(key).await.unwrap();
+        assert!(!vault.head(key).await.unwrap());
+
+        // Deleting an already-absent object succeeds (idempotent).
+        vault.delete(key).await.unwrap();
+        vault.delete("blocks/00/never-existed").await.unwrap();
     }
 
     // ----- S3Vault: env-gated, only runs against a live MinIO -----

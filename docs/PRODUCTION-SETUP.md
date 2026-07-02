@@ -116,6 +116,11 @@ El deploy (Paso 4) imprime la URL del deployment de producción, con formato
    cp infra/.env.cloud.example infra/.env.cloud
    # edita infra/.env.cloud
    ```
+   > ⚠️ La `CONVEX_DEPLOY_KEY` tiene formato `prod:<nombre>|<secreto>`. El `|` rompe el
+   > `source` de bash si el valor NO va entrecomillado, y `source` deja la variable
+   > **vacía** (los scripts abortarán con "falta CONVEX_DEPLOY_KEY"). Enciérrala en
+   > **comillas simples**: `CONVEX_DEPLOY_KEY='prod:…|…'` (la plantilla ya trae las
+   > comillas — solo pega tu key dentro).
 
 2. **Verifica que `infra/.env.cloud` está gitignoreado** (ya lo está en este repo — el
    `.gitignore` incluye `.env.cloud`):

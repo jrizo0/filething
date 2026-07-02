@@ -77,13 +77,12 @@ else
   bad "B no refleja la edición de hello.txt"
 fi
 
-hr "PASO 4 (sanity) — filething gc --keep-all (dry-run)"
-# gc es dry-run por defecto; --keep-all no borra nada. Best-effort: si el binario aún
-# no trae el subcomando `gc` (se está añadiendo), esto NO tumba el smoke.
-if a gc "$A_DIR" --keep-all; then
-  ok "gc (dry-run, --keep-all) ejecutó"
+hr "PASO 4 (sanity) — filething gc (dry-run)"
+# gc es dry-run por defecto (no borra nada). Best-effort: no tumba el smoke si falla.
+if a gc "$A_DIR"; then
+  ok "gc (dry-run) ejecutó"
 else
-  echo "  (aviso) 'filething gc' no disponible o falló — sanity omitido (no cuenta como fallo)"
+  echo "  (aviso) 'filething gc' falló — sanity omitido (no cuenta como fallo)"
 fi
 
 hr "RESULTADO"

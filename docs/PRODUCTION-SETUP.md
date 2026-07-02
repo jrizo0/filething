@@ -197,7 +197,9 @@ al mes en Convex). Para uso personal de unos pocos GB no deberías acercarte.
   real (Better Auth) — ver `TODO.md`, Fase B.
 - **Sin cifrado en runtime**: los bytes se guardan en R2 en claro (`alg=0`). Solo para uso
   personal; el cifrado (`alg=1`) es un hueco reservado del formato, aún no construido.
-- **GC/retención**: `filething gc <dir>` implementa mark-and-sweep con retention floor
-  (`min(baseSeqInUse)`) + grace-period, **dry-run por defecto** (`--apply` para borrar de
-  verdad; `--keep-all` para barrer solo huérfanos sin podar historial). Revisa siempre el
-  dry-run antes de `--apply`. Sin correrlo, el Vault solo crece.
+- **GC = solo huérfanos (por ahora)**: `filething gc <dir>` hace mark-and-sweep account-wide
+  con grace-period, **dry-run por defecto** (`--apply` para borrar). Retiene TODO el historial
+  y solo borra objetos que ninguna Revision referencia (basura de commits abortados). La poda
+  de historial (retention floor) está **diferida**: un floor sound por-Space necesita telemetría
+  por-(device,space) que el escalar `baseSeqInUse` actual no da (ver `docs/adr/0012`). Revisa
+  siempre el dry-run antes de `--apply`.

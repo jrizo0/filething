@@ -164,21 +164,26 @@ impl SpaceContext {
         })
     }
 
-    /// §7 step 2: for each unique scanned Block, skip when the index already has
-    /// it or the Vault `HEAD`s it present; otherwise `PUT` the encoded object and
-    /// record it locally. Returns the number of objects actually uploaded.
+    /// §7 step 2: for each unique scanned Block, `HEAD` the Vault and `PUT` only
+    /// when it is absent; record presence locally. Returns the number of objects
+    /// actually uploaded.
+    ///
+    /// It deliberately does NOT trust the local block index (`has_block`) to skip
+    /// the `HEAD`: the GC (`gc.rs`) can delete a Block the local index still
+    /// records — its own Device's sweep, or another Device's account-wide sweep —
+    /// so skipping the presence check would let a commit publish a Manifest that
+    /// references an object no longer in the Vault (a dangling reference: every
+    /// other Device's pull would fail with `object not found`). §7 requires every
+    /// referenced Block to be in the Vault BEFORE the CAS, and the local cache is
+    /// not a trustworthy proxy for that once a destructive GC exists. The `HEAD`
+    /// per known Block is the price of that safety (commits are human-paced).
     async fn upload_blocks(&self, scan: &ScanResult) -> Result<usize> {
         let space_id = self.space_id.as_str();
         let mut uploaded = 0usize;
         for (cid, encoded) in &scan.blocks_to_upload {
             let key = ft_hash::block_key(cid);
-            // Already known locally? Skip without a network round-trip.
-            if self.index.has_block(space_id, cid)? {
-                continue;
-            }
-            // Otherwise HEAD the Vault before PUT (§7 step 2).
+            // HEAD the Vault before PUT (§7 step 2). Present ⇒ record + skip.
             if self.vault.head(&key).await? {
-                // Present remotely but not in our local index: record it.
                 self.index.put_block(space_id, cid)?;
                 continue;
             }

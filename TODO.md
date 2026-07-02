@@ -151,9 +151,11 @@ Entró en la tanda del 2026-07-02: daemon-servicio + observabilidad + GC/retenci
   `<config_dir>/daemon.log`, reinicio al fallar. `apps/cli/src/service.rs` (generadores puros
   testeados; carga/descarga vía launchctl/systemctl).
 - [ ] **Binarios por SO** (cargo-dist o similar) + firma/notarización en macOS.
-- [x] **GC/retención** (`filething gc`, dry-run por defecto): mark-and-sweep account-wide con
-  retention floor (`min(baseSeqInUse)`) + grace-period. Validado en vivo (demo-gates gate g).
-  ADR 0012. (Podar documentos de Revisions sub-floor: pendiente, no bloquea.)
+- [~] **GC/retención** (`filething gc`, dry-run por defecto): mark-and-sweep **account-wide de
+  huérfanos** (retiene TODO el historial; borra solo objetos que ninguna Revision referencia) +
+  grace-period + guard de concurrencia. Validado en vivo (demo-gates gate g). ADR 0012. La
+  **poda de historial** (retention floor) queda diferida: necesita telemetría por-(Device,Space)
+  para un floor sound (el escalar `baseSeqInUse` actual no basta). Andamiaje reservado.
 - [x] **Observabilidad mínima**: `SyncMetrics` (commits, pulls, conflictos, errores del feed,
   alertas de staleness) persistida en `<root>/.filething/metrics.json`; `filething metrics`;
   watchdog que alerta si el head queda >5 min sin confirmarse; heartbeat por `tracing`.

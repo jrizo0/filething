@@ -112,16 +112,12 @@ impl SpaceContext {
         // the current stale episode (so we warn once, not every tick).
         let mut last_head_seen = Instant::now();
         let mut stale_alerted = false;
-        // Last base seq published to the Coordinator (the GC retention floor input,
-        // `§6.3`); avoids re-publishing an unchanged value.
-        let mut last_published_base: i64 = -1;
 
         // Initial catch-up so a freshly mounted Device is current before watching:
         // pull the head AND commit any local edits/deletes made while the daemon
         // was down (§7/§9).
         self.startup_sync().await?;
         metrics.record_head_seen();
-        self.publish_base_seq(&mut last_published_base).await;
         metrics.save(&self.local_root);
 
         tokio::pin!(shutdown);
@@ -175,7 +171,6 @@ impl SpaceContext {
                             metrics.record_head_seen();
                             let outcome = self.pull().await?;
                             record_pull_outcome(outcome, &mut metrics);
-                            self.publish_base_seq(&mut last_published_base).await;
                             metrics.save(&self.local_root);
                         }
                         Err(e) => {
@@ -202,7 +197,6 @@ impl SpaceContext {
                             stale_alerted = false;
                             metrics.record_head_seen();
                             record_pull_outcome(outcome, &mut metrics);
-                            self.publish_base_seq(&mut last_published_base).await;
                             metrics.save(&self.local_root);
                         }
                         Err(e) => {
@@ -217,7 +211,6 @@ impl SpaceContext {
                     if let CommitOutcome::Committed { .. } = self.commit_and_reconcile().await? {
                         metrics.record_commit();
                     }
-                    self.publish_base_seq(&mut last_published_base).await;
                     metrics.save(&self.local_root);
                 }
 
@@ -251,24 +244,6 @@ impl SpaceContext {
         metrics.save(&self.local_root);
         drop(bridge);
         Ok(())
-    }
-
-    /// Best-effort publish of this Device's base seq to the Coordinator, the GC
-    /// retention-floor input (`§6.3`). Skips a never-synced Space and an unchanged
-    /// value. Never fatal: a failure just means the floor is momentarily stale, so
-    /// the GC over-retains (the safe direction).
-    async fn publish_base_seq(&mut self, last_published: &mut i64) {
-        let seq = self.last_synced.seq;
-        if seq < 0 || seq == *last_published {
-            return;
-        }
-        let device_id = self.device_id.clone();
-        if let Some(coordinator) = self.coordinator.as_mut() {
-            match coordinator.set_base_seq(&device_id, seq as u64).await {
-                Ok(()) => *last_published = seq,
-                Err(e) => tracing::warn!(error = %e, "failed to publish base seq (retrying later)"),
-            }
-        }
     }
 
     /// The startup catch-up the [`run`](SpaceContext::run) loop performs once

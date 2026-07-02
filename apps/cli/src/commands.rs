@@ -390,12 +390,7 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
 /// `gc <dir>` — mark-and-sweep the Space's Vault objects, dry-run by default
 /// (`docs/format.md §6.3`, `docs/adr/0007`). Requires a Coordinator (retained
 /// roots + retention floor). Pass `--apply` to actually delete.
-pub async fn gc(
-    dir: PathBuf,
-    apply: bool,
-    grace_secs: Option<u64>,
-    keep_all: bool,
-) -> anyhow::Result<()> {
+pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::Result<()> {
     let config = Config::load()?;
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
@@ -410,14 +405,7 @@ pub async fn gc(
     let grace = grace_secs
         .map(Duration::from_secs)
         .unwrap_or(ft_engine::DEFAULT_GRACE);
-    let report = ctx
-        .gc(GcOptions {
-            apply,
-            grace,
-            keep_all,
-        })
-        .await
-        .context("gc")?;
+    let report = ctx.gc(GcOptions { apply, grace }).await.context("gc")?;
 
     let mode = if report.applied { "APPLIED" } else { "dry run" };
     println!(
@@ -425,13 +413,9 @@ pub async fn gc(
         root.display()
     );
     println!("  (all your Spaces share one Vault; reachability is unioned across them)");
-    if report.keep_all {
-        println!("  retention: keep-all (every Revision retained; sweeps only orphans)");
-    } else {
-        println!("  retention: seq >= per-Space floor (min base across your Devices)");
-    }
+    println!("  mode: orphan-sweep (retains ALL history; only unreferenced objects are swept)");
     println!(
-        "  {} Space(s), {} retained revision(s)",
+        "  {} Space(s), {} revision(s) walked",
         report.spaces, report.retained_revisions
     );
     println!(

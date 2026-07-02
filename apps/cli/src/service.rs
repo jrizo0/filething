@@ -145,15 +145,25 @@ fn plist_body(exe: &str, roots: &[String], env_file: &str, log_file: &str) -> St
     )
 }
 
+/// Escapes one `ExecStart=` argument for systemd: `%`→`%%` (systemd expands
+/// `%`-specifiers even inside quotes), then C-style-escapes `\` and `"`, wrapped
+/// in double quotes. Without the `%%` a Space path like `/x 100%backup` would be
+/// silently rewritten by specifier expansion.
+fn systemd_arg(s: &str) -> String {
+    let escaped = s
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// The systemd user-unit body. Loads the env file, runs the daemon over `roots`,
 /// restarts on failure.
 fn systemd_unit_body(exe: &str, roots: &[String], env_file: &str) -> String {
-    let mut exec = format!("\"{}\" daemon", exe);
+    let mut exec = format!("{} daemon", systemd_arg(exe));
     for root in roots {
         exec.push(' ');
-        exec.push('"');
-        exec.push_str(root);
-        exec.push('"');
+        exec.push_str(&systemd_arg(root));
     }
     format!(
         "[Unit]\n\
@@ -199,8 +209,15 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .context("HOME is not set")
 }
 
-/// Writes the captured-env file (0600) and returns its path.
+/// Writes the captured-env file and returns its path. The file holds
+/// deployment-root-equivalent secrets, so it is created **0600 from the outset**
+/// (never write-then-chmod, which would leave a window where the secrets are
+/// world-readable): any stale file is removed first, then created with mode 0600
+/// atomically. The config dir is tightened to 0700 too.
 fn write_env_file() -> anyhow::Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     let vars: Vec<(String, String)> = CAPTURED_ENV
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
@@ -209,13 +226,21 @@ fn write_env_file() -> anyhow::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+        // Best-effort: keep the dir owner-only (it holds secrets + config).
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    std::fs::write(&path, env_file_body(&vars))
+    // Remove any stale file so the create below always makes a fresh 0600 file
+    // (create+truncate would keep a pre-existing looser mode).
+    let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("creating {} (0600)", path.display()))?;
+    file.write_all(env_file_body(&vars).as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    // Secrets: owner-only.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))?;
     Ok(path)
 }
 
@@ -402,6 +427,13 @@ mod tests {
         assert!(p.contains("set -a; . &apos;/cfg/service.env&apos;; set +a; exec"));
         assert!(p.contains("daemon &apos;/home/u/proj&apos; &apos;/home/u/notes&apos;"));
         assert!(p.contains("<string>/cfg/daemon.log</string>"));
+    }
+
+    #[test]
+    fn systemd_arg_escapes_percent() {
+        assert_eq!(systemd_arg("/home/u/proj"), "\"/home/u/proj\"");
+        // A `%` in a path must be doubled or systemd expands it as a specifier.
+        assert_eq!(systemd_arg("/x 100%backup"), "\"/x 100%%backup\"");
     }
 
     #[test]

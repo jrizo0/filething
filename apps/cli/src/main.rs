@@ -87,10 +87,12 @@ enum Command {
         dirs: Vec<PathBuf>,
     },
 
-    /// Garbage-collect a Space's Vault: sweep objects no retained Revision needs.
-    /// Dry-run by default (prints what WOULD be deleted); pass --apply to delete.
+    /// Garbage-collect the account's Vault: delete ORPHANED objects that no
+    /// Revision of any of your Spaces references. Dry-run by default (prints what
+    /// WOULD be deleted); pass --apply to delete. Selecting a Space `dir` only
+    /// picks the account/Vault — the sweep is account-wide.
     Gc {
-        /// The Space folder.
+        /// A Space folder (selects the account whose Vault to GC).
         dir: PathBuf,
         /// Actually delete swept objects (default is a dry run).
         #[arg(long)]
@@ -98,10 +100,6 @@ enum Command {
         /// Never sweep an object younger than this many seconds (default 86400).
         #[arg(long)]
         grace_secs: Option<u64>,
-        /// Retain objects reachable from EVERY Revision (only sweep orphans; never
-        /// prune history).
-        #[arg(long)]
-        keep_all: bool,
     },
 
     /// Show sync metrics (commits, pulls, conflicts, feed errors, staleness) for a
@@ -148,8 +146,7 @@ async fn main() -> anyhow::Result<()> {
             dir,
             apply,
             grace_secs,
-            keep_all,
-        } => commands::gc(dir, apply, grace_secs, keep_all).await,
+        } => commands::gc(dir, apply, grace_secs).await,
         Command::Metrics { dir } => commands::metrics(dir),
         Command::Service { action } => commands::service(action),
     }
@@ -269,7 +266,7 @@ mod tests {
         assert!(r.is_err(), "daemon with no dir must fail to parse");
     }
 
-    /// `gc <dir>` defaults to a dry run; flags flip apply/keep_all/grace.
+    /// `gc <dir>` defaults to a dry run; flags flip apply/grace.
     #[test]
     fn parse_gc_defaults_and_flags() {
         match Cli::parse_from(["filething", "gc", "/proj"]).command {
@@ -277,34 +274,19 @@ mod tests {
                 dir,
                 apply,
                 grace_secs,
-                keep_all,
             } => {
                 assert_eq!(dir, PathBuf::from("/proj"));
                 assert!(!apply);
-                assert!(!keep_all);
                 assert!(grace_secs.is_none());
             }
             other => panic!("expected Gc, got {other:?}"),
         }
-        match Cli::parse_from([
-            "filething",
-            "gc",
-            "/proj",
-            "--apply",
-            "--keep-all",
-            "--grace-secs",
-            "0",
-        ])
-        .command
+        match Cli::parse_from(["filething", "gc", "/proj", "--apply", "--grace-secs", "0"]).command
         {
             Command::Gc {
-                apply,
-                grace_secs,
-                keep_all,
-                ..
+                apply, grace_secs, ..
             } => {
                 assert!(apply);
-                assert!(keep_all);
                 assert_eq!(grace_secs, Some(0));
             }
             other => panic!("expected Gc, got {other:?}"),

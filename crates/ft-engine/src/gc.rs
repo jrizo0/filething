@@ -1,28 +1,42 @@
-//! `gc` — mark-and-sweep garbage collection of unreachable Vault objects,
-//! guarded by a grace-period and the retention floor (`docs/format.md §6.3`,
-//! `docs/adr/0007`).
+//! `gc` — mark-and-sweep garbage collection of ORPHANED Vault objects
+//! (`docs/format.md §6.3`, `docs/adr/0007`, `docs/adr/0012`).
 //!
-//! The **mark** phase computes every Vault key reachable from the RETAINED
-//! Revisions (those with `seq >= retentionFloorSeq`, or all of them in
-//! [`GcOptions::keep_all`] mode): every Manifest page, every externalized
-//! blocklist (and the Blocks it lists), every inline Block, plus the Space meta
-//! blob and the empty-Manifest root. The **sweep** phase lists the physical
-//! objects and deletes those that are BOTH unreachable AND older than the
+//! The **mark** phase computes every Vault key reachable from EVERY Revision of
+//! EVERY Space of the account: every Manifest page, every externalized blocklist
+//! (and the Blocks it lists), every inline Block, plus each Space's meta blob and
+//! the empty-Manifest root. The **sweep** phase lists the physical objects and
+//! deletes those that are BOTH unreachable (from any Revision) AND older than the
 //! grace-period. Dry-run by default: nothing is deleted unless
 //! [`GcOptions::apply`] is set.
 //!
-//! Two independent safety nets make an erroneous delete of live data
-//! impossible in normal operation (`docs/adr/0007`):
-//! - **Retention floor** = `min(baseSeqInUse)` over the Account's Devices: the
-//!   GC never sweeps objects reachable from a Revision any Device still bases on
-//!   (`baseSeqInUse` only advances and is published on advance, so the floor is a
-//!   lower bound on every Device's real base — it can only over-retain).
-//! - **Grace-period**: never sweep an object younger than the window, so a
-//!   commit in flight (Vault-first, head-after, `§7`) whose objects are uploaded
-//!   but not yet referenced by a committed Revision is protected.
+//! This is deliberately **orphan-sweep only** — it retains ALL history, so it
+//! never removes an object any Revision references and thus never strands a
+//! Device's sync base. It reclaims genuine garbage: objects a commit uploaded but
+//! never referenced because the head never advanced (a crash/abort between the
+//! Vault write and the CAS, `§7`). History-pruning via a retention floor
+//! (reclaiming Blocks of deleted/superseded content below `min(baseSeqInUse)`) is
+//! DEFERRED: a SOUND per-Space floor needs per-(Device,Space) base telemetry,
+//! which the current per-Device `baseSeqInUse` scalar cannot provide — a per-Space
+//! seq published into a per-Device scalar can raise one Space's floor above a
+//! Device's real base there and strand its data. The `revisions:listFromSeq` /
+//! `spaces:refreshRetentionFloor` machinery is kept (unused for now) for that
+//! future work. See `docs/adr/0012`.
 //!
-//! As a last resort it REFUSES to run if the retained set is empty while the
-//! Space has a head (a backend anomaly), rather than sweeping everything.
+//! Safety nets:
+//! - **Grace-period**: never sweep an object younger than the window (24h
+//!   default), so a commit in flight (Vault-first, head-after, `§7`) whose objects
+//!   are uploaded but not yet referenced is protected. A missing/future mtime is
+//!   treated as "too young" (never sweep on uncertainty).
+//! - **Concurrency guard**: the reachability snapshot predates the object listing,
+//!   so before deleting (with `apply`) the GC re-reads every Space head; if any
+//!   advanced (a concurrent commit) it ABORTS without deleting.
+//! - **Anomaly guard**: refuses to run if a Space has a head but zero Revisions
+//!   are listed, rather than sweeping everything.
+//! - It fails if a reachable object cannot be read (never sweeps on a partial mark).
+//!
+//! Even so, a Device must still not trust a stale local presence cache: the commit
+//! path HEAD-verifies every Block before referencing it (`commit.rs`), so a Block
+//! this GC (or another Device's) removed is simply re-uploaded on the next commit.
 //!
 //! ## Scope: ONE bucket == ONE account
 //!
@@ -61,10 +75,6 @@ pub struct GcOptions {
     pub apply: bool,
     /// Never sweep an object younger than this. Protects in-flight commits.
     pub grace: Duration,
-    /// Retain objects reachable from EVERY Revision (ignore the retention floor).
-    /// Only orphaned debris (e.g. from an aborted commit) is then swept — history
-    /// is never pruned. The cautious default for a first run.
-    pub keep_all: bool,
 }
 
 impl Default for GcOptions {
@@ -72,7 +82,6 @@ impl Default for GcOptions {
         Self {
             apply: false,
             grace: DEFAULT_GRACE,
-            keep_all: false,
         }
     }
 }
@@ -85,10 +94,8 @@ impl Default for GcOptions {
 pub struct GcReport {
     /// Number of the account's Spaces whose reachability was unioned.
     pub spaces: usize,
-    /// `true` if every Revision was retained (`keep_all`); when `false` a
-    /// per-Space retention floor (`min(baseSeqInUse)`) was applied.
-    pub keep_all: bool,
-    /// Total retained Revisions (across all Spaces) whose trees were walked.
+    /// Total Revisions (across all Spaces) whose trees were walked (all of them —
+    /// orphan-sweep retains full history).
     pub retained_revisions: usize,
     /// Distinct reachable Vault objects (the mark set).
     pub reachable_objects: usize,
@@ -107,14 +114,14 @@ pub struct GcReport {
 }
 
 impl SpaceContext {
-    /// Runs a mark-and-sweep GC over the **account-wide** Vault. The Vault is
+    /// Runs an orphan-sweep GC over the **account-wide** Vault. The Vault is
     /// shared across ALL of the account's Spaces (one bucket, account-scoped
-    /// dedup), so reachability is the UNION over every Space's retained
-    /// Revisions — GCing from a single Space's view would delete other Spaces'
-    /// live Blocks. The `dir` you point at only selects the account / Vault /
-    /// Coordinator; the sweep covers the whole account. Requires a Coordinator
-    /// (a staging-only mount errors). Dry-run unless [`GcOptions::apply`]. See the
-    /// module docs for the safety model.
+    /// dedup), so reachability is the UNION over every Space's Revisions — GCing
+    /// from a single Space's view would delete other Spaces' live Blocks. The
+    /// `dir` you point at only selects the account / Vault / Coordinator; the
+    /// sweep covers the whole account. Requires a Coordinator (a staging-only
+    /// mount errors). Dry-run unless [`GcOptions::apply`]. See the module docs for
+    /// the safety model.
     pub async fn gc(&mut self, opts: GcOptions) -> Result<GcReport> {
         if self.coordinator.is_none() {
             return Err(EngineError::SpaceState(
@@ -122,21 +129,10 @@ impl SpaceContext {
             ));
         }
         let account_id = self.account_id.clone();
-        let device_id = self.device_id.clone();
-        let base_seq = self.last_synced.seq;
 
-        // Publish THIS Device's base so a recomputed floor reflects at least our
-        // own base (never higher than it). Skipped for a never-synced Space.
-        if base_seq >= 0 {
-            self.coordinator
-                .as_mut()
-                .expect("coordinator present")
-                .set_base_seq(&device_id, base_seq as u64)
-                .await?;
-        }
-
-        // Gather reachability roots (Manifest roots + meta blobs) across EVERY
-        // Space of the account — they all share this Vault.
+        // Every Space of the account shares this Vault. Gather reachability roots
+        // (ALL Revisions of every Space — orphan-sweep retains full history) and
+        // meta blobs, plus a snapshot of each Space head for the concurrency guard.
         let spaces = self
             .coordinator
             .as_mut()
@@ -147,30 +143,24 @@ impl SpaceContext {
         let mut root_cids: Vec<Cid> = Vec::new();
         let mut meta_cids: Vec<Cid> = Vec::new();
         let mut retained_revisions = 0usize;
+        let heads_before = head_snapshot(&spaces);
         for space in &spaces {
             meta_cids.push(space.meta_blob_cid);
-            let min_seq = if opts.keep_all {
-                0
-            } else {
-                self.coordinator
-                    .as_mut()
-                    .expect("coordinator present")
-                    .refresh_retention_floor(&space.space_id)
-                    .await?
-                    .retention_floor_seq
-            };
+            // Retain ALL Revisions (min_seq = 0): history-pruning is deferred (see
+            // the module docs), so the GC removes only objects reachable from NO
+            // Revision — true orphans (e.g. aborted-commit debris).
             let roots = self
                 .coordinator
                 .as_mut()
                 .expect("coordinator present")
-                .list_revisions_from(&space.space_id, min_seq)
+                .list_revisions_from(&space.space_id, 0)
                 .await?;
-            // Safety: a Space with a head but no retained roots is a backend
+            // Safety: a Space with a head but no Revisions listed is a backend
             // anomaly — refuse the WHOLE GC rather than treat live objects as junk.
             if roots.is_empty() && space.head_revision_id.is_some() {
                 return Err(EngineError::SpaceState(format!(
-                    "gc refusing to run: Space {} has a head but listFromSeq({min_seq}) \
-                     returned no retained roots",
+                    "gc refusing to run: Space {} has a head but listFromSeq(0) returned no \
+                     Revisions",
                     space.space_id.as_str()
                 )));
             }
@@ -194,7 +184,24 @@ impl SpaceContext {
 
         // ----- apply -----
         let mut deleted = 0usize;
-        if opts.apply {
+        if opts.apply && !sweepable.is_empty() {
+            // Concurrency guard: our reachability snapshot predates the listing, so
+            // a commit that advanced a head in between could have referenced an
+            // object we now deem an orphan. Re-read the heads; if any changed (or a
+            // Space appeared/vanished), ABORT without deleting.
+            let after = self
+                .coordinator
+                .as_mut()
+                .expect("coordinator present")
+                .list_spaces(&account_id)
+                .await?;
+            if head_snapshot(&after) != heads_before {
+                return Err(EngineError::SpaceState(
+                    "gc --apply aborted: a Space head changed during the sweep (concurrent commit, \
+                     or a Space was created/removed); nothing was deleted — re-run when idle"
+                        .to_string(),
+                ));
+            }
             for key in &sweepable {
                 self.vault.delete(key).await?;
                 deleted += 1;
@@ -203,7 +210,6 @@ impl SpaceContext {
 
         Ok(GcReport {
             spaces: spaces.len(),
-            keep_all: opts.keep_all,
             retained_revisions,
             reachable_objects: reachable.len(),
             scanned_objects: scanned,
@@ -213,6 +219,23 @@ impl SpaceContext {
             applied: opts.apply,
         })
     }
+}
+
+/// A sorted snapshot of each Space's `(id, head-revision-id)` — the concurrency
+/// guard compares this before vs. after the sweep to detect a racing commit (or a
+/// Space created/removed) and abort the delete.
+fn head_snapshot(spaces: &[ft_coordinator::Space]) -> Vec<(String, Option<String>)> {
+    let mut snap: Vec<(String, Option<String>)> = spaces
+        .iter()
+        .map(|s| {
+            (
+                s.space_id.as_str().to_string(),
+                s.head_revision_id.as_ref().map(|r| r.as_str().to_string()),
+            )
+        })
+        .collect();
+    snap.sort();
+    snap
 }
 
 /// Computes the complete set of reachable Vault keys over `&dyn Vault`: the meta

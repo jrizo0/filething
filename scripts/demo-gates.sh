@@ -98,9 +98,9 @@ HAVE_B=$(grep -rl "version de B (offline)" "$B_DIR" | wc -l)
 
 hr "GATE (g) — GC: dry-run no borra; huerfano inyectado se barre; lo alcanzable sobrevive"
 a sync "$A_DIR" >/dev/null   # asegura A al dia antes de barrer
-# (g.1) dry-run (keep-all, grace 0) NO debe borrar nada — es solo un reporte.
+# (g.1) dry-run (grace 0) NO debe borrar nada — es solo un reporte.
 N0=$(count_blocks)
-a gc "$A_DIR" --keep-all --grace-secs 0 >/dev/null
+a gc "$A_DIR" --grace-secs 0 >/dev/null
 N0b=$(count_blocks)
 [ "$N0b" -eq "$N0" ] && echo "OK (g.1): dry-run no borro nada (bloques $N0 == $N0b)" || fail "(g.1) el dry-run borro objetos ($N0 -> $N0b)"
 # (g.2) inyecta un objeto huerfano bajo blocks/ y confirma que --apply lo borra.
@@ -108,7 +108,7 @@ ORPHAN="blocks/zz/orphan-$(date +%s)"
 mc "echo huerfano | mc pipe L/${S3_BUCKET}/${ORPHAN}"
 mc "mc ls L/${S3_BUCKET}/${ORPHAN} 2>/dev/null | wc -l" | grep -q 1 || fail "(g.2) no se inyecto el huerfano"
 echo ">> huerfano inyectado: $ORPHAN"
-a gc "$A_DIR" --keep-all --grace-secs 0 --apply
+a gc "$A_DIR" --grace-secs 0 --apply
 LEFT=$(mc "mc ls L/${S3_BUCKET}/${ORPHAN} 2>/dev/null | wc -l" | tr -d '[:space:]')
 [ "$LEFT" -eq 0 ] && echo "OK (g.2): --apply borro el huerfano inyectado" || fail "(g.2) el huerfano sobrevivio al --apply"
 # (g.3) SEGURIDAD: lo alcanzable no se borro — un clone fresco reconstruye big.txt.

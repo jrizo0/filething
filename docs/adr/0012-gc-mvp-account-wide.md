@@ -1,4 +1,4 @@
-# GC MVP: mark-and-sweep account-wide, dry-run por defecto
+# GC MVP: orphan-sweep account-wide, dry-run por defecto; poda de historial diferida
 
 El GC (post-MVP en el plan original) se implementó para la Fase 2 (`ft-engine/src/gc.rs`,
 `filething gc`). Decisiones load-bearing:
@@ -12,26 +12,39 @@ El GC (post-MVP en el plan original) se implementó para la Fase 2 (`ft-engine/s
    Vault gestionado multi-tenant que comparta bucket entre cuentas necesitaría claves
    prefijadas por cuenta o un barrido server-side, antes de poder correr GC ahí.
 
-2. **Dos redes de seguridad (ADR 0007), ambas activas.** (a) *Retention floor* =
-   `min(baseSeqInUse)` sobre los Devices de la cuenta (`spaces:refreshRetentionFloor`,
-   recalculado antes de barrer); nunca se barre lo alcanzable desde Revisions con
-   `seq >= floor`. `baseSeqInUse` solo avanza y se publica al avanzar (daemon y `gc`), así que
-   el floor es una cota inferior de la base real de cada Device → solo puede sobre-retener. (b)
-   *Grace-period*: nunca se barre un objeto más joven que la ventana (24h por defecto), lo que
-   protege un commit en vuelo (Vault-primero, head-después, §7). `mtime` ausente/futuro ⇒ se
-   trata como "demasiado joven" (nunca barrer ante la duda).
+2. **Solo barrido de HUÉRFANOS (retiene TODO el historial).** El GC recorre TODAS las
+   Revisions de cada Space (`listFromSeq(0)`) y borra únicamente objetos que **ninguna**
+   Revision referencia — típicamente basura de un commit que subió bloques al Vault pero nunca
+   avanzó el head (crash/abort entre el PUT y el CAS, §7). Como nunca quita algo referenciado,
+   nunca deja sin base de sync a un Device.
 
-3. **Dry-run por defecto; `--apply` para borrar.** `--keep-all` retiene todas las Revisions
-   (solo barre huérfanos, sin podar historial). Si una Space tiene head pero `listFromSeq`
-   devuelve cero raíces retenidas, el GC **se niega** a correr (anomalía de backend) en vez de
-   tratar todo como basura. El mark falla si un objeto alcanzable no se puede leer (nunca se
-   barre con un mark incompleto).
+3. **La poda de historial (retention floor) queda DIFERIDA.** Un floor sound por-Space
+   (`min(baseSeqInUse)`) requiere telemetría por-(Device,Space): el `baseSeqInUse` actual es un
+   **escalar por-Device** y el `seq` es **por-Space**, así que publicar el seq de una Space en
+   ese escalar puede subir el floor de OTRA Space por encima de la base real de un Device ahí y
+   borrarle su base (bug de pérdida de datos encontrado en revisión adversarial). Se conservan
+   `revisions:listFromSeq(minSeq)` y `spaces:refreshRetentionFloor` (sin uso hoy) como andamiaje
+   para el trabajo futuro: telemetría por-(Device,Space) + floor conservador (=0 salvo que TODOS
+   los Devices de la cuenta hayan reportado una base para esa Space).
+
+4. **Redes de seguridad.** (a) *Grace-period*: nunca se barre un objeto más joven que la
+   ventana (24h por defecto), protegiendo un commit en vuelo (Vault-primero, head-después, §7);
+   `mtime` ausente/futuro ⇒ "demasiado joven". (b) *Guard de concurrencia*: el snapshot de
+   alcanzabilidad precede al listado, así que antes de borrar (`--apply`) se re-leen los heads
+   de todas las Spaces; si alguno cambió (commit concurrente) o apareció/desapareció una Space,
+   se ABORTA sin borrar. (c) *Anomalía*: se niega a correr si una Space tiene head pero cero
+   Revisions listadas. (d) El mark falla si un objeto alcanzable no se puede leer (nunca barre
+   con un mark incompleto). Además, el commit **siempre hace HEAD-before-PUT** (`commit.rs`, no
+   confía en el caché local `local_block`), así que un Block que este GC (o el de otro Device)
+   borró se re-sube en el siguiente commit — el caché de presencia local nunca puede contradecir
+   destructivamente al Vault.
 
 ## Consequences
 
-Validado en vivo (`scripts/demo-gates.sh` gate g, contra Convex+MinIO): dry-run no borra;
-un huérfano inyectado se barre con `--apply`; un clone fresco reconstruye el archivo grande
-tras el GC (los Blocks alcanzables sobreviven). El `list`/`delete` se añadió al trait `Vault`
-(ambos backends). Podar documentos de Revisions viejos (por debajo del floor) queda fuera:
-hoy solo se barren objetos del Vault; una Revision sub-floor puede quedar con su Manifest ya
-barrido (degrada a re-scan, aceptable — ADR 0007).
+Validado en vivo (`scripts/demo-gates.sh` gate g, contra Convex+MinIO): dry-run no borra; un
+huérfano inyectado se barre con `--apply`; un clone fresco reconstruye el archivo grande tras
+el GC (los Blocks alcanzables sobreviven). El `list`/`delete` se añadió al trait `Vault` (ambos
+backends). Coste: como no se poda historial, el Vault no reclama el espacio de contenido borrado/
+superado hasta que exista la poda sound (diferida); el GC de hoy limpia solo huérfanos. El
+HEAD-before-PUT añade un HEAD por Block conocido en cada commit (aceptable: commits a ritmo
+humano).

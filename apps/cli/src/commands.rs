@@ -7,12 +7,16 @@
 //! print a clear result.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
-use ft_engine::{AccountId, CommitOutcome, DeviceId, PullOutcome, SpaceContext, SpaceId};
+use ft_engine::{
+    AccountId, CommitOutcome, DeviceId, GcOptions, PullOutcome, SpaceContext, SpaceId, SyncMetrics,
+};
 
 use crate::config::{normalize_abs, Config};
 use crate::env;
+use crate::service::ServiceAction;
 
 /// A reasonable default Device name when `--name` is omitted: the machine
 /// hostname, else a generic label.
@@ -381,6 +385,129 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         .context("daemon serve")?;
     println!("filething daemon stopped.");
     Ok(())
+}
+
+/// `gc <dir>` — mark-and-sweep the Space's Vault objects, dry-run by default
+/// (`docs/format.md §6.3`, `docs/adr/0007`). Requires a Coordinator (retained
+/// roots + retention floor). Pass `--apply` to actually delete.
+pub async fn gc(
+    dir: PathBuf,
+    apply: bool,
+    grace_secs: Option<u64>,
+    keep_all: bool,
+) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let root = normalize_abs(&dir);
+    let space_id = env::space_id_at(&root)?;
+    let (url, account_id, device_id) = require_identity(&config)?;
+
+    let index = env::open_index(&root)?;
+    let vault = env::build_vault().await?;
+    let coordinator = env::connect_coordinator(&url).await?;
+    let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
+        .context("opening Space")?;
+
+    let grace = grace_secs
+        .map(Duration::from_secs)
+        .unwrap_or(ft_engine::DEFAULT_GRACE);
+    let report = ctx
+        .gc(GcOptions {
+            apply,
+            grace,
+            keep_all,
+        })
+        .await
+        .context("gc")?;
+
+    let mode = if report.applied { "APPLIED" } else { "dry run" };
+    println!("GC ({mode}) for Space at {}", root.display());
+    match report.retention_floor_seq {
+        Some(floor) => println!("  retention floor: seq >= {floor} (min base across Devices)"),
+        None => println!("  retention floor: keep-all (every Revision retained)"),
+    }
+    if let Some(head) = report.head_seq {
+        println!("  head seq: {head}");
+    }
+    println!("  retained revisions: {}", report.retained_revisions);
+    println!(
+        "  objects: {} scanned, {} reachable, {} sweepable, {} held by grace-period",
+        report.scanned_objects,
+        report.reachable_objects,
+        report.sweepable.len(),
+        report.kept_by_grace
+    );
+    if report.applied {
+        println!("  deleted: {} object(s)", report.deleted);
+    } else if report.sweepable.is_empty() {
+        println!("  nothing to sweep.");
+    } else {
+        const SHOW: usize = 20;
+        println!(
+            "  would delete {} object(s) (re-run with --apply):",
+            report.sweepable.len()
+        );
+        for key in report.sweepable.iter().take(SHOW) {
+            println!("    {key}");
+        }
+        if report.sweepable.len() > SHOW {
+            println!("    … and {} more", report.sweepable.len() - SHOW);
+        }
+    }
+    Ok(())
+}
+
+/// `metrics [<dir>]` — print the persisted sync counters for a Space (or every
+/// mapped Space). Reads `<root>/.filething/metrics.json` locally; no network.
+pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let roots: Vec<PathBuf> = match dir {
+        Some(d) => vec![normalize_abs(&d)],
+        None => Config::load()?
+            .spaces
+            .iter()
+            .map(|m| PathBuf::from(&m.local_root))
+            .collect(),
+    };
+    if roots.is_empty() {
+        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for root in roots {
+        let m = SyncMetrics::load(&root);
+        println!("Space at {}", root.display());
+        if m == SyncMetrics::default() {
+            println!("  (no metrics yet — has the daemon run for this Space?)");
+            continue;
+        }
+        println!(
+            "  commits: {}   pulls applied: {}   conflicts: {}",
+            m.commits, m.pulls_applied, m.conflicts
+        );
+        println!(
+            "  feed errors: {}   stale alerts: {}",
+            m.feed_errors, m.stale_alerts
+        );
+        print_ago("  started", m.started_at, now);
+        print_ago("  last head seen", m.last_head_seen, now);
+        print_ago("  last commit", m.last_commit, now);
+    }
+    Ok(())
+}
+
+/// Prints a unix-seconds timestamp as "<n>s ago", or "never" when absent.
+fn print_ago(label: &str, ts: Option<u64>, now: u64) {
+    match ts {
+        Some(t) => println!("{label}: {}s ago", now.saturating_sub(t)),
+        None => println!("{label}: never"),
+    }
+}
+
+/// `service <install|uninstall|status>` — manage the daemon as an OS service.
+pub fn service(action: ServiceAction) -> anyhow::Result<()> {
+    crate::service::run(action)
 }
 
 /// Lowercase hex of a 32-byte id, for human-readable output of a `manifestRoot`.

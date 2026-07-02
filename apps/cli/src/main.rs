@@ -12,10 +12,13 @@
 mod commands;
 mod config;
 mod env;
+mod service;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+use crate::service::ServiceAction;
 
 /// filething — keep your developer folders identical across machines.
 #[derive(Debug, Parser)]
@@ -83,6 +86,37 @@ enum Command {
         #[arg(required = true)]
         dirs: Vec<PathBuf>,
     },
+
+    /// Garbage-collect a Space's Vault: sweep objects no retained Revision needs.
+    /// Dry-run by default (prints what WOULD be deleted); pass --apply to delete.
+    Gc {
+        /// The Space folder.
+        dir: PathBuf,
+        /// Actually delete swept objects (default is a dry run).
+        #[arg(long)]
+        apply: bool,
+        /// Never sweep an object younger than this many seconds (default 86400).
+        #[arg(long)]
+        grace_secs: Option<u64>,
+        /// Retain objects reachable from EVERY Revision (only sweep orphans; never
+        /// prune history).
+        #[arg(long)]
+        keep_all: bool,
+    },
+
+    /// Show sync metrics (commits, pulls, conflicts, feed errors, staleness) for a
+    /// Space, or for every mapped Space when no dir is given.
+    Metrics {
+        /// The Space folder (defaults to all mapped Spaces).
+        dir: Option<PathBuf>,
+    },
+
+    /// Install / uninstall / status the daemon as an OS service (launchd on macOS,
+    /// systemd --user on Linux).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[tokio::main]
@@ -110,6 +144,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Ls { dir } => commands::ls(dir),
         Command::Sync { dir } => commands::sync(dir).await,
         Command::Daemon { dirs } => commands::daemon(dirs).await,
+        Command::Gc {
+            dir,
+            apply,
+            grace_secs,
+            keep_all,
+        } => commands::gc(dir, apply, grace_secs, keep_all).await,
+        Command::Metrics { dir } => commands::metrics(dir),
+        Command::Service { action } => commands::service(action),
     }
 }
 
@@ -225,5 +267,63 @@ mod tests {
     fn daemon_requires_a_dir() {
         let r = Cli::try_parse_from(["filething", "daemon"]);
         assert!(r.is_err(), "daemon with no dir must fail to parse");
+    }
+
+    /// `gc <dir>` defaults to a dry run; flags flip apply/keep_all/grace.
+    #[test]
+    fn parse_gc_defaults_and_flags() {
+        match Cli::parse_from(["filething", "gc", "/proj"]).command {
+            Command::Gc {
+                dir,
+                apply,
+                grace_secs,
+                keep_all,
+            } => {
+                assert_eq!(dir, PathBuf::from("/proj"));
+                assert!(!apply);
+                assert!(!keep_all);
+                assert!(grace_secs.is_none());
+            }
+            other => panic!("expected Gc, got {other:?}"),
+        }
+        match Cli::parse_from([
+            "filething",
+            "gc",
+            "/proj",
+            "--apply",
+            "--keep-all",
+            "--grace-secs",
+            "0",
+        ])
+        .command
+        {
+            Command::Gc {
+                apply,
+                grace_secs,
+                keep_all,
+                ..
+            } => {
+                assert!(apply);
+                assert!(keep_all);
+                assert_eq!(grace_secs, Some(0));
+            }
+            other => panic!("expected Gc, got {other:?}"),
+        }
+    }
+
+    /// `metrics` accepts an optional dir; `service <action>` parses the nested
+    /// subcommand.
+    #[test]
+    fn parse_metrics_and_service() {
+        match Cli::parse_from(["filething", "metrics"]).command {
+            Command::Metrics { dir } => assert!(dir.is_none()),
+            other => panic!("expected Metrics, got {other:?}"),
+        }
+        match Cli::parse_from(["filething", "service", "install"]).command {
+            Command::Service { action } => assert_eq!(action, ServiceAction::Install),
+            other => panic!("expected Service, got {other:?}"),
+        }
+        // `service` with no action is a parse error.
+        assert!(Cli::try_parse_from(["filething", "service"]).is_err());
     }
 }

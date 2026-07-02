@@ -20,6 +20,9 @@ dist/
 .env
 .env.local
 .env.*.local
+# Managed-infra credentials (Convex Cloud + R2). The *.example templates ARE
+# tracked; the filled-in .env.cloud is a secret and must never be committed.
+.env.cloud
 
 # OS / editor cruft
 .DS_Store

@@ -58,20 +58,23 @@ pub fn coordinator_url_from_env() -> String {
 ///
 /// The credential is resolved in precedence order — `CONVEX_ADMIN_KEY`,
 /// `CONVEX_DEPLOY_KEY` (Convex Cloud), `CONVEX_SELF_HOSTED_ADMIN_KEY` (local
-/// infra) — and is never persisted.
+/// infra) — and is never persisted. When NONE is set the client connects WITHOUT
+/// admin auth: Convex functions are public by default over the sync protocol, so
+/// a personal-use Cloud deployment (whose functions have no `ctx.auth` checks)
+/// still works; a self-hosted deploy, however, needs a key. See
+/// `docs/PRODUCTION-SETUP.md`.
 pub async fn connect_coordinator(url: &str) -> anyhow::Result<Coordinator> {
-    let admin_key = first_env(&[ENV_ADMIN_KEY, ENV_DEPLOY_KEY, ENV_ADMIN_KEY_SELF_HOSTED])
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no Convex credential set: use CONVEX_DEPLOY_KEY (or CONVEX_ADMIN_KEY) for \
-                 Convex Cloud, or CONVEX_SELF_HOSTED_ADMIN_KEY for the local Docker infra \
-                 (see docs/PRODUCTION-SETUP.md)"
-            )
-        })?;
     let mut client = convex::ConvexClient::new(url)
         .await
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
-    client.set_admin_auth(admin_key, None).await;
+    match first_env(&[ENV_ADMIN_KEY, ENV_DEPLOY_KEY, ENV_ADMIN_KEY_SELF_HOSTED]) {
+        Some(admin_key) => client.set_admin_auth(admin_key, None).await,
+        None => tracing::warn!(
+            "no Convex credential set (CONVEX_DEPLOY_KEY / CONVEX_ADMIN_KEY / \
+             CONVEX_SELF_HOSTED_ADMIN_KEY); connecting without admin auth — fine for Convex \
+             Cloud public functions, but a self-hosted deployment needs a key"
+        ),
+    }
     Ok(Coordinator::from_client(client))
 }
 

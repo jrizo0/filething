@@ -422,6 +422,29 @@ pub struct HeadUpdate {
     pub parent: Option<RevisionId>,
 }
 
+/// A retained Revision's GC-relevant fields (`revisions:listFromSeq`). The GC
+/// keeps every Vault object reachable from `manifest_root_cid`. `§6.3`,
+/// `docs/adr/0007`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionRoot {
+    /// The Revision's id.
+    pub revision_id: RevisionId,
+    /// Its per-Space seq.
+    pub seq: u64,
+    /// The Manifest B-tree root to keep reachable (32 bytes).
+    pub manifest_root_cid: Cid,
+}
+
+/// The recomputed GC retention floor (`spaces:refreshRetentionFloor`). `§6.3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionFloor {
+    /// `min(baseSeqInUse)` over the Account's Devices, clamped to `[0, head]`.
+    /// Revisions with `seq >= retention_floor_seq` must never be swept.
+    pub retention_floor_seq: u64,
+    /// The current head seq, if the Space has any Revision.
+    pub head_seq: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Contract function names (single source of truth)
 // ---------------------------------------------------------------------------
@@ -433,8 +456,10 @@ mod func {
     pub const SPACES_GET: &str = "spaces:get";
     pub const SPACES_LIST_BY_ACCOUNT: &str = "spaces:listByAccount";
     pub const SPACES_HEAD: &str = "spaces:head";
+    pub const SPACES_REFRESH_RETENTION_FLOOR: &str = "spaces:refreshRetentionFloor";
     pub const REVISIONS_COMMIT: &str = "revisions:commit";
     pub const REVISIONS_BY_SEQ: &str = "revisions:bySeq";
+    pub const REVISIONS_LIST_FROM_SEQ: &str = "revisions:listFromSeq";
     pub const DEVICES_SET_BASE_SEQ: &str = "devices:setBaseSeq";
 }
 
@@ -524,6 +549,18 @@ fn set_base_seq_args(device_id: &DeviceId, base_seq_in_use: u64) -> BTreeMap<Str
         // (see `revision_by_seq_args`).
         ("baseSeqInUse", Value::Float64(base_seq_in_use as f64)),
     ])
+}
+
+fn list_from_seq_args(space_id: &SpaceId, min_seq: u64) -> BTreeMap<String, Value> {
+    obj([
+        ("spaceId", space_id.to_value()),
+        // `v.number()` on the backend → Convex float64 (see `revision_by_seq_args`).
+        ("minSeq", Value::Float64(min_seq as f64)),
+    ])
+}
+
+fn refresh_retention_floor_args(space_id: &SpaceId) -> BTreeMap<String, Value> {
+    obj([("spaceId", space_id.to_value())])
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +698,49 @@ fn parse_head_update(v: &Value) -> Result<HeadUpdate> {
         seq: wire::as_opt_u64(o, "seq", CTX)?,
         manifest_root: wire::as_opt_cid(o, "manifestRootCid", CTX)?,
         parent: wire::as_opt_string(o, "parent", CTX)?.map(RevisionId),
+    })
+}
+
+fn parse_revision_root(v: &Value) -> Result<RevisionRoot> {
+    const CTX: &str = func::REVISIONS_LIST_FROM_SEQ;
+    let o = wire::as_object(v, CTX)?;
+    Ok(RevisionRoot {
+        revision_id: RevisionId(wire::as_string(
+            wire::field(o, "revisionId", CTX)?,
+            "revisionId",
+            CTX,
+        )?),
+        seq: wire::as_u64(wire::field(o, "seq", CTX)?, "seq", CTX)?,
+        manifest_root_cid: wire::value_to_cid(
+            wire::field(o, "manifestRootCid", CTX)?,
+            "manifestRootCid",
+            CTX,
+        )?,
+    })
+}
+
+fn parse_revision_roots(v: &Value) -> Result<Vec<RevisionRoot>> {
+    const CTX: &str = func::REVISIONS_LIST_FROM_SEQ;
+    match v {
+        Value::Array(items) => items.iter().map(parse_revision_root).collect(),
+        other => Err(CoordinatorError::UnexpectedValue {
+            field: "<root>",
+            context: CTX,
+            detail: format!("expected array, got {}", wire::value_kind(other)),
+        }),
+    }
+}
+
+fn parse_retention_floor(v: &Value) -> Result<RetentionFloor> {
+    const CTX: &str = func::SPACES_REFRESH_RETENTION_FLOOR;
+    let o = wire::as_object(v, CTX)?;
+    Ok(RetentionFloor {
+        retention_floor_seq: wire::as_u64(
+            wire::field(o, "retentionFloorSeq", CTX)?,
+            "retentionFloorSeq",
+            CTX,
+        )?,
+        head_seq: wire::as_opt_u64(o, "headSeq", CTX)?,
     })
 }
 
@@ -844,6 +924,22 @@ impl Coordinator {
         parse_revision(&v)
     }
 
+    /// `revisions:listFromSeq` — every Revision root at or above `min_seq` (the
+    /// GC's retained set, `§6.3`). Returns id + seq + Manifest root per Revision.
+    pub async fn list_revisions_from(
+        &mut self,
+        space_id: &SpaceId,
+        min_seq: u64,
+    ) -> Result<Vec<RevisionRoot>> {
+        let v = self
+            .call_query(
+                func::REVISIONS_LIST_FROM_SEQ,
+                list_from_seq_args(space_id, min_seq),
+            )
+            .await?;
+        parse_revision_roots(&v)
+    }
+
     // ----- devices -----
 
     /// `devices:setBaseSeq` — publish the Device's retention floor (`§6.3`).
@@ -854,6 +950,19 @@ impl Coordinator {
         )
         .await?;
         Ok(())
+    }
+
+    /// `spaces:refreshRetentionFloor` — recompute + persist the Space's GC
+    /// retention floor from live Device telemetry (`§6.3`). Called right before a
+    /// sweep so the floor reflects the freshest `baseSeqInUse` values.
+    pub async fn refresh_retention_floor(&mut self, space_id: &SpaceId) -> Result<RetentionFloor> {
+        let v = self
+            .call_mutation(
+                func::SPACES_REFRESH_RETENTION_FLOOR,
+                refresh_retention_floor_args(space_id),
+            )
+            .await?;
+        parse_retention_floor(&v)
     }
 
     // ----- change feed (§8) -----
@@ -1044,6 +1153,65 @@ mod tests {
         assert_eq!(keys, vec!["baseSeqInUse", "deviceId"]);
         assert_eq!(args["deviceId"], Value::String("dev_1".into()));
         assert_eq!(args["baseSeqInUse"], Value::Float64(5.0));
+    }
+
+    #[test]
+    fn list_from_seq_args_send_float64_min_seq() {
+        // `minSeq` is `v.number()` on the backend → Float64, not Int64.
+        let args = list_from_seq_args(&SpaceId::new("sp_1"), 7);
+        let keys: Vec<_> = args.keys().cloned().collect();
+        assert_eq!(keys, vec!["minSeq", "spaceId"]);
+        assert_eq!(args["spaceId"], Value::String("sp_1".into()));
+        assert_eq!(args["minSeq"], Value::Float64(7.0));
+    }
+
+    #[test]
+    fn refresh_retention_floor_args_have_space() {
+        let args = refresh_retention_floor_args(&SpaceId::new("sp_9"));
+        assert_eq!(args.keys().cloned().collect::<Vec<_>>(), vec!["spaceId"]);
+        assert_eq!(args["spaceId"], Value::String("sp_9".into()));
+    }
+
+    #[test]
+    fn parse_revision_roots_reads_array() {
+        // Accepts both Int64 and integral Float64 for seq (as `wire::as_u64` does).
+        let a = objv([
+            ("revisionId", Value::String("rev_2".into())),
+            ("seq", Value::Int64(2)),
+            ("manifestRootCid", Value::Bytes(vec![2u8; 32])),
+        ]);
+        let b = objv([
+            ("revisionId", Value::String("rev_3".into())),
+            ("seq", Value::Float64(3.0)),
+            ("manifestRootCid", Value::Bytes(vec![3u8; 32])),
+        ]);
+        let roots = parse_revision_roots(&Value::Array(vec![a, b])).unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].revision_id, RevisionId::new("rev_2"));
+        assert_eq!(roots[0].seq, 2);
+        assert_eq!(roots[0].manifest_root_cid, cid(2));
+        assert_eq!(roots[1].seq, 3);
+        assert_eq!(roots[1].manifest_root_cid, cid(3));
+    }
+
+    #[test]
+    fn parse_retention_floor_reads_object_and_null_head() {
+        let v = objv([
+            ("retentionFloorSeq", Value::Int64(4)),
+            ("headSeq", Value::Int64(9)),
+        ]);
+        let rf = parse_retention_floor(&v).unwrap();
+        assert_eq!(rf.retention_floor_seq, 4);
+        assert_eq!(rf.head_seq, Some(9));
+
+        // A Space with no Revisions → headSeq null, floor 0.
+        let v2 = objv([
+            ("retentionFloorSeq", Value::Int64(0)),
+            ("headSeq", Value::Null),
+        ]);
+        let rf2 = parse_retention_floor(&v2).unwrap();
+        assert_eq!(rf2.retention_floor_seq, 0);
+        assert_eq!(rf2.head_seq, None);
     }
 
     // ----- response parsing -----

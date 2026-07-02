@@ -64,6 +64,12 @@ impl Vault for CountingVault {
         }
         self.inner.put(key, body).await
     }
+    async fn list(&self, prefix: &str) -> VaultResult<Vec<ft_vault::VaultObject>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> VaultResult<()> {
+        self.inner.delete(key).await
+    }
 }
 
 /// Seeds a `space_state` row for `space_id` (a fresh, never-synced Space) so a

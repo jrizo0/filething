@@ -68,12 +68,21 @@ FILETHING_HOME=/tmp/devB filething daemon /tmp/B
 # edita archivos en /tmp/A o /tmp/B y míralos aparecer en el otro.
 ```
 
-## 6. Pasar a la nube (R2 + Convex cloud) — solo configuración
-El código no cambia; solo el entorno:
-- **Vault → Cloudflare R2:** apunta `S3_ENDPOINT`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`/`S3_BUCKET`
-  a tu bucket R2 (la API es S3-compatible; `ft-vault` ya usa path-style configurable).
-- **Coordinator → Convex cloud:** `npx convex deploy` a tu deployment cloud y apunta
-  `CONVEX_SELF_HOSTED_URL`/auth a esa URL (o usa el flujo de Convex cloud).
+## 6. Pasar a la nube (R2 + Convex Cloud)
+**Runbook paso a paso: `docs/PRODUCTION-SETUP.md`** (crear el bucket R2 + token, el proyecto
+Convex Cloud + deploy key, rellenar `infra/.env.cloud`, y `scripts/cloud-deploy.sh` +
+`scripts/cloud-smoke.sh`). Resumen:
+- **Vault → Cloudflare R2:** apunta `S3_ENDPOINT`/`S3_REGION=auto`/`S3_ACCESS_KEY`/
+  `S3_SECRET_KEY`/`S3_BUCKET` a tu bucket R2 (S3-compatible; `ft-vault` ya usa path-style).
+- **Coordinator → Convex Cloud:** `scripts/cloud-deploy.sh` (deploy con `CONVEX_DEPLOY_KEY`);
+  apunta `CONVEX_URL` a `https://<name>.convex.cloud`. El cliente usa el deploy key vía
+  `set_admin_auth`, o conecta sin credencial (funciones públicas) — ver el runbook.
+
+## 7. Comandos de operación (Fase 2)
+- `filething gc <dir> [--apply] [--keep-all] [--grace-secs N]` — recolector de basura del
+  Vault (account-wide, dry-run por defecto). Ver `docs/adr/0012`.
+- `filething metrics [dir]` — métricas de sync del daemon (lee `.filething/metrics.json`).
+- `filething service <install|uninstall|status>` — daemon como servicio del SO.
 
 ## Qué NO está en el MVP (huecos reservados en el formato, no construidos)
 Cifrado en runtime, zero-knowledge, serve mode / self-hosted vault, GC/retención,

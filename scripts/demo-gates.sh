@@ -3,14 +3,19 @@
 # Dos "Devices" = dos FILETHING_HOME + dos carpetas en esta misma maquina Linux.
 set -uo pipefail
 
-REPO=/home/jrizo/repos/filething
+# Raíz del repo relativa a este script: funciona igual en el checkout original y
+# en un worktree (así el gate corre el binario y el backend de ESTE árbol).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/target/debug/filething"
 WORK=/tmp/ft-demo
 A_HOME="$WORK/devA-home"; B_HOME="$WORK/devB-home"
 A_DIR="$WORK/dirA";       B_DIR="$WORK/dirB"
 
-# --- entorno: coordinator + vault de infra/.env ---
-set -a; source "$REPO/infra/.env"; set +a
+# --- entorno: coordinator + vault ---
+# En un worktree, infra/.env (gitignored) no existe; usa FT_ENV_FILE para apuntar
+# al .env del checkout que tiene las credenciales de la infra local compartida.
+ENV_FILE="${FT_ENV_FILE:-$REPO/infra/.env}"
+set -a; source "$ENV_FILE"; set +a
 export CONVEX_SELF_HOSTED_URL="${CONVEX_SELF_HOSTED_URL:-http://localhost:3210}"
 # El cliente usa S3_* y CONVEX_SELF_HOSTED_*; ya vienen de infra/.env.
 
@@ -91,8 +96,28 @@ HAVE_A=$(grep -rl "version de A (offline)" "$B_DIR" | wc -l)
 HAVE_B=$(grep -rl "version de B (offline)" "$B_DIR" | wc -l)
 [ "$HAVE_A" -ge 1 ] && [ "$HAVE_B" -ge 1 ] && echo "OK (c): B conserva AMBAS versiones (sin perdida de datos)" || fail "(c) se perdio una version (A=$HAVE_A B=$HAVE_B)"
 
+hr "GATE (g) — GC: dry-run no borra; huerfano inyectado se barre; lo alcanzable sobrevive"
+a sync "$A_DIR" >/dev/null   # asegura A al dia antes de barrer
+# (g.1) dry-run (keep-all, grace 0) NO debe borrar nada — es solo un reporte.
+N0=$(count_blocks)
+a gc "$A_DIR" --keep-all --grace-secs 0 >/dev/null
+N0b=$(count_blocks)
+[ "$N0b" -eq "$N0" ] && echo "OK (g.1): dry-run no borro nada (bloques $N0 == $N0b)" || fail "(g.1) el dry-run borro objetos ($N0 -> $N0b)"
+# (g.2) inyecta un objeto huerfano bajo blocks/ y confirma que --apply lo borra.
+ORPHAN="blocks/zz/orphan-$(date +%s)"
+mc "echo huerfano | mc pipe L/${S3_BUCKET}/${ORPHAN}"
+mc "mc ls L/${S3_BUCKET}/${ORPHAN} 2>/dev/null | wc -l" | grep -q 1 || fail "(g.2) no se inyecto el huerfano"
+echo ">> huerfano inyectado: $ORPHAN"
+a gc "$A_DIR" --keep-all --grace-secs 0 --apply
+LEFT=$(mc "mc ls L/${S3_BUCKET}/${ORPHAN} 2>/dev/null | wc -l" | tr -d '[:space:]')
+[ "$LEFT" -eq 0 ] && echo "OK (g.2): --apply borro el huerfano inyectado" || fail "(g.2) el huerfano sobrevivio al --apply"
+# (g.3) SEGURIDAD: lo alcanzable no se borro — un clone fresco reconstruye big.txt.
+B_DIR2="$WORK/dirB2"; mkdir -p "$B_DIR2"
+b clone "$SPACE" "$B_DIR2" >/dev/null
+diff "$A_DIR/big.txt" "$B_DIR2/big.txt" >/dev/null && echo "OK (g.3): clone fresco reconstruye big.txt tras el GC (bloques alcanzables intactos)" || fail "(g.3) el GC borro bloques alcanzables (clone no reconstruye big.txt)"
+
 hr "RESULTADO"
-echo "Gates a, b, c, d: PASARON via la CLI real contra Convex+MinIO."
+echo "Gates a, b, c, d, g: PASARON via la CLI real contra Convex+MinIO."
 
 # ---------------------------------------------------------------------------
 # Gates (e) y (f) — daemons de verdad (no `sync` puntual), Space/HOMEs propios

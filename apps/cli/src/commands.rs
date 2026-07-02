@@ -420,15 +420,20 @@ pub async fn gc(
         .context("gc")?;
 
     let mode = if report.applied { "APPLIED" } else { "dry run" };
-    println!("GC ({mode}) for Space at {}", root.display());
-    match report.retention_floor_seq {
-        Some(floor) => println!("  retention floor: seq >= {floor} (min base across Devices)"),
-        None => println!("  retention floor: keep-all (every Revision retained)"),
+    println!(
+        "GC ({mode}) — account-wide Vault, selected via {}",
+        root.display()
+    );
+    println!("  (all your Spaces share one Vault; reachability is unioned across them)");
+    if report.keep_all {
+        println!("  retention: keep-all (every Revision retained; sweeps only orphans)");
+    } else {
+        println!("  retention: seq >= per-Space floor (min base across your Devices)");
     }
-    if let Some(head) = report.head_seq {
-        println!("  head seq: {head}");
-    }
-    println!("  retained revisions: {}", report.retained_revisions);
+    println!(
+        "  {} Space(s), {} retained revision(s)",
+        report.spaces, report.retained_revisions
+    );
     println!(
         "  objects: {} scanned, {} reachable, {} sweepable, {} held by grace-period",
         report.scanned_objects,

@@ -23,6 +23,18 @@
 //!
 //! As a last resort it REFUSES to run if the retained set is empty while the
 //! Space has a head (a backend anomaly), rather than sweeping everything.
+//!
+//! ## Scope: ONE bucket == ONE account
+//!
+//! The Vault is a single bucket and dedup is account-wide, so the GC computes
+//! reachability as the UNION over EVERY Space of the account (not the one Space
+//! the CLI pointed at) — otherwise it would delete Blocks another Space of the
+//! same account still needs. It follows that the GC also sweeps any object NOT
+//! reachable from the account, i.e. it assumes the bucket belongs to exactly one
+//! account (the shipped self-hosted / personal-use model: a deployment has one
+//! account). A future MANAGED multi-tenant Vault sharing one bucket across
+//! accounts would need account-prefixed keys or a server-side cross-account
+//! sweep before this could run safely there.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -65,14 +77,18 @@ impl Default for GcOptions {
     }
 }
 
-/// What a [`SpaceContext::gc`] run found and (with `apply`) did.
+/// What a [`SpaceContext::gc`] run found and (with `apply`) did. GC is
+/// **account-scoped**: the Vault (one bucket) holds Blocks for EVERY Space of the
+/// account and dedup is account-wide, so reachability is the UNION over all of
+/// them and these figures span the account, not one Space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcReport {
-    /// The retention floor used, or `None` in `keep_all` mode.
-    pub retention_floor_seq: Option<u64>,
-    /// The Space head seq at GC time, if any.
-    pub head_seq: Option<u64>,
-    /// Number of retained Revisions whose Manifest trees were walked.
+    /// Number of the account's Spaces whose reachability was unioned.
+    pub spaces: usize,
+    /// `true` if every Revision was retained (`keep_all`); when `false` a
+    /// per-Space retention floor (`min(baseSeqInUse)`) was applied.
+    pub keep_all: bool,
+    /// Total retained Revisions (across all Spaces) whose trees were walked.
     pub retained_revisions: usize,
     /// Distinct reachable Vault objects (the mark set).
     pub reachable_objects: usize,
@@ -91,20 +107,25 @@ pub struct GcReport {
 }
 
 impl SpaceContext {
-    /// Runs a mark-and-sweep GC over this Space's Vault objects. See the module
-    /// docs for the safety model. Requires a Coordinator (a staging-only mount
-    /// errors). Dry-run unless [`GcOptions::apply`].
+    /// Runs a mark-and-sweep GC over the **account-wide** Vault. The Vault is
+    /// shared across ALL of the account's Spaces (one bucket, account-scoped
+    /// dedup), so reachability is the UNION over every Space's retained
+    /// Revisions — GCing from a single Space's view would delete other Spaces'
+    /// live Blocks. The `dir` you point at only selects the account / Vault /
+    /// Coordinator; the sweep covers the whole account. Requires a Coordinator
+    /// (a staging-only mount errors). Dry-run unless [`GcOptions::apply`]. See the
+    /// module docs for the safety model.
     pub async fn gc(&mut self, opts: GcOptions) -> Result<GcReport> {
         if self.coordinator.is_none() {
             return Err(EngineError::SpaceState(
                 "gc requires a Coordinator; this context was mounted for staging only".to_string(),
             ));
         }
-        let space_id = self.space_id.clone();
+        let account_id = self.account_id.clone();
         let device_id = self.device_id.clone();
         let base_seq = self.last_synced.seq;
 
-        // Publish THIS Device's base so the recomputed floor reflects at least our
+        // Publish THIS Device's base so a recomputed floor reflects at least our
         // own base (never higher than it). Skipped for a never-synced Space.
         if base_seq >= 0 {
             self.coordinator
@@ -114,53 +135,51 @@ impl SpaceContext {
                 .await?;
         }
 
-        // The Space doc: needed for the meta blob (a reachability root outside the
-        // Manifest tree) and to know whether a head exists (the anomaly guard).
-        let space = self
+        // Gather reachability roots (Manifest roots + meta blobs) across EVERY
+        // Space of the account — they all share this Vault.
+        let spaces = self
             .coordinator
             .as_mut()
             .expect("coordinator present")
-            .get_space(&space_id)
+            .list_spaces(&account_id)
             .await?;
 
-        // Determine the retained window: all Revisions (keep_all) or seq >= floor.
-        let (min_seq, floor_reported, head_seq) = if opts.keep_all {
-            (0u64, None, None)
-        } else {
-            let rf = self
+        let mut root_cids: Vec<Cid> = Vec::new();
+        let mut meta_cids: Vec<Cid> = Vec::new();
+        let mut retained_revisions = 0usize;
+        for space in &spaces {
+            meta_cids.push(space.meta_blob_cid);
+            let min_seq = if opts.keep_all {
+                0
+            } else {
+                self.coordinator
+                    .as_mut()
+                    .expect("coordinator present")
+                    .refresh_retention_floor(&space.space_id)
+                    .await?
+                    .retention_floor_seq
+            };
+            let roots = self
                 .coordinator
                 .as_mut()
                 .expect("coordinator present")
-                .refresh_retention_floor(&space_id)
+                .list_revisions_from(&space.space_id, min_seq)
                 .await?;
-            (
-                rf.retention_floor_seq,
-                Some(rf.retention_floor_seq),
-                rf.head_seq,
-            )
-        };
-
-        let roots = self
-            .coordinator
-            .as_mut()
-            .expect("coordinator present")
-            .list_revisions_from(&space_id, min_seq)
-            .await?;
-
-        // Safety: never sweep everything. A head with no retained roots is a
-        // backend anomaly — refuse rather than treat every object as garbage.
-        if roots.is_empty() && space.head_revision_id.is_some() {
-            return Err(EngineError::SpaceState(format!(
-                "gc refusing to run: Space {} has a head but listFromSeq({min_seq}) returned no \
-                 retained roots",
-                space_id.as_str()
-            )));
+            // Safety: a Space with a head but no retained roots is a backend
+            // anomaly — refuse the WHOLE GC rather than treat live objects as junk.
+            if roots.is_empty() && space.head_revision_id.is_some() {
+                return Err(EngineError::SpaceState(format!(
+                    "gc refusing to run: Space {} has a head but listFromSeq({min_seq}) \
+                     returned no retained roots",
+                    space.space_id.as_str()
+                )));
+            }
+            retained_revisions += roots.len();
+            root_cids.extend(roots.into_iter().map(|r| r.manifest_root_cid));
         }
 
-        // ----- mark: every reachable Vault key -----
-        let root_cids: Vec<Cid> = roots.iter().map(|r| r.manifest_root_cid).collect();
-        let reachable =
-            mark_reachable(self.vault.as_ref(), &root_cids, &space.meta_blob_cid).await?;
+        // ----- mark: every reachable Vault key across all Spaces -----
+        let reachable = mark_reachable(self.vault.as_ref(), &root_cids, &meta_cids).await?;
 
         // ----- sweep: list physical objects, hold back reachable + young -----
         let now = SystemTime::now();
@@ -183,9 +202,9 @@ impl SpaceContext {
         }
 
         Ok(GcReport {
-            retention_floor_seq: floor_reported,
-            head_seq,
-            retained_revisions: roots.len(),
+            spaces: spaces.len(),
+            keep_all: opts.keep_all,
+            retained_revisions,
             reachable_objects: reachable.len(),
             scanned_objects: scanned,
             kept_by_grace,
@@ -206,12 +225,14 @@ impl SpaceContext {
 pub(crate) async fn mark_reachable(
     vault: &dyn Vault,
     roots: &[Cid],
-    meta_cid: &Cid,
+    meta_cids: &[Cid],
 ) -> Result<HashSet<String>> {
     let mut reachable: HashSet<String> = HashSet::new();
-    // The Space meta blob (`meta/<cid>`) is a reachability root independent of the
-    // Manifest tree; its cid is not discoverable by walking. Never delete.
-    reachable.insert(crate::secrets::meta_key(meta_cid));
+    // Each Space's meta blob (`meta/<cid>`) is a reachability root independent of
+    // the Manifest tree; its cid is not discoverable by walking. Never delete.
+    for meta_cid in meta_cids {
+        reachable.insert(crate::secrets::meta_key(meta_cid));
+    }
     // The empty-Manifest root is the "no base yet" base a fresh Device reads.
     // Insert its key directly (do NOT walk/fetch: it may legitimately be absent
     // from the Vault, which must not fail the mark).
@@ -391,7 +412,7 @@ mod tests {
         )
         .await;
 
-        let reachable = mark_reachable(&vault, &[root], &meta).await.unwrap();
+        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
 
         assert!(reachable.contains(&ft_hash::manifest_key(&root)));
         assert!(reachable.contains(&ft_hash::block_key(&block_a)));
@@ -437,7 +458,7 @@ mod tests {
         };
         let root = upload_manifest(&vault, vec![(ft_fsmap::casefold_key(&p), entry)]).await;
 
-        let reachable = mark_reachable(&vault, &[root], &meta).await.unwrap();
+        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
 
         assert!(reachable.contains(&ft_hash::blocklist_key(&bl_cid)));
         assert!(reachable.contains(&ft_hash::block_key(&block_a)));
@@ -473,7 +494,7 @@ mod tests {
         };
         let root = upload_manifest(&vault, vec![(ft_fsmap::casefold_key(&p), entry)]).await;
 
-        let err = mark_reachable(&vault, &[root], &cid(200))
+        let err = mark_reachable(&vault, &[root], &[cid(200)])
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::SpaceState(_)));

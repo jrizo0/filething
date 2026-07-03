@@ -1,27 +1,28 @@
-// auth — minimal device pairing by code (Coordinator control plane).
+// auth — identity resolution and the authorization helpers every Coordinator
+// function shares.
 //
-// Decisions §0: "Auth = pairing mínimo por código de dispositivo." Better Auth /
-// browser OAuth is a reserved hole (post-MVP). The pairing code is intentionally
-// NON-cryptographic for the MVP — it only has to be hard enough to mistype, not
-// to brute-force.
+// Real auth now lives in Better Auth (see betterAuth.ts / http.ts). The client
+// presents a Convex-audience JWT over the websocket; here we turn that identity
+// into a filething Account and enforce ownership. The MVP pairing codes
+// (bootstrap/claim, table pairing_codes) are gone: pairing a second Device is
+// just the same user logging in elsewhere and calling ensureDevice again.
 //
-// Contract (BUILD-PLAN §3 ft-coordinator, mirrored 1:1 in the Rust client):
-//   mutation auth:bootstrap({ deviceName })
-//     -> { accountId, deviceId, pairingCode }   // first Device: Account+Device+code
-//   mutation auth:claim({ code, deviceName })
-//     -> { accountId, deviceId }                // second Device joins the Account
+// Contract (mirrored in the Rust client):
+//   mutation auth:ensureDevice({ deviceName, dedupSecret? })
+//     -> { accountId, deviceId, dedupSecret }   // get-or-create Account + Device
 //
-// The Coordinator never sees file bytes nor the Space key (format.md §1, §6).
+// The Coordinator never sees file bytes nor a Space's plaintext (format.md §1, §6);
+// dedupSecret / spaceKey are opaque escrow blobs it only hands back to the same
+// authenticated Account.
 
 import { v, ConvexError } from "convex/values";
 import { mutation } from "./_generated/server";
-import type { MutationCtx } from "./_generated/server";
-import type { Id } from "./_generated/dataModel";
+import type { QueryCtx } from "./_generated/server";
+import type { Doc, Id } from "./_generated/dataModel";
 
 // UTF-8 encode a string into a fresh, standalone ArrayBuffer (the type
-// v.bytes() stores). We copy into a new ArrayBuffer rather than reuse the
-// encoder's view buffer so the value is unambiguously a plain ArrayBuffer
-// (never a SharedArrayBuffer) and owns exactly its bytes.
+// v.bytes() stores). Copy into a new ArrayBuffer so the value is unambiguously a
+// plain ArrayBuffer that owns exactly its bytes.
 function utf8ToArrayBuffer(s: string): ArrayBuffer {
   const bytes = new TextEncoder().encode(s);
   const buf = new ArrayBuffer(bytes.byteLength);
@@ -29,129 +30,185 @@ function utf8ToArrayBuffer(s: string): ArrayBuffer {
   return buf;
 }
 
-// Code alphabet: no 0/O/1/I/L to stay unambiguous when typed by a human.
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-const CODE_LEN = 8;
+// Per-Account / per-Space escrow secrets are fixed 32-byte keys.
+const ESCROW_KEY_BYTES = 32;
 
-// Generates a short, human-typeable, NON-cryptographic pairing code (MVP).
-// Uses Math.random — adequate for a one-shot, single-use pairing token; a real
-// auth flow (reserved, post-MVP) would replace this with a proper secret.
-function generatePairingCode(): string {
-  let code = "";
-  for (let i = 0; i < CODE_LEN; i++) {
-    const idx = Math.floor(Math.random() * CODE_ALPHABET.length);
-    code += CODE_ALPHABET[idx];
+// Resolve the caller's authenticated Account, or throw. Every public function
+// funnels through this: no valid JWT (ctx.auth) => "unauthenticated"; a valid
+// identity with no matching Account yet => "no_account" (call ensureDevice first).
+// The Account is keyed by `subject` = the JWT `sub` claim (Better Auth user id).
+export async function requireAccount(ctx: QueryCtx): Promise<Doc<"accounts">> {
+  const identity = await ctx.auth.getUserIdentity();
+  if (identity === null) {
+    throw new ConvexError({
+      code: "unauthenticated",
+      message: "no authenticated identity on the request",
+    });
   }
-  return code;
+  const account = await ctx.db
+    .query("accounts")
+    .withIndex("by_subject", (q) => q.eq("subject", identity.subject))
+    .unique();
+  if (account === null) {
+    throw new ConvexError({
+      code: "no_account",
+      message: "authenticated but no Account yet; call auth:ensureDevice first",
+    });
+  }
+  return account;
 }
 
-// Mints a fresh, not-yet-used pairing code, retrying on the (vanishingly rare)
-// collision with an existing unclaimed code so the lookup-by-code stays
-// unambiguous. Bounded retries keep the mutation well under Convex's CPU limit.
-async function mintUniqueCode(ctx: MutationCtx): Promise<string> {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const code = generatePairingCode();
-    const existing = await ctx.db
-      .query("pairing_codes")
-      .withIndex("by_code", (q) => q.eq("code", code))
-      .unique();
-    if (existing === null) {
-      return code;
-    }
+// Load a Space and assert the caller's Account owns it, or throw. Centralises
+// the ownership check shared by spaces:* and revisions:*.
+export async function requireOwnedSpace(
+  ctx: QueryCtx,
+  account: Doc<"accounts">,
+  spaceId: Id<"spaces">,
+): Promise<Doc<"spaces">> {
+  const space = await ctx.db.get(spaceId);
+  if (space === null) {
+    throw new ConvexError({ code: "space_not_found", message: "no such Space" });
   }
-  // Astronomically unlikely with 30^8 codes; surface as a distinguishable error
-  // rather than risk an ambiguous duplicate.
-  throw new ConvexError({
-    code: "pairing_code_exhausted",
-    message: "could not mint a unique pairing code",
-  });
+  if (space.accountId !== account._id) {
+    throw new ConvexError({
+      code: "forbidden",
+      message: "Space belongs to another Account",
+    });
+  }
+  return space;
 }
 
-// First Device: creates the Account + this Device and mints a pairing code that
-// a second Device can later claim to join the same Account.
-export const bootstrap = mutation({
+// Load a Device and assert the caller's Account owns it, or throw.
+export async function requireOwnedDevice(
+  ctx: QueryCtx,
+  account: Doc<"accounts">,
+  deviceId: Id<"devices">,
+): Promise<Doc<"devices">> {
+  const device = await ctx.db.get(deviceId);
+  if (device === null) {
+    throw new ConvexError({ code: "device_not_found", message: "no such Device" });
+  }
+  if (device.accountId !== account._id) {
+    throw new ConvexError({
+      code: "forbidden",
+      message: "Device belongs to another Account",
+    });
+  }
+  return device;
+}
+
+// Pick a human-ish display name for a freshly created Account from the identity,
+// falling back to the device name. Stored as v.bytes() (ciphertext-ready).
+function displayNameFor(
+  identity: { email?: string; name?: string },
+  deviceName: string,
+): string {
+  return identity.email ?? identity.name ?? deviceName;
+}
+
+// ensureDevice — the authenticated entry point every client calls at startup.
+// Resolves identity -> get-or-create Account (by JWT subject) -> get-or-create
+// Device (by Account + deviceName) and returns the escrow dedupSecret so a
+// second Device of the same user gets the same value. Idempotent: calling it
+// again for a known (Account, deviceName) returns the existing rows.
+//
+// `dedupSecret` (32 bytes) is generated by the CLIENT on first use and stored
+// once. It is REQUIRED when the Account is created; ignored (the stored value
+// wins) once set. It back-fills an Account that predates escrow.
+export const ensureDevice = mutation({
   args: {
     deviceName: v.string(),
+    dedupSecret: v.optional(v.bytes()),
   },
   returns: v.object({
     accountId: v.id("accounts"),
     deviceId: v.id("devices"),
-    pairingCode: v.string(),
+    dedupSecret: v.bytes(),
   }),
   handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (identity === null) {
+      throw new ConvexError({
+        code: "unauthenticated",
+        message: "no authenticated identity on the request",
+      });
+    }
+
+    if (
+      args.dedupSecret !== undefined &&
+      args.dedupSecret.byteLength !== ESCROW_KEY_BYTES
+    ) {
+      throw new ConvexError({
+        code: "bad_dedup_secret",
+        message: `dedupSecret must be exactly ${ESCROW_KEY_BYTES} bytes`,
+      });
+    }
+
     const now = Date.now();
 
-    // The Account owns Spaces and Devices. `subject` is the stable external
-    // identity; in the MVP we derive a throwaway one from the device + time
-    // (real login subject is reserved, post-MVP). `name` is v.bytes() so it can
-    // become ciphertext under zero-knowledge without a type change.
-    const subject = `pairing:${now}:${args.deviceName}`;
-    const accountId: Id<"accounts"> = await ctx.db.insert("accounts", {
-      subject,
-      name: utf8ToArrayBuffer(args.deviceName),
-      createdAt: now,
-    });
-
-    const deviceId: Id<"devices"> = await ctx.db.insert("devices", {
-      accountId,
-      name: args.deviceName,
-      baseSeqInUse: 0,
-    });
-
-    const pairingCode = await mintUniqueCode(ctx);
-    await ctx.db.insert("pairing_codes", {
-      code: pairingCode,
-      accountId,
-      createdAt: now,
-      claimedAt: null,
-    });
-
-    return { accountId, deviceId, pairingCode };
-  },
-});
-
-// Second Device: consumes a pairing code to join the Account that minted it,
-// registering a new Device under that Account. The code is single-use.
-export const claim = mutation({
-  args: {
-    code: v.string(),
-    deviceName: v.string(),
-  },
-  returns: v.object({
-    accountId: v.id("accounts"),
-    deviceId: v.id("devices"),
-  }),
-  handler: async (ctx, args) => {
-    const pairing = await ctx.db
-      .query("pairing_codes")
-      .withIndex("by_code", (q) => q.eq("code", args.code))
+    // Get-or-create the Account keyed by the JWT subject.
+    let account = await ctx.db
+      .query("accounts")
+      .withIndex("by_subject", (q) => q.eq("subject", identity.subject))
       .unique();
 
-    if (pairing === null) {
-      throw new ConvexError({
-        code: "invalid_pairing_code",
-        message: "no such pairing code",
+    let accountId: Id<"accounts">;
+    let dedupSecret: ArrayBuffer;
+
+    if (account === null) {
+      // First Device for this identity: the client MUST supply the escrow secret.
+      if (args.dedupSecret === undefined) {
+        throw new ConvexError({
+          code: "dedup_secret_required",
+          message: "first ensureDevice for an Account must include dedupSecret",
+        });
+      }
+      dedupSecret = args.dedupSecret;
+      accountId = await ctx.db.insert("accounts", {
+        subject: identity.subject,
+        name: utf8ToArrayBuffer(
+          displayNameFor(identity, args.deviceName),
+        ),
+        dedupSecret,
+        createdAt: now,
+      });
+    } else {
+      accountId = account._id;
+      if (account.dedupSecret === undefined) {
+        // Back-fill escrow for a pre-existing Account (needs the client's secret).
+        if (args.dedupSecret === undefined) {
+          throw new ConvexError({
+            code: "dedup_secret_required",
+            message: "Account has no dedupSecret yet; include it to back-fill",
+          });
+        }
+        dedupSecret = args.dedupSecret;
+        await ctx.db.patch(accountId, { dedupSecret });
+      } else {
+        // Already escrowed: the stored value is authoritative.
+        dedupSecret = account.dedupSecret;
+      }
+    }
+
+    // Get-or-create the Device by (Account, deviceName). Names are unique per
+    // Account by convention; a repeat call returns the existing Device.
+    const existingDevices = await ctx.db
+      .query("devices")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect();
+    const existing = existingDevices.find((d) => d.name === args.deviceName);
+
+    let deviceId: Id<"devices">;
+    if (existing !== undefined) {
+      deviceId = existing._id;
+    } else {
+      deviceId = await ctx.db.insert("devices", {
+        accountId,
+        name: args.deviceName,
+        baseSeqInUse: 0,
       });
     }
-    if (pairing.claimedAt !== null) {
-      throw new ConvexError({
-        code: "pairing_code_already_claimed",
-        message: "pairing code has already been used",
-      });
-    }
 
-    const now = Date.now();
-    // Single-use: mark claimed inside this serializable mutation so two
-    // concurrent claims of the same code cannot both succeed (OCC retry re-reads
-    // the fresh row).
-    await ctx.db.patch(pairing._id, { claimedAt: now });
-
-    const deviceId: Id<"devices"> = await ctx.db.insert("devices", {
-      accountId: pairing.accountId,
-      name: args.deviceName,
-      baseSeqInUse: 0,
-    });
-
-    return { accountId: pairing.accountId, deviceId };
+    return { accountId, deviceId, dedupSecret };
   },
 });

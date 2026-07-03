@@ -43,14 +43,15 @@ hr "BUILD — binario release (target/release/filething)"
 
 mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 
-hr "PASO 1 — login A (bootstrap) + login B (claim por código)"
-OUT_A=$(a login --name device-a-cloud); echo "$OUT_A"
-# Anclado a "--code XXXX" (mismo criterio que scripts/demo-gates.sh): un grep suelto
-# de [A-Z0-9]{6,} podría capturar dígitos del account id impreso arriba.
-CODE=$(echo "$OUT_A" | sed -n 's/.*--code \([A-Z0-9]\{1,\}\).*/\1/p' | head -1)
-if [ -n "$CODE" ]; then ok "A generó pairing code ($CODE)"; else bad "A no imprimió pairing code"; echo "SMOKE FAIL"; exit 1; fi
-b login --code "$CODE" --name device-b-cloud; echo
-ok "B se emparejó con el código"
+hr "PASO 1 — login A (signup) + login B (mismo usuario, otro Device)"
+# Auth real (Better Auth): email único por corrida + password por env var. El
+# segundo Device es el MISMO usuario logueando en otro FILETHING_HOME (pairing
+# eliminado). CONVEX_SITE_URL se deriva de CONVEX_URL (*.convex.cloud →
+# *.convex.site) si no se fija en el .env.
+FT_EMAIL="${FILETHING_TEST_EMAIL:-smoke-$(date +%s)-$$@example.com}"
+export FILETHING_PASSWORD="${FILETHING_PASSWORD:?define FILETHING_PASSWORD en $ENV_FILE}"
+if a login --signup --email "$FT_EMAIL" --name device-a-cloud; then ok "A creó la cuenta ($FT_EMAIL)"; else bad "login --signup de A"; echo "SMOKE FAIL"; exit 1; fi
+if b login --email "$FT_EMAIL" --name device-b-cloud; then ok "B se logueó (mismo usuario, Device nuevo)"; else bad "login de B"; echo "SMOKE FAIL"; exit 1; fi
 
 hr "PASO 2 — A init (con archivo) + B clone => el archivo aparece en B"
 mkdir -p "$A_DIR/src"

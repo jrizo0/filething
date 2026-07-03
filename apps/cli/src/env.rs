@@ -1,25 +1,33 @@
 //! Building the engine's collaborators from the environment (`docs/BUILD-PLAN.md
-//! §3`, the credential model).
+//! §3`, `docs/adr/0014`, `docs/adr/0015`).
 //!
-//! The Coordinator URL + admin/deploy key and the Vault `S3_*` credentials come
-//! from the environment. The same wiring serves two deployments (see
-//! `docs/PRODUCTION-SETUP.md`):
+//! The Coordinator URL and the Vault `S3_*` credentials come from the
+//! environment; the per-Device identity (the Better Auth session) comes from the
+//! Device's [`Credentials`]. The normal path is authenticated: the CLI trades the
+//! session for a Convex JWT and attaches it to the websocket
+//! ([`ConvexClient::set_auth`] one-shot, or [`ConvexClient::set_auth_callback`]
+//! for the long-running daemon so it re-mints across the ~15-min expiry). The
+//! deployment admin/deploy key is now ONLY an ops fallback for when there is no
+//! session (see [`connect`]).
 //!
-//! - **Local Docker infra** (self-hosted Convex + MinIO): the legacy
-//!   `CONVEX_SELF_HOSTED_URL` / `CONVEX_SELF_HOSTED_ADMIN_KEY` vars.
-//! - **Managed cloud** (Convex Cloud + Cloudflare R2): the cloud-neutral
-//!   `CONVEX_URL` + `CONVEX_DEPLOY_KEY` (or `CONVEX_ADMIN_KEY`) vars, which take
-//!   precedence. For personal use the Convex Cloud **deploy key** is fed through
-//!   the same `set_admin_auth` path (acceptable only while every Device is the
-//!   owner's — real per-user auth is a reserved hole, `TODO.md` Fase B).
+//! Deployments (`docs/PRODUCTION-SETUP.md`): local Docker infra
+//! (`CONVEX_SELF_HOSTED_URL`) or managed cloud (`CONVEX_URL`); the URL selects
+//! both the Convex websocket and — via [`crate::auth::auth_base_url`] — the
+//! Better Auth host.
 //!
 //! These helpers centralize that wiring so every subcommand builds a
-//! [`Coordinator`] (with admin auth) and a [`Vault`] the same way.
+//! [`Coordinator`], attaches encryption key material, and builds a [`Vault`] the
+//! same way.
 
 use std::path::Path;
 
 use anyhow::Context as _;
-use ft_engine::{Coordinator, Vault};
+use convex::{AuthTokenFetcher, AuthenticationToken, ConvexClient};
+use ft_core::SpaceCrypto;
+use ft_engine::{Coordinator, SpaceId, Vault};
+
+use crate::auth;
+use crate::credentials::{self, Credentials};
 
 /// Cloud-neutral Convex deployment URL (Convex Cloud `https://<name>.convex.cloud`).
 /// Preferred; falls back to [`ENV_URL_SELF_HOSTED`].
@@ -52,30 +60,132 @@ pub fn coordinator_url_from_env() -> String {
         .unwrap_or_else(|| "http://localhost:3210".to_string())
 }
 
-/// Builds a [`Coordinator`] connected to `url` with deployment admin auth
-/// attached (construct a [`convex::ConvexClient`], `set_admin_auth`, then
-/// [`Coordinator::from_client`]).
+/// Builds a [`Coordinator`] connected to `url`, authenticated as this Device.
 ///
-/// The credential is resolved in precedence order — `CONVEX_ADMIN_KEY`,
+/// - With a Better Auth session (`creds`): trade it for a Convex JWT and attach
+///   it. `long_running` (the daemon) uses [`ConvexClient::set_auth_callback`] so
+///   the JWT is re-minted on every websocket reconnect (surviving the ~15-min
+///   expiry); one-shot commands use [`ConvexClient::set_auth`].
+/// - Without a session: fall back to the deployment admin/deploy key
+///   ([`connect_ops_fallback`]) — an OPS escape hatch, no longer the normal flow.
+pub async fn connect(
+    url: &str,
+    creds: Option<&Credentials>,
+    long_running: bool,
+) -> anyhow::Result<Coordinator> {
+    match creds {
+        Some(c) if !c.session_token.is_empty() => {
+            connect_authed(url, &c.session_token, long_running).await
+        }
+        _ => connect_ops_fallback(url).await,
+    }
+}
+
+/// Connects with the per-Device Better Auth session attached as a Convex JWT.
+async fn connect_authed(
+    url: &str,
+    session_token: &str,
+    long_running: bool,
+) -> anyhow::Result<Coordinator> {
+    let base = auth::auth_base_url(url)?;
+    let mut client = ConvexClient::new(url)
+        .await
+        .with_context(|| format!("connecting to the Coordinator at {url}"))?;
+
+    if long_running {
+        // Re-mint the JWT on connect and every reconnect (force_refresh) so a
+        // daemon outlives the ~15-min JWT expiry without operator action.
+        let base = base.clone();
+        let token = session_token.to_string();
+        let fetcher: AuthTokenFetcher = Box::new(move |_force_refresh: bool| {
+            let base = base.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                let jwt = auth::convex_token(&base, &token).await?;
+                Ok(AuthenticationToken::User(jwt))
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = anyhow::Result<AuthenticationToken>>
+                            + Send,
+                    >,
+                >
+        });
+        client.set_auth_callback(Some(fetcher)).await;
+    } else {
+        let jwt = auth::convex_token(&base, session_token).await?;
+        client.set_auth(Some(jwt)).await;
+    }
+    Ok(Coordinator::from_client(client))
+}
+
+/// Ops fallback: connect with the deployment admin/deploy key when there is no
+/// session. Resolved in precedence order — `CONVEX_ADMIN_KEY`,
 /// `CONVEX_DEPLOY_KEY` (Convex Cloud), `CONVEX_SELF_HOSTED_ADMIN_KEY` (local
-/// infra) — and is never persisted. When NONE is set the client connects WITHOUT
-/// admin auth: Convex functions are public by default over the sync protocol, so
-/// a personal-use Cloud deployment (whose functions have no `ctx.auth` checks)
-/// still works; a self-hosted deploy, however, needs a key. See
-/// `docs/PRODUCTION-SETUP.md`.
-pub async fn connect_coordinator(url: &str) -> anyhow::Result<Coordinator> {
-    let mut client = convex::ConvexClient::new(url)
+/// infra) — and never persisted. With NONE set, connects unauthenticated (which
+/// the auth-gated contract functions now reject — hence the login hint).
+async fn connect_ops_fallback(url: &str) -> anyhow::Result<Coordinator> {
+    let mut client = ConvexClient::new(url)
         .await
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
     match first_env(&[ENV_ADMIN_KEY, ENV_DEPLOY_KEY, ENV_ADMIN_KEY_SELF_HOSTED]) {
-        Some(admin_key) => client.set_admin_auth(admin_key, None).await,
+        Some(admin_key) => {
+            tracing::warn!(
+                "no Device session found; using the deployment admin/deploy key as an OPS \
+                 fallback — this is NOT the normal flow, run `filething login` to authenticate \
+                 as a Device"
+            );
+            client.set_admin_auth(admin_key, None).await
+        }
         None => tracing::warn!(
-            "no Convex credential set (CONVEX_DEPLOY_KEY / CONVEX_ADMIN_KEY / \
-             CONVEX_SELF_HOSTED_ADMIN_KEY); connecting without admin auth — fine for Convex \
-             Cloud public functions, but a self-hosted deployment needs a key"
+            "not logged in and no Convex admin/deploy key set — the Coordinator's functions \
+             require authentication; run `filething login` first"
         ),
     }
     Ok(Coordinator::from_client(client))
+}
+
+/// Loads this Device's encryption key material for the Space at `root` from the
+/// LOCAL caches (no network): the per-Space `space_key` cache plus the Account
+/// `dedup_secret` in [`Credentials`]. Returns `None` (so the Space stays on the
+/// cleartext `alg=0` path) when either is absent — a legacy Space with no
+/// escrowed key, or a Device that has not logged in.
+pub fn load_space_crypto(
+    root: &Path,
+    creds: Option<&Credentials>,
+) -> anyhow::Result<Option<SpaceCrypto>> {
+    let (Some(creds), Some(space_key)) = (creds, credentials::read_space_key(root)?) else {
+        return Ok(None);
+    };
+    Ok(Some(SpaceCrypto {
+        dedup_secret: creds.dedup_secret()?,
+        space_key,
+    }))
+}
+
+/// Ensures the Space's `space_key` is cached locally, fetching it from the
+/// Coordinator (`spaces:get`) and writing the `0600` cache on a miss. Returns the
+/// key, or `None` for a legacy Space the backend has no `space_key` for. Lets a
+/// freshly-opened Space (e.g. one restored from config without its cache) recover
+/// its key so later commands work offline.
+pub async fn ensure_space_key_cached(
+    coordinator: &mut Coordinator,
+    space_id: &SpaceId,
+    root: &Path,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    if let Some(key) = credentials::read_space_key(root)? {
+        return Ok(Some(key));
+    }
+    let space = coordinator
+        .get_space(space_id)
+        .await
+        .context("fetching the Space to recover its space_key")?;
+    if let Some(key) = space.space_key {
+        credentials::write_space_key(root, &key)?;
+        Ok(Some(key))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Builds the data-plane [`Vault`] from the `S3_*` env vars

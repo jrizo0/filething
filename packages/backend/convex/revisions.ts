@@ -17,6 +17,7 @@
 
 import { v, ConvexError } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireAccount, requireOwnedSpace, requireOwnedDevice } from "./auth";
 
 // Commit a new Revision iff the Space head still equals the expected base.
 //
@@ -37,14 +38,11 @@ export const commit = mutation({
     seq: v.number(),
   }),
   handler: async (ctx, args) => {
-    // Read the head INSIDE the txn — never trust a prior client read (§7).
-    const space = await ctx.db.get(args.spaceId);
-    if (space === null) {
-      throw new ConvexError({
-        code: "space_not_found",
-        message: "no such Space",
-      });
-    }
+    // AUTHZ: the caller must own the Space AND the author Device. Reading the
+    // Space here also serves as the in-txn head read (§7) below.
+    const account = await requireAccount(ctx);
+    const space = await requireOwnedSpace(ctx, account, args.spaceId);
+    await requireOwnedDevice(ctx, account, args.authorDeviceId);
 
     // CAS: the current head MUST equal the base the client committed against.
     // Compared as strings because Convex Ids compare by value as strings, and
@@ -107,6 +105,8 @@ export const listFromSeq = query({
     }),
   ),
   handler: async (ctx, args) => {
+    const account = await requireAccount(ctx);
+    await requireOwnedSpace(ctx, account, args.spaceId);
     const rows = await ctx.db
       .query("revisions")
       .withIndex("by_space_seq", (q) =>
@@ -128,6 +128,8 @@ export const bySeq = query({
     seq: v.number(),
   },
   handler: async (ctx, args) => {
+    const account = await requireAccount(ctx);
+    await requireOwnedSpace(ctx, account, args.spaceId);
     return await ctx.db
       .query("revisions")
       .withIndex("by_space_seq", (q) =>

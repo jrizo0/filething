@@ -1,12 +1,15 @@
 // spaces — Space lifecycle and the reactive Space-head query (Coordinator).
 //
-// Contract (BUILD-PLAN §3 ft-coordinator):
-//   mutation spaces:create({ accountId, name (bytes UTF-8), metaBlobCid (bytes) })
-//     -> { spaceId }                                  // head starts null
-//   query    spaces:get({ spaceId })                  -> the Space doc
-//   query    spaces:listByAccount({ accountId })      -> Space[]
+// Contract (BUILD-PLAN §3 ft-coordinator). Every function is authenticated:
+// the owning Account is derived from ctx.auth (requireAccount), never trusted
+// from an arg, and ownership of the Space is enforced (requireOwnedSpace).
+//   mutation spaces:create({ name (bytes UTF-8), metaBlobCid (bytes),
+//                            spaceKey (bytes, 32) })  -> { spaceId }
+//   query    spaces:get({ spaceId })                 -> the Space doc (incl. spaceKey)
+//   query    spaces:listMine()                        -> Space[] for the caller
 //   query    spaces:head({ spaceId })
 //     -> { headRevisionId|null, seq|null, manifestRootCid|null, parent|null }
+//   mutation spaces:refreshRetentionFloor({ spaceId })
 //
 // spaces:head is a QUERY so Convex's reactivity turns it into the change feed
 // (format.md §8): a subscriber re-runs whenever headRevisionId — or the head
@@ -17,51 +20,66 @@
 
 import { v, ConvexError } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireAccount, requireOwnedSpace } from "./auth";
+
+// Per-Space escrow key is a fixed 32-byte secret.
+const SPACE_KEY_BYTES = 32;
 
 // Create a Space with no head (the first Revision is committed later via
-// revisions:commit). `name` and `metaBlobCid` are bytes; in the MVP `name` is
-// cleartext UTF-8 and `metaBlobCid` points at the Space metadata blob in the
-// Vault (chunk secret, etc.) — opaque to the Coordinator.
+// revisions:commit). The owning Account comes from ctx.auth, not an arg. `name`
+// and `metaBlobCid` are bytes; MVP `name` is cleartext UTF-8, `metaBlobCid`
+// points at the Space metadata blob in the Vault — opaque to the Coordinator.
+// `spaceKey` is the 32-byte escrow key the CLIENT generates; the Coordinator
+// stores it and hands it back only to authenticated callers of this Account.
 export const create = mutation({
   args: {
-    accountId: v.id("accounts"),
     name: v.bytes(),
     metaBlobCid: v.bytes(),
+    spaceKey: v.bytes(),
   },
   returns: v.object({
     spaceId: v.id("spaces"),
   }),
   handler: async (ctx, args) => {
+    const account = await requireAccount(ctx);
+    if (args.spaceKey.byteLength !== SPACE_KEY_BYTES) {
+      throw new ConvexError({
+        code: "bad_space_key",
+        message: `spaceKey must be exactly ${SPACE_KEY_BYTES} bytes`,
+      });
+    }
     const spaceId = await ctx.db.insert("spaces", {
-      accountId: args.accountId,
+      accountId: account._id,
       name: args.name,
       headRevisionId: null, // initial head = null (no Revision yet)
       metaBlobCid: args.metaBlobCid,
+      spaceKey: args.spaceKey,
       retentionFloorSeq: 0, // MVP: GC off, floor at 0 (format.md §6.3)
     });
     return { spaceId };
   },
 });
 
-// Fetch the full Space document (including headRevisionId) by id.
+// Fetch the full Space document (including headRevisionId and the escrow
+// spaceKey) by id — only for the owning Account.
 export const get = query({
   args: {
     spaceId: v.id("spaces"),
   },
   handler: async (ctx, args) => {
-    return await ctx.db.get(args.spaceId);
+    const account = await requireAccount(ctx);
+    return await requireOwnedSpace(ctx, account, args.spaceId);
   },
 });
 
-// List every Space owned by an Account, via the by_account index.
-export const listByAccount = query({
-  args: {
-    accountId: v.id("accounts"),
-  },
-  handler: async (ctx, args) => {
+// List every Space owned by the authenticated caller's Account.
+export const listMine = query({
+  args: {},
+  handler: async (ctx) => {
+    const account = await requireAccount(ctx);
     return await ctx.db
       .query("spaces")
-      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .withIndex("by_account", (q) => q.eq("accountId", account._id))
       .collect();
   },
 });
@@ -80,8 +98,9 @@ export const head = query({
     parent: v.union(v.id("revisions"), v.null()),
   }),
   handler: async (ctx, args) => {
-    const space = await ctx.db.get(args.spaceId);
-    if (space === null || space.headRevisionId === null) {
+    const account = await requireAccount(ctx);
+    const space = await requireOwnedSpace(ctx, account, args.spaceId);
+    if (space.headRevisionId === null) {
       return {
         headRevisionId: null,
         seq: null,
@@ -132,10 +151,8 @@ export const refreshRetentionFloor = mutation({
     headSeq: v.union(v.number(), v.null()),
   }),
   handler: async (ctx, args) => {
-    const space = await ctx.db.get(args.spaceId);
-    if (space === null) {
-      throw new ConvexError({ code: "space_not_found", message: "no such Space" });
-    }
+    const account = await requireAccount(ctx);
+    const space = await requireOwnedSpace(ctx, account, args.spaceId);
 
     // The head seq is the upper bound the floor can never exceed.
     let headSeq: number | null = null;

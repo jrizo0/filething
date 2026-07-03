@@ -9,8 +9,10 @@
 //! Coordinator URL/admin key and the Vault `S3_*` credentials come from the
 //! environment (the MVP self-hosted model, `infra/.env`).
 
+mod auth;
 mod commands;
 mod config;
+mod credentials;
 mod env;
 mod service;
 
@@ -30,13 +32,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Pair this Device with the Coordinator. Without --code, bootstrap a new
-    /// Account (prints a pairing code); with --code, join an existing Account.
+    /// Log this Device in to the Coordinator via Better Auth, then register it
+    /// (`auth:ensureDevice`). Use `--signup` the first time (creates the Account);
+    /// omit it to log in an existing Account — including from a SECOND Device,
+    /// which is just the same user logging in elsewhere (pairing codes are gone).
+    /// The password is read from `$FILETHING_PASSWORD` (for scripts) or prompted.
     Login {
-        /// Pairing code from another Device's `login` (join an existing Account).
+        /// The account email (Better Auth identity).
         #[arg(long)]
-        code: Option<String>,
-        /// A human name for this Device (defaults to the machine hostname).
+        email: String,
+        /// Create the Account instead of logging in to an existing one.
+        #[arg(long)]
+        signup: bool,
+        /// A human name for this Device (defaults to the machine hostname). On
+        /// `--signup` it also seeds the Account's display name if unset.
         #[arg(long)]
         name: Option<String>,
     },
@@ -131,7 +140,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Login { code, name } => commands::login(code, name).await,
+        Command::Login {
+            email,
+            signup,
+            name,
+        } => commands::login(email, signup, name).await,
         Command::Init { dir, name } => commands::init(dir, name).await,
         Command::Clone {
             space_id,
@@ -163,37 +176,54 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// `login` with no flags parses to a bootstrap (no code, no name).
+    /// `login --email` parses to a log-in (no signup, no device name).
     #[test]
-    fn parse_login_bootstrap() {
-        let cli = Cli::parse_from(["filething", "login"]);
+    fn parse_login_email_only() {
+        let cli = Cli::parse_from(["filething", "login", "--email", "a@b.com"]);
         match cli.command {
-            Command::Login { code, name } => {
-                assert!(code.is_none());
+            Command::Login {
+                email,
+                signup,
+                name,
+            } => {
+                assert_eq!(email, "a@b.com");
+                assert!(!signup);
                 assert!(name.is_none());
             }
             other => panic!("expected Login, got {other:?}"),
         }
     }
 
-    /// `login --code X --name Y` parses both flags.
+    /// `login --email X --signup --name Y` parses all three.
     #[test]
-    fn parse_login_claim_with_code_and_name() {
+    fn parse_login_signup_with_name() {
         let cli = Cli::parse_from([
             "filething",
             "login",
-            "--code",
-            "ABCD-1234",
+            "--email",
+            "a@b.com",
+            "--signup",
             "--name",
             "laptop",
         ]);
         match cli.command {
-            Command::Login { code, name } => {
-                assert_eq!(code.as_deref(), Some("ABCD-1234"));
+            Command::Login {
+                email,
+                signup,
+                name,
+            } => {
+                assert_eq!(email, "a@b.com");
+                assert!(signup);
                 assert_eq!(name.as_deref(), Some("laptop"));
             }
             other => panic!("expected Login, got {other:?}"),
         }
+    }
+
+    /// `login` with no `--email` is a parse error (email is required).
+    #[test]
+    fn login_requires_email() {
+        assert!(Cli::try_parse_from(["filething", "login"]).is_err());
     }
 
     /// `init <dir> --name` parses the positional dir and the name flag.

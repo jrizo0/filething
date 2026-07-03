@@ -21,10 +21,18 @@ export default defineSchema({
   // Referenced by spaces.accountId / devices.accountId / dedup.accountId.
   // (v1: Spaces are personal — exactly one Account per Space.)
   accounts: defineTable({
-    // Stable external identity (e.g. pairing/login subject). Cleartext in MVP.
+    // Stable external identity = the Better Auth user id, i.e. the `sub` claim of
+    // the JWT that the client presents over the websocket (ctx.auth subject).
+    // requireAccount() looks the Account up by this via the by_subject index.
     subject: v.string(),
     // Display name; v.bytes() so it can become ciphertext under zero-knowledge.
     name: v.bytes(),
+    // KEY ESCROW: 32-byte per-Account secret the client generates on its first
+    // auth:ensureDevice and uploads once. The Coordinator only stores and hands
+    // it back to authenticated callers of the SAME Account (ensureDevice); it is
+    // never used server-side. v.optional so pre-existing Account docs stay valid;
+    // ensureDevice treats it as required for newly created Accounts.
+    dedupSecret: v.optional(v.bytes()),
     createdAt: v.number(),
   }).index("by_subject", ["subject"]),
 
@@ -37,6 +45,11 @@ export default defineSchema({
     headRevisionId: v.union(v.id("revisions"), v.null()), // THE Space head; CAS here
     metaBlobCid: v.bytes(), // -> Vault: chunk secret (+ future encryptable
     //                         material). Opaque to the Coordinator.
+    // KEY ESCROW: 32-byte per-Space key the client generates in spaces:create.
+    // Returned only to authenticated callers of the owning Account (get/listMine)
+    // so a second Device of the same user can decrypt the Space. Opaque server-side.
+    // v.optional so any pre-existing Space doc stays valid; create requires it.
+    spaceKey: v.optional(v.bytes()),
     retentionFloorSeq: v.number(), // min(seq) the GC must NOT sweep (§6.3). MVP: 0.
   }).index("by_account", ["accountId"]),
 
@@ -69,15 +82,8 @@ export default defineSchema({
     cid: v.bytes(), // -> blocks/<cid>
   }).index("by_account_pcid", ["accountId", "pcid"]),
 
-  // pairing_codes — MINIMAL device-pairing-by-code (decisions §0: "Auth =
-  // pairing mínimo por código de dispositivo"; Better Auth / browser OAuth is a
-  // reserved hole, post-MVP). auth:bootstrap mints a row that binds a code to an
-  // Account; auth:claim consumes it to join a second Device to that Account.
-  // The code is NON-cryptographic for the MVP (constraint: keep it simple).
-  pairing_codes: defineTable({
-    code: v.string(), // short human-typeable code; looked up on claim
-    accountId: v.id("accounts"), // the Account a claimer joins
-    createdAt: v.number(),
-    claimedAt: v.union(v.number(), v.null()), // null = still claimable (single-use)
-  }).index("by_code", ["code"]),
+  // NOTE: the MVP `pairing_codes` table was retired in favour of real auth
+  // (Better Auth). Pairing a second Device is now just the same user logging in
+  // on another Device: auth:ensureDevice resolves identity -> Account and
+  // get-or-creates the Device. See convex/auth.ts and convex/betterAuth.ts.
 });

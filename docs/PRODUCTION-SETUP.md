@@ -154,25 +154,26 @@ publicar el mismo schema/funciones. **Éxito** = el deploy termina sin error e i
 scripts/cloud-smoke.sh
 ```
 Construye el binario release y simula **dos Devices** (dos `FILETHING_HOME`) contra Convex
-Cloud + R2: `login` (pairing) → `init` con un archivo → `clone` en el segundo Device →
-edición + `sync`. Imprime `✓`/`✗` por chequeo. **Éxito** = todos los chequeos en `✓` y
-`SMOKE OK` al final. Que el `clone` traiga el archivo valida el commit, el change feed
-(WebSocket) y el round-trip por R2 contra la infra gestionada.
+Cloud + R2: `login --signup` con email+password (`FILETHING_PASSWORD`) → `init` con un archivo
+→ `login` del mismo usuario en el segundo Device + `clone` → edición + `sync`. Imprime `✓`/`✗`
+por chequeo. **Éxito** = todos los chequeos en `✓` y `SMOKE OK` al final. Que el `clone`
+traiga el archivo valida el commit, el change feed (WebSocket), el round-trip por R2 y el
+**descifrado cross-device** (`alg=1`) contra la infra gestionada.
 
-### 4.3 Caveat del deploy key (VERIFICAR EN VIVO)
-El cliente Rust usa la ruta `set_admin_auth(<deploy_key>)` del crate `convex`, que autentica
-sobre `wss://<name>.convex.cloud/api/sync`. Esa ruta **acepta** un deploy key, pero la API es
-`#[doc(hidden)]` / no documentada: **hay que verificarla empíricamente**. El smoke test del
-4.2 es esa verificación.
-
-- **Si el smoke pasa con `CONVEX_DEPLOY_KEY`**: listo, esa es la ruta buena para uso personal.
-- **Si falla en el `login`/conexión por culpa del deploy key**: las funciones de Convex son
-  **públicas por defecto** y el backend de filething **no tiene checks de `ctx.auth`**, así que
-  el cliente puede funcionar **sin credencial**. `connect_coordinator` (`apps/cli/src/env.rs`)
-  ya contempla ese caso: si no hay `CONVEX_DEPLOY_KEY` / `CONVEX_ADMIN_KEY` /
-  `CONVEX_SELF_HOSTED_ADMIN_KEY`, conecta **sin** `set_admin_auth` y solo emite un warning. Para
-  probar esta ruta, comenta `CONVEX_DEPLOY_KEY` en `infra/.env.cloud` y repite el smoke.
-  (Aceptable solo para uso personal, porque el backend no valida identidad — ver Riesgos.)
+### 4.3 Auth real (Fase 3): Better Auth en el deployment
+Desde la Fase 3 (ADR 0014) el cliente ya **no** usa el deploy key: cada Device hace
+`filething login --email <email>` (password por prompt o `FILETHING_PASSWORD`; `--signup` la
+primera vez), guarda su token de sesión en `credentials.json` (0600) y autentica el websocket
+con un JWT (`set_auth`). El deployment necesita dos env vars (una sola vez):
+```bash
+cd packages/backend
+bunx convex env set BETTER_AUTH_SECRET "$(openssl rand -base64 32)"
+bunx convex env set SITE_URL https://<name>.convex.site
+```
+Los endpoints HTTP de Better Auth viven en `https://<name>.convex.site` (Cloud) o en el
+puerto 3211 (self-hosted); el CLI deriva esa URL de `CONVEX_URL` automáticamente
+(`CONVEX_SITE_URL` la sobreescribe). El deploy key queda **solo** para `convex deploy` y como
+fallback de ops en el CLI cuando no hay sesión.
 
 ---
 
@@ -192,16 +193,15 @@ al mes en Convex). Para uso personal de unos pocos GB no deberías acercarte.
 
 ## Riesgos conocidos
 
-- **Deploy key por la ruta `#[doc(hidden)]`**: filething autentica al cliente con el deploy key
-  vía `set_admin_auth` sobre una API no documentada del crate `convex`. Puede romperse en una
-  actualización del crate; verifica siempre con el smoke test (4.2/4.3).
 - **El deploy key es un secreto ROOT**: da control total del deployment (puede impersonar a
-  cualquier usuario). Guárdalo como tal; `infra/.env.cloud` debe estar gitignoreado (Paso 3).
-- **Backend sin auth**: las funciones de Convex son públicas y el backend no valida `ctx.auth`.
-  Es **aceptable solo mientras todos los Devices sean tuyos**. Antes de terceros hace falta auth
-  real (Better Auth) — ver `TODO.md`, Fase B.
-- **Sin cifrado en runtime**: los bytes se guardan en R2 en claro (`alg=0`). Solo para uso
-  personal; el cifrado (`alg=1`) es un hueco reservado del formato, aún no construido.
+  cualquier usuario). Desde la Fase 3 solo hace falta para `convex deploy` (y como fallback de
+  ops del CLI); guárdalo como tal; `infra/.env.cloud` debe estar gitignoreado (Paso 3).
+- **JWT de ~15 min en el daemon**: el daemon re-mintea el JWT en cada (re)conexión del
+  websocket (`set_auth_callback`), pero una conexión muy estable >15 min no refresca
+  proactivamente; si aparecen errores de auth en daemons longevos, reiniciar el servicio los
+  resuelve (mejora futura: refresh proactivo).
+- **Escrow server-side**: Convex custodia `dedupSecret`/`spaceKey` (ADR 0015). El cifrado
+  `alg=1` protege los bytes en R2; **no** es zero-knowledge frente al Coordinator (diferido).
 - **GC = solo huérfanos (por ahora)**: `filething gc <dir>` hace mark-and-sweep account-wide
   con grace-period, **dry-run por defecto** (`--apply` para borrar). Retiene TODO el historial
   y solo borra objetos que ninguna Revision referencia (basura de commits abortados). La poda

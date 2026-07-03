@@ -60,9 +60,12 @@ use ft_vault::{Vault, VaultObject};
 use crate::context::SpaceContext;
 use crate::error::{EngineError, Result};
 
-/// The Vault prefixes the GC enumerates and may sweep. `keys/` and `reach/` are
-/// reserved (encryption off, `§4.5`/`§6.3`) and deliberately never touched.
-const SWEEP_PREFIXES: [&str; 4] = ["blocks/", "manifest/", "blocklist/", "meta/"];
+/// The Vault prefixes the GC enumerates and may sweep. `keys/<cid>` data-key
+/// sidecars (`§4.5`, ADR 0015) are attachments of `blocks/<cid>`: a sidecar is
+/// reachable iff its Block is (see [`mark_entry_blocks`]), so an orphan sidecar —
+/// one whose Block is gone, or which never had a live Block — is swept here just
+/// like any other orphan. `reach/` stays reserved and is never touched.
+const SWEEP_PREFIXES: [&str; 5] = ["blocks/", "manifest/", "blocklist/", "meta/", "keys/"];
 
 /// The default grace-period: 24h. An object younger than this is never swept.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -128,16 +131,15 @@ impl SpaceContext {
                 "gc requires a Coordinator; this context was mounted for staging only".to_string(),
             ));
         }
-        let account_id = self.account_id.clone();
-
         // Every Space of the account shares this Vault. Gather reachability roots
         // (ALL Revisions of every Space — orphan-sweep retains full history) and
         // meta blobs, plus a snapshot of each Space head for the concurrency guard.
+        // `list_mine` scopes to the caller's own Account (derived from the JWT).
         let spaces = self
             .coordinator
             .as_mut()
             .expect("coordinator present")
-            .list_spaces(&account_id)
+            .list_mine()
             .await?;
 
         let mut root_cids: Vec<Cid> = Vec::new();
@@ -193,7 +195,7 @@ impl SpaceContext {
                 .coordinator
                 .as_mut()
                 .expect("coordinator present")
-                .list_spaces(&account_id)
+                .list_mine()
                 .await?;
             if head_snapshot(&after) != heads_before {
                 return Err(EngineError::SpaceState(
@@ -303,6 +305,13 @@ async fn mark_from_root(
 /// externalized blocklist (and every Block it lists) via `bk_ref`, or the inline
 /// `bk` list. Verifies an externalized blocklist hashes to its `bk_ref` and
 /// refuses to proceed on a mismatch (never sweep on corruption).
+///
+/// For every reachable Block cid it ALSO marks the Block's `keys/<cid>` data-key
+/// sidecar reachable (`§4.5`, ADR 0015). Marking a sidecar key that has no
+/// physical object (an `alg=0` Block never wrote one) is harmless: a reachable
+/// key with no listed object simply never matches during the sweep. This is what
+/// keeps a live encrypted Block's sidecar from being collected, and — with the
+/// `keys/` prefix now swept — lets an orphan sidecar be reclaimed.
 async fn mark_entry_blocks(
     vault: &dyn Vault,
     entry: &FileEntry,
@@ -327,11 +336,13 @@ async fn mark_entry_blocks(
             })?;
             for c in list {
                 reachable.insert(ft_hash::block_key(&c));
+                reachable.insert(ft_diff::keys_key(&c));
             }
         }
         None => {
             for c in &entry.bk {
                 reachable.insert(ft_hash::block_key(c));
+                reachable.insert(ft_diff::keys_key(c));
             }
         }
     }
@@ -521,6 +532,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::SpaceState(_)));
+    }
+
+    #[tokio::test]
+    async fn mark_retains_the_sidecar_of_a_live_block_and_leaves_orphans_unmarked() {
+        // A live (reachable) Block's `keys/<cid>` sidecar must be marked reachable
+        // so the GC never collects it (§4.5, ADR 0015 — sidecar lives with its
+        // Block). A sidecar whose Block is NOT referenced stays unmarked, so the
+        // `keys/` sweep can reclaim it.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+        let meta = cid(200);
+        let live_block = cid(1);
+        let orphan_block = cid(2);
+
+        let root = upload_manifest(&vault, vec![file_entry("a.txt", vec![live_block])]).await;
+        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
+
+        // The live Block AND its sidecar are reachable.
+        assert!(reachable.contains(&ft_hash::block_key(&live_block)));
+        assert!(reachable.contains(&ft_diff::keys_key(&live_block)));
+        // A Block referenced by nothing — and thus its sidecar — is NOT reachable,
+        // so both would be swept (subject to the grace-period).
+        assert!(!reachable.contains(&ft_hash::block_key(&orphan_block)));
+        assert!(!reachable.contains(&ft_diff::keys_key(&orphan_block)));
+    }
+
+    #[test]
+    fn partition_sweep_reclaims_an_orphan_sidecar_under_the_keys_prefix() {
+        // With `keys/` now a swept prefix, an orphan `keys/<cid>` object (its Block
+        // gone or never live) that is old enough is reclaimed exactly like any
+        // other orphan, while a live block's sidecar (in the reachable set) is kept.
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = Duration::from_secs(3600);
+        let mut reachable = HashSet::new();
+        reachable.insert("keys/aa/live".to_string());
+
+        let objects = vec![
+            VaultObject {
+                key: "keys/aa/live".to_string(),
+                last_modified: Some(now - Duration::from_secs(10_000)),
+            },
+            VaultObject {
+                key: "keys/bb/orphan-old".to_string(),
+                last_modified: Some(now - Duration::from_secs(10_000)),
+            },
+        ];
+        let (sweepable, _kept) = partition_sweep(objects, &reachable, now, grace);
+        assert_eq!(sweepable, vec!["keys/bb/orphan-old".to_string()]);
     }
 
     #[test]

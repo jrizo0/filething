@@ -21,7 +21,7 @@
 //! [`CommitOutcome::NoChange`] is returned without touching the Coordinator.
 
 use ft_coordinator::{AccountId, CommitError, Coordinator, DeviceId, RevisionId, SpaceId};
-use ft_core::Cid;
+use ft_core::{Cid, SpaceCrypto};
 use ft_fsmap::{LinuxFs, OsFs};
 use ft_index::{Index, SpaceState};
 
@@ -191,6 +191,18 @@ impl SpaceContext {
             self.index.put_block(space_id, cid)?;
             uploaded += 1;
         }
+        // Encryption ON (`alg=1`): each Block has a `keys/<cid>` data-key sidecar
+        // to upload alongside it (`§4.5`, ADR 0015 — the sidecar lives and dies
+        // with its Block). Same HEAD-before-PUT skip: the wrap uses a fresh nonce
+        // each call so the bytes differ run-to-run, but it unwraps to the same
+        // data key, so writing it once is enough. Empty with encryption off.
+        for (cid, sidecar) in &scan.sidecars {
+            let key = ft_diff::keys_key(cid);
+            if self.vault.head(&key).await? {
+                continue;
+            }
+            self.vault.put(&key, sidecar.clone()).await?;
+        }
         Ok(uploaded)
     }
 
@@ -215,14 +227,20 @@ impl SpaceContext {
     ///
     /// Generates a random per-Space `chunk_secret` (`§3`), writes the meta blob to
     /// the Vault ([`write_meta_blob`]), registers the Space with the Coordinator
-    /// (`create_space`, recording the `metaBlobCid`), persists the initial
-    /// `space_state` (`§9`), assembles the [`SpaceContext`] and runs the first
-    /// `commit(None)`.
+    /// (`create_space`, recording the `metaBlobCid` and escrowing `crypto.space_key`,
+    /// `§4.5`), persists the initial `space_state` (`§9`), assembles the
+    /// [`SpaceContext`], **attaches `crypto`** so the very first Revision is written
+    /// encrypted (`alg=1`, `§4.4`), and runs the first `commit(None)`.
+    ///
+    /// `crypto` bundles the Account `dedup_secret` and the freshly-generated
+    /// per-Space `space_key`; the same `space_key` is escrowed with the Coordinator
+    /// so any Device of the Account can clone the Space (see [`SpaceContext::clone_space`]).
     ///
     /// On success returns the mounted context (whose `last_synced` reflects the
     /// committed first Revision). A first-commit [`CommitOutcome::Conflict`] (a
     /// racing `create_space`) surfaces as [`EngineError::SpaceState`]; an empty
     /// toy dir still commits an empty first Revision.
+    #[allow(clippy::too_many_arguments)]
     pub async fn init_space(
         index: Index,
         vault: Box<dyn ft_vault::Vault>,
@@ -231,6 +249,7 @@ impl SpaceContext {
         device_id: DeviceId,
         name: &[u8],
         local_root: impl Into<std::path::PathBuf>,
+        crypto: SpaceCrypto,
     ) -> Result<Self> {
         Self::init_space_with_fs(
             index,
@@ -241,6 +260,7 @@ impl SpaceContext {
             device_id,
             name,
             local_root,
+            crypto,
         )
         .await
     }
@@ -258,6 +278,7 @@ impl SpaceContext {
         device_id: DeviceId,
         name: &[u8],
         local_root: impl Into<std::path::PathBuf>,
+        crypto: SpaceCrypto,
     ) -> Result<Self> {
         let local_root = local_root.into();
 
@@ -265,9 +286,10 @@ impl SpaceContext {
         let chunk_secret = generate_chunk_secret();
         let meta_cid = write_meta_blob(vault.as_ref(), &chunk_secret).await?;
 
-        // (3) register the Space with the Coordinator (head starts null).
+        // (3) register the Space with the Coordinator (head starts null),
+        // escrowing the client-generated `space_key` (`§4.5`).
         let space_id: SpaceId = coordinator
-            .create_space(&account_id, name, &meta_cid)
+            .create_space(name, &meta_cid, &crypto.space_key)
             .await?;
 
         // (4) persist the initial space_state: seq = -1 marks "never synced",
@@ -298,6 +320,10 @@ impl SpaceContext {
             space_id,
             &state,
         )?;
+
+        // Turn ON encryption BEFORE the first commit so seq 0 is already `alg=1`
+        // (each Block encrypted + a `keys/<cid>` sidecar, `§4.4`/`§4.5`).
+        ctx.attach_crypto(crypto);
 
         // (5) first commit (seq 0). expected_base = None.
         match ctx.commit(None).await? {

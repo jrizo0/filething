@@ -220,6 +220,7 @@ impl SpaceContext {
             self.fs.as_ref(),
             &self.local_root,
             &changes,
+            self.crypto.as_ref(),
         )
         .await?;
         for change in &changes {
@@ -281,7 +282,15 @@ impl SpaceContext {
             .bk
             .iter()
             .map(|cid| BlockRef {
-                // MVP: cid == pcid (cleartext). The per-chunk pcid is the cid.
+                // The per-chunk pcid is set equal to the cid here. This is exact
+                // for `alg=0` (cid == pcid) and only APPROXIMATE for `alg=1`
+                // (where the two diverge): recovering the true per-chunk pcid
+                // would require decrypting the Block, which materialize already
+                // did but does not surface. This is safe because the per-chunk
+                // pcid in a local-index BlockRef is not read by any wired path —
+                // block presence keys off `cid` (`local_block`/`has_block`) and
+                // the per-chunk `dedup_local` table is not yet consulted. The
+                // whole-file plaintext pcid (`entry.pcid`, set below) stays exact.
                 pcid: Pcid::new(*cid.as_bytes()),
                 cid: *cid,
             })
@@ -419,6 +428,7 @@ impl SpaceContext {
             self.fs.as_ref(),
             &self.local_root,
             entry,
+            self.crypto.as_ref(),
         )
         .await?;
         self.index_upsert_materialized(entry)?;
@@ -492,6 +502,7 @@ impl SpaceContext {
                             self.fs.as_ref(),
                             &self.local_root,
                             loser,
+                            self.crypto.as_ref(),
                         )
                         .await?;
                         from_vault = true;

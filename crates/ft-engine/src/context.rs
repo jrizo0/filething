@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use ft_chunker::Chunker;
 use ft_coordinator::{AccountId, Coordinator, DeviceId, RevisionId, SpaceId};
-use ft_core::Cid;
+use ft_core::{Cid, SpaceCrypto};
 use ft_fsmap::{LinuxFs, OsFs};
 use ft_index::{Index, SpaceState};
 use ft_vault::Vault;
@@ -78,6 +78,15 @@ pub struct SpaceContext {
     /// recognized as our own write and not re-committed. `None` for a one-shot
     /// pull/clone with no watcher (marking is then a harmless no-op).
     pub applied: Option<Arc<AppliedState>>,
+    /// Runtime encryption key material for this Space (`§4.4`/`§4.5`). `None`
+    /// (the default) ⇒ Blocks ship in cleartext (`alg=0`) and NOTHING about the
+    /// scan/commit/pull behavior changes. `Some` ⇒ each scanned Block is encrypted
+    /// (`alg=1`) with a `keys/<cid>` sidecar on commit, and each `alg=1` Block is
+    /// decrypted on materialize. Set by the caller via
+    /// [`attach_crypto`](SpaceContext::attach_crypto) after mounting; it is NOT
+    /// persisted in `space_state` (the escrow/keyring that supplies it lives
+    /// outside the engine).
+    pub crypto: Option<SpaceCrypto>,
 }
 
 impl SpaceContext {
@@ -198,6 +207,9 @@ impl SpaceContext {
                 .as_ref()
                 .map(|s| RevisionId::new(s.clone())),
             applied: None,
+            // Encryption is OFF unless the caller attaches key material (§4.4).
+            // Not read from `space_state`: the space_key is not persisted there.
+            crypto: None,
         })
     }
 
@@ -208,6 +220,18 @@ impl SpaceContext {
     /// unset.
     pub fn attach_applied_state(&mut self, applied: Arc<AppliedState>) {
         self.applied = Some(applied);
+    }
+
+    /// Turns ON runtime `alg=1` encryption for this mounted Space by attaching the
+    /// key material ([`SpaceCrypto`]: the Account `dedup_secret` + the `space_key`,
+    /// `§4.4`/`§4.5`). After this call the scan encrypts each Block and produces
+    /// its `keys/<cid>` sidecar, the commit uploads both, and materialize decrypts
+    /// `alg=1` Blocks. Without it the Space stays on the cleartext (`alg=0`) path.
+    /// The caller obtains the material from the escrow/keyring (outside the engine)
+    /// and attaches it after [`open`](SpaceContext::open) / `init_space` /
+    /// `clone_space`.
+    pub fn attach_crypto(&mut self, crypto: SpaceCrypto) {
+        self.crypto = Some(crypto);
     }
 
     /// The `expected_base` `RevisionId` is NOT stored in `space_state` (which

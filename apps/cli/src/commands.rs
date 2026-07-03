@@ -10,13 +10,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use ft_core::SpaceCrypto;
 use ft_engine::{
     AccountId, CommitOutcome, DeviceId, GcOptions, PullOutcome, SpaceContext, SpaceId, SyncMetrics,
 };
 
 use crate::config::{normalize_abs, Config};
-use crate::env;
+use crate::credentials::{self, Credentials};
 use crate::service::ServiceAction;
+use crate::{auth, env};
 
 /// A reasonable default Device name when `--name` is omitted: the machine
 /// hostname, else a generic label.
@@ -27,56 +29,110 @@ fn default_device_name() -> String {
         .unwrap_or_else(|| "filething-device".to_string())
 }
 
-/// `login` — pair this Device with the Coordinator (`docs/BUILD-PLAN.md §3`).
+/// `login` — authenticate this Device and register it (`docs/adr/0014`).
 ///
-/// Without `--code` this is a BOOTSTRAP: create the first Account + Device and
-/// print the pairing code a second Device can `claim`. With `--code` it CLAIMS an
-/// existing Account. Either way the learned identity (account/device id +
-/// coordinator url) is saved to `config.json`.
-pub async fn login(code: Option<String>, name: Option<String>) -> anyhow::Result<()> {
-    let device_name = name.unwrap_or_else(default_device_name);
+/// Runs the real Better Auth flow: `--signup` creates the Account (`POST
+/// /sign-up/email`), otherwise it logs in an existing one (`POST /sign-in/email`)
+/// — a SECOND Device is just the same user logging in elsewhere. The session is
+/// traded for a Convex JWT, `auth:ensureDevice` get-or-creates the Account +
+/// Device and returns the escrow `dedup_secret`. The non-secret identity lands in
+/// `config.json`; the session token + `dedup_secret` land in `credentials.json`
+/// (`0600`). The password comes from `$FILETHING_PASSWORD` or an interactive
+/// prompt.
+pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow::Result<()> {
     let url = env::coordinator_url_from_env();
-    let mut coordinator = env::connect_coordinator(&url).await?;
+    let base = auth::auth_base_url(&url)?;
+    let device_name = name.clone().unwrap_or_else(default_device_name);
+    let password = read_password()?;
 
+    // (1) Better Auth: signup or login → a session token.
+    let session_token = if signup {
+        let display = name.clone().unwrap_or_else(|| {
+            email
+                .split('@')
+                .next()
+                .unwrap_or("filething user")
+                .to_string()
+        });
+        auth::sign_up(&base, &display, &email, &password)
+            .await
+            .context("sign-up (create the Account)")?
+    } else {
+        auth::sign_in(&base, &email, &password)
+            .await
+            .context("sign-in (existing Account — omit --signup only if it exists)")?
+    };
+
+    // (2) Connect authenticated (trades the session for a Convex JWT).
+    let session_only = Credentials {
+        session_token: session_token.clone(),
+        dedup_secret_hex: String::new(),
+    };
+    let mut coordinator = env::connect(&url, Some(&session_only), false).await?;
+
+    // (3) ensureDevice: get-or-create Account + Device; the server returns the
+    // authoritative dedup_secret (ours if the Account is new, the existing one
+    // otherwise). We always send a fresh candidate.
+    let candidate = credentials::generate_secret();
+    let ensured = coordinator
+        .ensure_device(&device_name, &candidate)
+        .await
+        .context("auth:ensureDevice")?;
+
+    // (4) Persist: identity in config.json, secrets in credentials.json (0600).
     let mut config = Config::load()?;
-
-    match code {
-        None => {
-            let boot = coordinator
-                .bootstrap(&device_name)
-                .await
-                .context("bootstrap (first Device of a new Account)")?;
-            config.set_identity(&url, boot.account_id.as_str(), boot.device_id.as_str());
-            config.save()?;
-            println!("Paired this Device as the first of a new Account.");
-            println!("  account: {}", boot.account_id);
-            println!("  device:  {}", boot.device_id);
-            println!("  coordinator: {url}");
-            println!();
-            println!(
-                "Pairing code (run `filething login --code {0}` on another Device):",
-                boot.pairing_code
-            );
-            println!("  {}", boot.pairing_code);
-        }
-        Some(code) => {
-            let claim = coordinator
-                .claim(&code, &device_name)
-                .await
-                .context("claim (joining an existing Account with a pairing code)")?;
-            config.set_identity(&url, claim.account_id.as_str(), claim.device_id.as_str());
-            config.save()?;
-            println!("Paired this Device into the existing Account.");
-            println!("  account: {}", claim.account_id);
-            println!("  device:  {}", claim.device_id);
-            println!("  coordinator: {url}");
-        }
+    config.set_identity(
+        &url,
+        ensured.account_id.as_str(),
+        ensured.device_id.as_str(),
+    );
+    config.save()?;
+    Credentials {
+        session_token,
+        dedup_secret_hex: hex::encode(ensured.dedup_secret),
     }
+    .save()?;
+
+    println!(
+        "Logged in as {email} and registered this Device ({}).",
+        if signup {
+            "new Account"
+        } else {
+            "existing Account"
+        }
+    );
+    println!("  account: {}", ensured.account_id);
+    println!("  device:  {} ({device_name})", ensured.device_id);
+    println!("  coordinator: {url}");
     Ok(())
 }
 
+/// Reads the login password from `$FILETHING_PASSWORD` (scripts/CI) or, failing
+/// that, an interactive prompt on stderr. Note: the interactive read is NOT
+/// hidden — prefer the env var for anything scripted.
+fn read_password() -> anyhow::Result<String> {
+    if let Ok(p) = std::env::var("FILETHING_PASSWORD") {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    use std::io::Write as _;
+    eprint!("Password: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading the password from stdin")?;
+    let p = line.trim_end_matches(['\n', '\r']).to_string();
+    anyhow::ensure!(
+        !p.is_empty(),
+        "no password provided (set FILETHING_PASSWORD or type one at the prompt)"
+    );
+    Ok(p)
+}
+
 /// Loads the paired identity from the config, erroring with a `login` hint if the
-/// Device has not been paired yet. Returns `(coordinator_url, account, device)`.
+/// Device has not logged in yet. Returns `(coordinator_url, account, device)`.
 fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, DeviceId)> {
     let url = config
         .coordinator_url
@@ -85,12 +141,19 @@ fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, Devic
     let account_id = config
         .account_id
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("not paired yet — run `filething login` first"))?;
+        .ok_or_else(|| anyhow::anyhow!("not logged in yet — run `filething login` first"))?;
     let device_id = config
         .device_id
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("not paired yet — run `filething login` first"))?;
+        .ok_or_else(|| anyhow::anyhow!("not logged in yet — run `filething login` first"))?;
     Ok((url, AccountId::new(account_id), DeviceId::new(device_id)))
+}
+
+/// Loads this Device's secrets, erroring with a `login` hint when absent. Used by
+/// the commands that must authenticate and/or need encryption key material.
+fn require_credentials() -> anyhow::Result<Credentials> {
+    Credentials::load()?
+        .ok_or_else(|| anyhow::anyhow!("no Device credentials found — run `filething login` first"))
 }
 
 /// `init <dir>` — make a local folder a fresh Space and commit its first Revision
@@ -98,6 +161,7 @@ fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, Devic
 pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = require_credentials()?;
     let root = normalize_abs(&dir);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("creating Space dir {}", root.display()))?;
@@ -120,7 +184,16 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let coordinator = env::connect_coordinator(&url).await?;
+    let coordinator = env::connect(&url, Some(&creds), false).await?;
+
+    // Generate this Space's escrow key and turn on `alg=1`: `init_space` sends the
+    // key to `spaces:create` and encrypts the first Revision. `dedup_secret` is
+    // the Account escrow secret from login.
+    let space_key = credentials::generate_secret();
+    let crypto = SpaceCrypto {
+        dedup_secret: creds.dedup_secret()?,
+        space_key,
+    };
 
     let ctx = SpaceContext::init_space(
         index,
@@ -130,10 +203,14 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
         device_id,
         space_name.as_bytes(),
         &root,
+        crypto,
     )
     .await
     .context("init_space")?;
     let space_id = ctx.space_id.clone();
+
+    // Cache the space_key locally (0600) so later commands open the Space offline.
+    credentials::write_space_key(&root, &space_key)?;
 
     // Record the mapping in the config.
     let mut config = Config::load()?;
@@ -143,6 +220,7 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     println!("Created Space {space_id}");
     println!("  name:  {space_name}");
     println!("  local: {}", root.display());
+    println!("  encryption: on (alg=1)");
     println!(
         "  synced seq {} root {}",
         ctx.last_synced.seq,
@@ -157,6 +235,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
     let _ = name; // accepted for symmetry with init; clone takes the Space's name.
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = require_credentials()?;
     let root = normalize_abs(&dir);
     let space_id = SpaceId::new(space_id);
     if let Some(existing) = env::existing_space_id_at(&root)? {
@@ -169,7 +248,12 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let coordinator = env::connect_coordinator(&url).await?;
+    let mut coordinator = env::connect(&url, Some(&creds), false).await?;
+
+    // Cache the Space's escrow key locally (0600) before materializing, so later
+    // commands open it offline. `clone_space` uses it + dedup_secret to decrypt
+    // `alg=1` Blocks; a legacy Space has no key (materializes cleartext).
+    env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
 
     let ctx = SpaceContext::clone_space(
         index,
@@ -179,6 +263,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
         device_id,
         space_id.clone(),
         &root,
+        creds.dedup_secret()?,
     )
     .await
     .context("clone_space")?;
@@ -223,12 +308,13 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     let root = resolve_root(dir)?;
     let space_id = env::space_id_at(&root)?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
 
     // Mount for scanning only (no Coordinator needed to detect LOCAL changes).
-    let ctx = SpaceContext::mount(
+    let mut ctx = SpaceContext::mount(
         index,
         vault,
         Box::new(ft_fsmap::LinuxFs),
@@ -237,6 +323,13 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
         space_id.clone(),
     )
     .context("mounting Space for status")?;
+
+    // Attach crypto from the LOCAL cache so the scanned Manifest root matches the
+    // committed `alg=1` base (the block cids — and hence the root — differ under
+    // encryption; without the key status would always report false local changes).
+    if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+        ctx.attach_crypto(crypto);
+    }
 
     println!("Space {space_id}");
     println!("  local: {}", root.display());
@@ -259,7 +352,7 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Best-effort remote head check (does not fail status if the Coordinator is
     // unreachable — status must work offline).
-    match env::connect_coordinator(&url).await {
+    match env::connect(&url, creds.as_ref(), false).await {
         Ok(mut coordinator) => match coordinator.get_space(&space_id).await {
             Ok(space) => match space.head_revision_id {
                 Some(head) => {
@@ -320,13 +413,20 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let coordinator = env::connect_coordinator(&url).await?;
+    let mut coordinator = env::connect(&url, creds.as_ref(), false).await?;
+    // Recover the escrow key into the cache if it is missing, so encryption is
+    // attached correctly below (a commit on an `alg=1` Space MUST encrypt).
+    env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
 
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
         .context("opening Space")?;
+    if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+        ctx.attach_crypto(crypto);
+    }
 
     // Pull first (catch up to the head), then push local changes.
     let pulled = ctx.pull().await.context("pull")?;
@@ -367,6 +467,7 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
     anyhow::ensure!(!dirs.is_empty(), "daemon needs at least one Space dir");
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = Credentials::load()?;
 
     let mut spaces = Vec::with_capacity(dirs.len());
     for dir in dirs {
@@ -374,8 +475,11 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         let space_id = env::space_id_at(&root)?;
         let index = env::open_index(&root)?;
         let vault = env::build_vault().await?;
-        let coordinator = env::connect_coordinator(&url).await?;
-        let ctx = SpaceContext::open(
+        // Long-running: the JWT is re-minted on every reconnect (set_auth_callback)
+        // so the daemon outlives the ~15-min token expiry.
+        let mut coordinator = env::connect(&url, creds.as_ref(), true).await?;
+        env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
+        let mut ctx = SpaceContext::open(
             index,
             vault,
             coordinator,
@@ -384,6 +488,9 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
             space_id.clone(),
         )
         .with_context(|| format!("opening Space at {}", root.display()))?;
+        if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+            ctx.attach_crypto(crypto);
+        }
         tracing::info!(space = %space_id, root = %root.display(), "mounted Space for daemon");
         spaces.push(ctx);
     }
@@ -411,10 +518,13 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
     let (url, account_id, device_id) = require_identity(&config)?;
+    let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let coordinator = env::connect_coordinator(&url).await?;
+    // GC walks cleartext Manifests + meta blobs and deletes Vault objects (sidecars
+    // included); it never decrypts Block content, so no crypto is attached here.
+    let coordinator = env::connect(&url, creds.as_ref(), false).await?;
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
         .context("opening Space")?;
 

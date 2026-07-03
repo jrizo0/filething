@@ -70,13 +70,21 @@ fn is_junk_name(name: &std::ffi::OsStr) -> bool {
 /// [`ft_manifest::build`] (it excludes local-only symlinks, `§5.1`).
 /// `blocks_to_upload` is the de-duplicated `(cid, encoded_object)` list for the
 /// commit's upload step (`§7` step 2) — within a single scan the same `cid`
-/// appears once.
+/// appears once. `sidecars` is the PARALLEL de-duplicated `(cid, wrapped_data_key)`
+/// list when encryption is ON (`alg=1`): each entry is the `keys/<cid>` sidecar
+/// for the Block of the same `cid`, to be uploaded alongside it (`§4.5`). It is
+/// EMPTY when encryption is off (`alg=0`), so the cleartext path is unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct ScanResult {
     /// FileEntries to put in the Manifest, keyed by their casefold key.
     pub entries: Vec<(CasefoldKey, FileEntry)>,
-    /// Unique encoded Block objects to upload: `(cid, ft_block::encode(span))`.
+    /// Unique encoded Block objects to upload: `(cid, encoded_object)` — the
+    /// object is `ft_block::encode(span)` (`alg=0`) or the encrypted object from
+    /// `ft_block::encode_encrypted` (`alg=1`).
     pub blocks_to_upload: Vec<(Cid, Vec<u8>)>,
+    /// Unique `keys/<cid>` data-key sidecars for the `alg=1` Blocks above, keyed
+    /// by the same `cid`. Empty when encryption is off.
+    pub sidecars: Vec<(Cid, Vec<u8>)>,
 }
 
 impl ScanResult {
@@ -275,13 +283,36 @@ impl SpaceContext {
 
         for span in &spans {
             let slice = &bytes[span.offset..span.end()];
-            let pcid: Pcid = ft_hash::pcid_of(slice);
-            let cid: Cid = cid_for(slice); // MVP: cid == pcid (nonce excluded).
+            // Encryption OFF (`alg=0`): cid == pcid (nonce excluded), the object
+            // is the cleartext payload, no sidecar. Encryption ON (`alg=1`): the
+            // cid is `BLAKE3(nonce || ciphertext)` and DIVERGES from the cleartext
+            // pcid — `bk`/the Manifest address by `cid`, the local index/dedup key
+            // by `pcid`; the wrapped data key becomes the `keys/<cid>` sidecar.
+            let (cid, pcid, obj, sidecar): (Cid, Pcid, Vec<u8>, Option<Vec<u8>>) =
+                match self.crypto.as_ref() {
+                    None => {
+                        let pcid = ft_hash::pcid_of(slice);
+                        (cid_for(slice), pcid, encode(slice), None)
+                    }
+                    Some(crypto) => {
+                        let (cid, pcid, obj, data_key) =
+                            ft_block::encode_encrypted(slice, &crypto.dedup_secret)?;
+                        let sidecar =
+                            ft_block::sidecar::wrap_data_key(&data_key, &crypto.space_key);
+                        (cid, pcid, obj, Some(sidecar))
+                    }
+                };
             bk.push(cid);
             block_refs.push(BlockRef { pcid, cid });
-            // De-dup within this scan: collect each Block's encoded object once.
+            // De-dup within this scan: collect each Block's object (and, under
+            // encryption, its sidecar) once per cid. Same content ⇒ same pcid ⇒
+            // same deterministic key/nonce ⇒ same ciphertext ⇒ same cid, so this
+            // dedups identically whether encryption is on or off (`§4.4`).
             if seen_blocks.insert(cid) {
-                result.blocks_to_upload.push((cid, encode(slice)));
+                result.blocks_to_upload.push((cid, obj));
+                if let Some(sidecar) = sidecar {
+                    result.sidecars.push((cid, sidecar));
+                }
             }
         }
 

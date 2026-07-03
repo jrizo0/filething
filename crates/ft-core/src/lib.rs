@@ -47,8 +47,19 @@ pub const HEADER_VERSION: u8 = 1;
 
 /// AEAD algorithm id for cleartext payloads (MVP default). `docs/format.md §4.3`.
 pub const ALG_CLEARTEXT: u8 = 0;
-/// AEAD algorithm id for XChaCha20-Poly1305 (RESERVED, OFF in MVP). `docs/format.md §4.3`.
+/// AEAD algorithm id for XChaCha20-Poly1305 runtime encryption. `docs/format.md §4.3`.
 pub const ALG_AEAD: u8 = 1;
+/// Alias of [`ALG_AEAD`] spelled out with the spec's primitive name, used by the
+/// `alg=1` encode/decode path (`ft-block`) so call sites don't have to remember
+/// that "AEAD" means XChaCha20-Poly1305 specifically. Same value as [`ALG_AEAD`].
+pub const ALG_XCHACHA20_POLY1305: u8 = ALG_AEAD;
+
+/// Wrap-algorithm id for the sidecar's `wrap_alg` field (`docs/format.md §4.5`):
+/// XChaCha20-Poly1305 with the Space key (via a KDF subkey) as KEK. Numerically
+/// equal to [`ALG_XCHACHA20_POLY1305`] today (same AEAD choice), but kept as its
+/// own constant: a Block's `alg` and a sidecar's `wrap_alg` are logically
+/// distinct fields that happen to share one algorithm.
+pub const WRAP_ALG_XCHACHA20_POLY1305: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // KDF context strings (docs/format.md §2.1)
@@ -384,6 +395,53 @@ pub struct FileEntry {
 }
 
 // ---------------------------------------------------------------------------
+// SpaceCrypto — runtime encryption key material (docs/format.md §4.4/§4.5)
+// ---------------------------------------------------------------------------
+
+/// The in-memory key material that turns ON runtime `alg=1` encryption for a
+/// mounted Space. Absent (`Option::None` at the call sites that take it) ⇒ the
+/// cleartext `alg=0` path is used and nothing about behavior changes.
+///
+/// - `dedup_secret` is the per-Account secret that derives the DETERMINISTIC
+///   per-content data key and nonce (`ft_hash::data_key` / `ft_hash::nonce`,
+///   `§4.4`), so the same cleartext in the same Account always encrypts to the
+///   same `cid` — the property cross-Device dedup relies on under encryption.
+/// - `space_key` wraps/unwraps each Block's data key in its
+///   `keys/<space_id>/<aa>/<cid>` sidecar (`§4.5`), so rotating it re-wraps the
+///   ~88-byte sidecars without touching the immutable Block objects.
+/// - `space_id` scopes the sidecar OBJECT KEY to this Space. The Block object
+///   (`blocks/<cid>`) is Account-scoped and deduped across Spaces, but the
+///   sidecar is wrapped with THIS Space's `space_key`, so two Spaces of one
+///   Account sharing a chunk each need their own sidecar — hence the Space
+///   component in the key (`§4.5`).
+///
+/// This type carries only the raw secrets; it deliberately has NO serde impl —
+/// the escrow/keyring that supplies it lives outside this crate. Its [`Debug`]
+/// is redacted so the secrets never reach a log.
+#[derive(Clone)]
+pub struct SpaceCrypto {
+    /// Per-Account dedup secret (`§4.4`). Never logged (redacted in [`Debug`]).
+    pub dedup_secret: [u8; 32],
+    /// Per-Space key wrapping the sidecar data keys (`§4.5`). Never logged.
+    pub space_key: [u8; 32],
+    /// Id of the Space this key material belongs to; scopes the sidecar object
+    /// key `keys/<space_id>/<aa>/<cid>` (`§4.5`). Not a secret.
+    pub space_id: String,
+}
+
+impl fmt::Debug for SpaceCrypto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never render the raw key bytes — a Debug of a mounted context or a
+        // scan result must not leak either secret into a log or a panic message.
+        f.debug_struct("SpaceCrypto")
+            .field("dedup_secret", &"<redacted>")
+            .field("space_key", &"<redacted>")
+            .field("space_id", &self.space_id)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manifest pages (docs/format.md §5.3)
 // ---------------------------------------------------------------------------
 
@@ -493,6 +551,24 @@ impl BlockHeader {
     /// Builds a cleartext Manifest-page header (`alg=0`, zero nonce).
     pub fn new_manifest(payload_len: u64) -> Self {
         Self::new(MAGIC_MANIFEST, payload_len)
+    }
+
+    /// Builds an encrypted (`alg=1`, [`ALG_XCHACHA20_POLY1305`]) Block header
+    /// carrying the deterministic per-content `nonce` (`docs/format.md §4.3`,
+    /// §4.4) and `payload_len` set to the CIPHERTEXT length (including the
+    /// Poly1305 tag). Only Blocks are encrypted in this build — Manifest-page
+    /// encryption (`§5.5`, zero-knowledge) is a separate future hookup.
+    pub fn new_encrypted_block(payload_len: u64, nonce: [u8; 24]) -> Self {
+        Self {
+            magic: MAGIC_BLOCK,
+            header_version: HEADER_VERSION,
+            alg: ALG_XCHACHA20_POLY1305,
+            flags: 0,
+            reserved: 0,
+            payload_len,
+            nonce,
+            reserved2: [0u8; 24],
+        }
     }
 
     /// Builds a cleartext header with the given magic: `header_version=1`,
@@ -679,6 +755,23 @@ mod tests {
         let h = BlockHeader::new_manifest(7);
         assert_eq!(&h.magic, b"FTM1");
         assert_eq!(h.magic, MAGIC_MANIFEST);
+    }
+
+    #[test]
+    fn encrypted_block_header_carries_alg1_and_nonce() {
+        let nonce = [0x42u8; 24];
+        let h = BlockHeader::new_encrypted_block(123, nonce);
+        assert_eq!(h.magic, MAGIC_BLOCK);
+        assert_eq!(h.alg, ALG_XCHACHA20_POLY1305);
+        assert_eq!(h.alg, ALG_AEAD);
+        assert_eq!(h.nonce, nonce);
+        assert_eq!(h.payload_len, 123);
+        assert_eq!(h.reserved2, [0u8; 24]);
+
+        // Roundtrips through the wire encoding like any other header.
+        let bytes = h.encode();
+        let back = BlockHeader::decode(&bytes).unwrap();
+        assert_eq!(h, back);
     }
 
     #[test]
@@ -884,6 +977,8 @@ mod tests {
         assert_eq!(HEADER_VERSION, 1);
         assert_eq!(ALG_CLEARTEXT, 0);
         assert_eq!(ALG_AEAD, 1);
+        assert_eq!(ALG_XCHACHA20_POLY1305, 1);
+        assert_eq!(WRAP_ALG_XCHACHA20_POLY1305, 1);
         assert_eq!(CTX_CDC_GEAR, "filething.cdc.gear.v1");
         assert_eq!(CTX_BLOCK_KEY, "filething.block.key.v1");
         assert_eq!(CTX_BLOCK_NONCE, "filething.block.nonce.v1");

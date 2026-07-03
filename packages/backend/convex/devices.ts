@@ -11,6 +11,7 @@
 
 import { v } from "convex/values";
 import { mutation } from "./_generated/server";
+import { requireAccount, requireOwnedDevice } from "./auth";
 
 export const setBaseSeq = mutation({
   args: {
@@ -19,6 +20,9 @@ export const setBaseSeq = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    // Only the owning Account may move its own Device's retention base.
+    const account = await requireAccount(ctx);
+    await requireOwnedDevice(ctx, account, args.deviceId);
     await ctx.db.patch(args.deviceId, { baseSeqInUse: args.baseSeqInUse });
     return null;
   },

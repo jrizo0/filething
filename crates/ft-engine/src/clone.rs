@@ -10,6 +10,7 @@
 //! materialize the entire head tree into `local_root`.
 
 use ft_coordinator::{AccountId, Coordinator, DeviceId, SpaceId};
+use ft_core::SpaceCrypto;
 use ft_fsmap::{LinuxFs, OsFs};
 use ft_index::{Index, SpaceState};
 
@@ -32,6 +33,13 @@ impl SpaceContext {
     /// Returns the mounted, fully-materialized context (its `last_synced` now the
     /// head). Uses the default [`LinuxFs`]; see [`SpaceContext::clone_space_with_fs`]
     /// to inject another adapter.
+    ///
+    /// `dedup_secret` is the caller's per-Account escrow secret (`§4.4`, from
+    /// `ensure_device`). Combined with the `space_key` the Coordinator returns in
+    /// the Space document, it lets this Device decrypt `alg=1` Blocks while
+    /// materializing. A legacy Space with no escrowed `space_key` stays on the
+    /// cleartext (`alg=0`) path — `dedup_secret` is then unused.
+    #[allow(clippy::too_many_arguments)]
     pub async fn clone_space(
         index: Index,
         vault: Box<dyn ft_vault::Vault>,
@@ -40,6 +48,7 @@ impl SpaceContext {
         device_id: DeviceId,
         space_id: SpaceId,
         local_root: impl Into<std::path::PathBuf>,
+        dedup_secret: [u8; 32],
     ) -> Result<Self> {
         Self::clone_space_with_fs(
             index,
@@ -50,6 +59,7 @@ impl SpaceContext {
             device_id,
             space_id,
             local_root,
+            dedup_secret,
         )
         .await
     }
@@ -65,6 +75,7 @@ impl SpaceContext {
         device_id: DeviceId,
         space_id: SpaceId,
         local_root: impl Into<std::path::PathBuf>,
+        dedup_secret: [u8; 32],
     ) -> Result<Self> {
         let local_root = local_root.into();
         std::fs::create_dir_all(&local_root).map_err(crate::error::EngineError::Io)?;
@@ -72,6 +83,8 @@ impl SpaceContext {
         // (1)/(2) read the Space doc, then the chunk secret from its meta blob.
         let space = coordinator.get_space(&space_id).await?;
         let chunk_secret = load_meta_blob(vault.as_ref(), &space.meta_blob_cid).await?;
+        // The escrowed per-Space key (if any) turns ON `alg=1` decryption below.
+        let space_key = space.space_key;
 
         // (3) persist the "no base yet" space_state: seq = -1, empty-Manifest root.
         // The first pull's `ensure_empty_root_present` uploads the empty page so
@@ -102,6 +115,20 @@ impl SpaceContext {
             space_id,
             &state,
         )?;
+
+        // Turn ON `alg=1` decryption BEFORE the pull materializes the tree: an
+        // escrowed `space_key` + the Account `dedup_secret` let `materialize`
+        // unwrap each Block's data key from its `keys/<space_id>/<cid>` sidecar
+        // (`§4.5`). A legacy Space without a `space_key` stays on the cleartext
+        // path.
+        if let Some(space_key) = space_key {
+            let space_id = ctx.space_id.as_str().to_string();
+            ctx.attach_crypto(SpaceCrypto {
+                dedup_secret,
+                space_key,
+                space_id,
+            });
+        }
 
         // (5) pull: fast-forward from the empty base to the head materializes the
         // whole tree. With an empty local dir there are never local changes, so

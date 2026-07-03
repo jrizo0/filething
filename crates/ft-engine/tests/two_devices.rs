@@ -38,19 +38,23 @@ fn read(root: &Path, rel: &str) -> Vec<u8> {
 /// each has its own local dir + index — two Devices on one machine, exactly the
 /// MVP demo topology (`docs/BUILD-PLAN.md §0`).
 #[tokio::test]
-#[ignore = "requires a live self-hosted Convex backend (CONVEX_SELF_HOSTED_URL / _ADMIN_KEY)"]
+#[ignore = "requires a live self-hosted Convex backend + a user JWT (FILETHING_TEST_JWT)"]
 async fn two_devices_end_to_end() {
     use convex::ConvexClient;
+    use ft_core::SpaceCrypto;
     use ft_engine::Coordinator;
 
     let url = std::env::var("CONVEX_SELF_HOSTED_URL")
         .unwrap_or_else(|_| "http://localhost:3210".to_string());
-    let admin_key = std::env::var("CONVEX_SELF_HOSTED_ADMIN_KEY")
-        .expect("CONVEX_SELF_HOSTED_ADMIN_KEY must be set to run this test");
+    // Since Fase 3 the contract is authenticated (`ctx.auth`): a real user JWT
+    // (Better Auth, Convex audience) is required, not the deployment admin key.
+    // Obtain one the way the CLI does (see `apps/cli` login).
+    let jwt = std::env::var("FILETHING_TEST_JWT")
+        .expect("FILETHING_TEST_JWT (a Better Auth Convex-audience JWT) must be set");
 
     let connect = || async {
         let mut client = ConvexClient::new(&url).await.expect("connect to Convex");
-        client.set_admin_auth(admin_key.clone(), None).await;
+        client.set_auth(Some(jwt.clone())).await;
         Coordinator::from_client(client)
     };
 
@@ -61,25 +65,37 @@ async fn two_devices_end_to_end() {
     let dir_b = work.path().join("device-b");
     std::fs::create_dir_all(&dir_a).unwrap();
 
-    // Bootstrap one Account + Device A.
+    // ensureDevice: get-or-create the Account + Device A, and the escrow dedup
+    // secret every Device of this Account shares.
     let mut coord_a = connect().await;
-    let boot = coord_a.bootstrap("device-a").await.expect("bootstrap");
+    let ensured = coord_a
+        .ensure_device("device-a", &[7u8; 32])
+        .await
+        .expect("ensure_device");
 
-    // Device A: init_space with a toy tree.
+    // Device A: init_space with a toy tree. A client-generated space_key turns on
+    // `alg=1` encryption for the whole Space.
     write(&dir_a, "hello.txt", b"hello from A\n", false);
     write(&dir_a, "src/lib.rs", b"pub fn x() {}\n", false);
     write(&dir_a, "run.sh", b"#!/bin/sh\necho ok\n", true);
 
+    let crypto = SpaceCrypto {
+        dedup_secret: ensured.dedup_secret,
+        space_key: [42u8; 32],
+        // `init_space` stamps the real id from `create_space`; placeholder here.
+        space_id: String::new(),
+    };
     let index_a = Index::open_in_memory().unwrap();
     let vault_a: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
     let mut ctx_a = SpaceContext::init_space(
         index_a,
         vault_a,
         coord_a.clone(),
-        boot.account_id.clone(),
-        boot.device_id.clone(),
+        ensured.account_id.clone(),
+        ensured.device_id.clone(),
         b"two-device-space",
         &dir_a,
+        crypto,
     )
     .await
     .expect("A init_space");
@@ -87,17 +103,20 @@ async fn two_devices_end_to_end() {
 
     // Device B: clone_space into a fresh dir, sharing the SAME vault + account.
     // (One account, multi-seat, in the v1 model — B reuses A's device id here for
-    // simplicity; conflict-copy names would differ in a real pairing.)
+    // simplicity; conflict-copy names would differ in a real pairing.) B fetches
+    // the escrowed space_key from the Space doc and decrypts with the shared
+    // dedup_secret.
     let index_b = Index::open_in_memory().unwrap();
     let vault_b: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
     let mut ctx_b = SpaceContext::clone_space(
         index_b,
         vault_b,
         coord_a.clone(),
-        boot.account_id.clone(),
-        boot.device_id.clone(),
+        ensured.account_id.clone(),
+        ensured.device_id.clone(),
         space_id.clone(),
         &dir_b,
+        ensured.dedup_secret,
     )
     .await
     .expect("B clone_space");

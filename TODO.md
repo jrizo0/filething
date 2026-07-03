@@ -142,10 +142,20 @@ Runbook completo: `docs/PRODUCTION-SETUP.md`. ADR: `docs/adr/0013`.
 ### Fase B — Endurecer para usuarios reales (desbloquea cobrar)
 En orden de prioridad; los [R] de abajo guardan los huecos ya cableados en el formato.
 Entró en la tanda del 2026-07-02: daemon-servicio + observabilidad + GC/retención.
-- [ ] **Auth real** (Better Auth): login por navegador + tokens por device emitidos en el
-  pairing; el cliente deja de necesitar cualquier key privilegiada. Prerrequisito para terceros.
-- [ ] **Cifrado en runtime** (`alg=1`, huecos ya reservados): antes de guardar bytes de
-  terceros en R2. Data key determinista por cuenta (ADR 0003), sidecars `keys/<cid>`.
+Entró en la tanda del 2026-07-03 ("Fase 3"): auth real + cifrado en runtime.
+- [x] **Auth real** (Better Auth, ADR 0014 — 2026-07-03): email+password headless (login por
+  navegador diferido); componente `@convex-dev/better-auth` en el backend; `ctx.auth` +
+  ownership en TODAS las funciones Convex; `filething login --email` (token de sesión por
+  device en `credentials.json` 0600, JWT vía `set_auth`/`set_auth_callback`); pairing codes
+  eliminados (pairing = login del mismo usuario); deploy key relegada a fallback de ops.
+  Validado e2e contra el stack local (2 devices, aislamiento cross-account).
+- [x] **Cifrado en runtime** (`alg=1`, ADR 0015 — 2026-07-03): XChaCha20-Poly1305 con data
+  key/nonce deterministas (ADR 0003), sidecars `keys/<aa>/<cid>` (ADR 0004), escrow v1 de
+  `dedupSecret`/`spaceKey` en Convex, GC barre sidecars junto a sus Blocks. Manifests siguen
+  `alg=0` (zero-knowledge diferido). Vault mixto OK; spaces pre-Fase 3 siguen en claro.
+  Validado e2e: blocks en MinIO sin plaintext + clone/descifrado cross-device.
+  **Pendiente**: validar en vivo contra Convex Cloud + R2 (re-correr `cloud-smoke.sh`; setear
+  `BETTER_AUTH_SECRET`/`SITE_URL` en el deployment — runbook §4.3).
 - [x] **Daemon como servicio** (`filething service install/uninstall/status`): launchd en
   macOS, systemd `--user` en Linux; env file 0600 con las credenciales + logs en
   `<config_dir>/daemon.log`, reinicio al fallar. `apps/cli/src/service.rs` (generadores puros
@@ -167,11 +177,12 @@ Entró en la tanda del 2026-07-02: daemon-servicio + observabilidad + GC/retenci
 ---
 
 ## Reservado — NO construir en el MVP (huecos ya cableados en el formato)
-- [R] Cifrado en runtime (`alg=1`, sidecars `keys/*`, derivación+cifrado AEAD)
+- [R] ~~Cifrado en runtime~~ → construido en Fase 3 (2026-07-03, ADR 0015)
 - [R] Zero-knowledge (cifrar páginas de Manifest, `reach/*` para GC)
 - [R] Serve mode / self-hosted vault + Grants firmados
 - [R] GC / retención (grace-period y retention floor ya reservados en schema)
-- [R] Better Auth / OAuth navegador completo (MVP = pairing por código)
+- [R] ~~Better Auth~~ → construido en Fase 3 (email+password headless, ADR 0014); OAuth
+  navegador + device-authorization para devices headless siguen reservados
 - [R] Billing (Polar), dashboard y marketing (Next.js)
 - [R] Packing de bloques chicos; binarios per-SO; validación de nombres Windows
 - [R] Move-detection / tombstones explícitos (rename = delete+add en MVP)

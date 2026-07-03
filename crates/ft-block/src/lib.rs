@@ -1,36 +1,49 @@
 //! ft-block — codec for the content-addressed Block object (`docs/format.md`
-//! §4.1–4.3; §4.5 reserved).
+//! §4.1–4.5).
 //!
 //! A Block object is a fixed 64-byte header ([`ft_core::BlockHeader`]) followed
 //! by its payload. This crate encodes/decodes that object, computes the
 //! addressing [`Cid`], and verifies wire integrity by recomputing the hash and
-//! comparing it against an expected `cid`.
+//! comparing it against an expected `cid`. It also implements the `alg=1`
+//! (XChaCha20-Poly1305) runtime encryption path and its `keys/<space_id>/<aa>/<cid>`
+//! sidecar codec ([`sidecar`]).
 //!
-//! ## MVP: encryption OFF (`alg=0`)
+//! ## Cleartext (`alg=0`)
 //!
-//! The single load-bearing decision (`docs/format.md §4.3`, resolved for this
-//! build): in the MVP the `cid` is computed over the payload **without**
-//! prepending the nonce, i.e.
+//! The single load-bearing decision (`docs/format.md §4.3`): for cleartext the
+//! `cid` is computed over the payload **without** prepending the nonce, i.e.
 //!
 //! ```text
 //! cid = ft_hash::cid_of(payload) = BLAKE3-256(payload)
 //! ```
 //!
-//! so that `cid == pcid` (`§4.3`: "en MVP nonce=ceros => cid=pcid"). The entire
-//! MVP dedup path depends on this equality. The header still carries 24 nonce
-//! bytes — all zero, a reserved field — but those bytes do NOT enter the hash in
-//! the MVP. Because the MVP nonce is all-zero, `BLAKE3(payload)` and
-//! `BLAKE3(nonce_24 || payload)` would differ; this crate deliberately hashes
-//! the payload alone, matching `ft_hash::cid_of` / `ft_hash::pcid_of`.
+//! so that `cid == pcid` (`§4.3`: "en MVP nonce=ceros => cid=pcid"). The header
+//! still carries 24 nonce bytes — all zero, a reserved field — but those bytes
+//! do NOT enter the hash for `alg=0`.
 //!
-//! ## Future: encryption ON (`alg=1`) — RESERVED, not implemented
+//! ## Encryption (`alg=1`, XChaCha20-Poly1305)
 //!
-//! Under AEAD the payload is ciphertext and the addressing hash becomes
-//! `cid = BLAKE3-256(nonce_24 || ciphertext)` (`§4.4`), with the wrapped data key
-//! living in a `keys/<aa>/<cid>` sidecar (`§4.5`). Neither the `alg=1` branch nor
-//! the sidecar is implemented here; [`cid_of_object`] returns
-//! [`Error::UnsupportedAlg`] for any non-cleartext `alg` so the reserved branch
-//! is explicit rather than silently mishashed.
+//! [`encode_encrypted`] / [`decode_encrypted`] implement `docs/format.md §4.4`:
+//! the data key and nonce are DETERMINISTIC per content (`ft_hash::data_key` /
+//! `ft_hash::nonce`, derived from the per-Account dedup secret and the chunk's
+//! `pcid`), so the same cleartext in the same Account always re-derives the same
+//! key/nonce/ciphertext/`cid` — the property that makes cross-Device dedup
+//! survive encryption. The addressing hash becomes
+//!
+//! ```text
+//! cid = BLAKE3-256(nonce_24 || ciphertext)
+//! ```
+//!
+//! and the 64-byte header is authenticated as the AEAD's associated data (AAD),
+//! so the header is not maleable independently of the ciphertext (`§4.3`,
+//! "regla DURA"). [`verify`] / [`cid_of_object`] recompute this hash straight
+//! from the object's own bytes with NO key required — only [`decode_encrypted`]
+//! (which actually recovers the cleartext) needs the `data_key`. The wrapped
+//! data key itself never lives in the Block object; it lives in a
+//! `keys/<space_id>/<aa>/<cid>` sidecar (`§4.5`), encoded/decoded by [`sidecar`].
+//!
+//! [`cid_of_object`] / [`verify`] return [`Error::UnsupportedAlg`] for any `alg`
+//! other than `0` or `1` — a third algorithm is not a format this crate knows.
 
 use ft_core::{BlockHeader, Cid, BLOCK_HEADER_LEN};
 use thiserror::Error;
@@ -65,8 +78,9 @@ pub enum Error {
         actual: u64,
     },
 
-    /// The AEAD branch (`alg=1`) is reserved and not implemented in the MVP.
-    #[error("unsupported alg {0}: only cleartext (alg=0) is implemented in the MVP")]
+    /// The object's `alg` byte is neither [`ft_core::ALG_CLEARTEXT`] nor
+    /// [`ft_core::ALG_XCHACHA20_POLY1305`] — not a format this crate knows.
+    #[error("unsupported alg {0}: only cleartext (alg=0) and XChaCha20-Poly1305 (alg=1) are implemented")]
     UnsupportedAlg(u8),
 
     /// Integrity check failed: the recomputed `cid` did not equal the expected
@@ -78,6 +92,35 @@ pub enum Error {
         /// The `cid` recomputed from the object's bytes.
         computed: Cid,
     },
+
+    /// A caller-supplied `alg`/`wrap_alg` did not match what an operation
+    /// requires — e.g. [`decode_encrypted`] on an `alg=0` object, or
+    /// [`sidecar::unwrap_data_key`] on a sidecar whose `wrap_alg` this crate
+    /// does not implement.
+    #[error("wrong alg: expected {expected}, got {got}")]
+    WrongAlg {
+        /// The `alg`/`wrap_alg` the operation requires.
+        expected: u8,
+        /// The `alg`/`wrap_alg` actually found.
+        got: u8,
+    },
+
+    /// AEAD encryption failed. With the fixed 32-byte key / 24-byte nonce this
+    /// crate always supplies, this should not happen in practice; surfaced as an
+    /// error instead of panicking so a pathological input cannot crash a Device.
+    #[error("AEAD encryption failed")]
+    Encrypt,
+
+    /// AEAD decryption/authentication failed: wrong `data_key` (or wrong
+    /// `space_key` for a sidecar unwrap), or the ciphertext/AAD was tampered
+    /// with. Deliberately does not distinguish which, per AEAD best practice.
+    #[error("AEAD decryption failed: wrong key or tampered data")]
+    Decrypt,
+
+    /// A `keys/<space_id>/<aa>/<cid>` sidecar's CBOR payload failed to decode, or decoded
+    /// to a `wrap_nonce`/`wrapped_data_key` of the wrong length.
+    #[error("malformed sidecar: {0}")]
+    MalformedSidecar(String),
 }
 
 /// Crate-wide `Result` alias over the block [`Error`].
@@ -132,26 +175,39 @@ pub fn decode(obj: &[u8]) -> Result<(BlockHeader, Vec<u8>)> {
 
 /// Computes the addressing [`Cid`] for a cleartext `payload`.
 ///
-/// MVP (`alg=0`): `cid = ft_hash::cid_of(payload) = BLAKE3-256(payload)`, so
-/// `cid == pcid`. The nonce is NOT prepended in the MVP (`docs/format.md §4.3`).
+/// `alg=0`: `cid = ft_hash::cid_of(payload) = BLAKE3-256(payload)`, so
+/// `cid == pcid`. The nonce is NOT prepended for cleartext (`docs/format.md §4.3`).
 pub fn cid_for(payload: &[u8]) -> Cid {
     ft_hash::cid_of(payload)
+}
+
+/// Computes the addressing [`Cid`] for an encrypted (`alg=1`) object's stored
+/// ciphertext: `cid = BLAKE3-256(nonce || ciphertext)` (`docs/format.md §4.4`).
+///
+/// Needs no key: this is the wire-integrity hash, computable from the object's
+/// own bytes alone (`§4.3`, "regla DURA").
+pub fn cid_for_encrypted(nonce: &[u8; 24], ciphertext: &[u8]) -> Cid {
+    let mut buf = Vec::with_capacity(nonce.len() + ciphertext.len());
+    buf.extend_from_slice(nonce);
+    buf.extend_from_slice(ciphertext);
+    ft_hash::cid_of(&buf)
 }
 
 /// Decodes a Block object and computes the [`Cid`] of its stored payload
 /// according to the header's `alg`.
 ///
-/// - MVP (`alg=0`, [`ft_core::ALG_CLEARTEXT`]): hashes the payload alone
+/// - `alg=0` ([`ft_core::ALG_CLEARTEXT`]): hashes the payload alone
 ///   (`BLAKE3-256(payload)`), the nonce excluded — matching [`cid_for`].
-/// - `alg=1` ([`ft_core::ALG_AEAD`]) and any other value: returns
-///   [`Error::UnsupportedAlg`]. The future AEAD rule
-///   (`cid = BLAKE3-256(nonce || ciphertext)`) is reserved, not implemented.
+/// - `alg=1` ([`ft_core::ALG_XCHACHA20_POLY1305`]): hashes `nonce || ciphertext`
+///   — matching [`cid_for_encrypted`]. No key required.
+/// - any other value: [`Error::UnsupportedAlg`].
 pub fn cid_of_object(obj: &[u8]) -> Result<Cid> {
     let (header, payload) = decode(obj)?;
-    if header.alg != ft_core::ALG_CLEARTEXT {
-        return Err(Error::UnsupportedAlg(header.alg));
+    match header.alg {
+        ft_core::ALG_CLEARTEXT => Ok(cid_for(&payload)),
+        ft_core::ALG_XCHACHA20_POLY1305 => Ok(cid_for_encrypted(&header.nonce, &payload)),
+        other => Err(Error::UnsupportedAlg(other)),
     }
-    Ok(cid_for(&payload))
 }
 
 /// Recomputes the object's [`Cid`] (via [`cid_of_object`]) and compares it to
@@ -170,6 +226,216 @@ pub fn verify(obj: &[u8], expected: &Cid) -> Result<()> {
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Encryption (alg=1, XChaCha20-Poly1305) — docs/format.md §4.4
+// ---------------------------------------------------------------------------
+
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+
+/// Encrypts `payload` into a full encrypted (`alg=1`) Block object.
+///
+/// Implements `docs/format.md §4.4`: `pcid = pcid_of(payload)`; `data_key` and
+/// `nonce` are DETERMINISTIC, derived from `dedup_secret` and `pcid`
+/// (`ft_hash::data_key` / `ft_hash::nonce`) so the same cleartext in the same
+/// Account always re-derives the same key/nonce — the property dedup relies on.
+/// The 64-byte header (with `payload_len` set to the ciphertext length,
+/// including the 16-byte Poly1305 tag) is authenticated as the AEAD's
+/// associated data, then `cid = cid_for_encrypted(nonce, ciphertext)`.
+///
+/// Returns `(cid, pcid, object_bytes, data_key)`. The caller is responsible for
+/// wrapping `data_key` into a `keys/<space_id>/<aa>/<cid>` sidecar ([`sidecar::wrap_data_key`])
+/// before/alongside uploading `object_bytes` — this function does not touch the
+/// sidecar.
+pub fn encode_encrypted(
+    payload: &[u8],
+    dedup_secret: &[u8; 32],
+) -> Result<(Cid, ft_core::Pcid, Vec<u8>, [u8; 32])> {
+    let pcid = ft_hash::pcid_of(payload);
+    let data_key = ft_hash::data_key(dedup_secret, &pcid);
+    let nonce_bytes = ft_hash::nonce(dedup_secret, &pcid);
+
+    // payload_len is the CIPHERTEXT length (plaintext + 16-byte Poly1305 tag),
+    // known up-front so the header — the AEAD's AAD — can be built before
+    // encrypting (docs/format.md §4.3 table, "futuro (alg=1)" column).
+    let ciphertext_len = payload.len() as u64 + 16;
+    let header = BlockHeader::new_encrypted_block(ciphertext_len, nonce_bytes);
+    let aad = header.encode();
+
+    let cipher = XChaCha20Poly1305::new(&Key::from(data_key));
+    let ciphertext = cipher
+        .encrypt(
+            &XNonce::from(nonce_bytes),
+            Payload {
+                msg: payload,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Encrypt)?;
+
+    let cid = cid_for_encrypted(&nonce_bytes, &ciphertext);
+
+    let mut obj = Vec::with_capacity(BLOCK_HEADER_LEN + ciphertext.len());
+    obj.extend_from_slice(&aad);
+    obj.extend_from_slice(&ciphertext);
+
+    Ok((cid, pcid, obj, data_key))
+}
+
+/// Decrypts an encrypted (`alg=1`) Block object back to its cleartext payload.
+///
+/// Decodes the object ([`decode`]), requires `header.alg ==
+/// `[`ft_core::ALG_XCHACHA20_POLY1305`], re-authenticates the 64-byte header as
+/// AAD, and decrypts the ciphertext with `data_key` and the header's own nonce.
+/// A wrong `data_key`, a tampered ciphertext, or a tampered header (AAD) all
+/// surface as [`Error::Decrypt`] (AEAD does not distinguish these — that is the
+/// point: it authenticates the header without revealing which part failed).
+///
+/// The caller obtains `data_key` by unwrapping the object's `keys/<space_id>/<aa>/<cid>`
+/// sidecar ([`sidecar::unwrap_data_key`]) with the Space key.
+pub fn decode_encrypted(obj: &[u8], data_key: &[u8; 32]) -> Result<Vec<u8>> {
+    let (header, ciphertext) = decode(obj)?;
+    if header.alg != ft_core::ALG_XCHACHA20_POLY1305 {
+        return Err(Error::WrongAlg {
+            expected: ft_core::ALG_XCHACHA20_POLY1305,
+            got: header.alg,
+        });
+    }
+    let aad = header.encode();
+    let cipher = XChaCha20Poly1305::new(&Key::from(*data_key));
+    cipher
+        .decrypt(
+            &XNonce::from(header.nonce),
+            Payload {
+                msg: &ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Decrypt)
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar: wrapped data key (docs/format.md §4.5)
+// ---------------------------------------------------------------------------
+
+/// Codec for the `keys/<space_id>/<aa>/<cid>` sidecar: the Block's data key, wrapped with
+/// the Space key so rotating the Space key re-wraps (~88-byte objects) without
+/// touching the (immutable) Block object or its `cid` (`docs/format.md §4.5`,
+/// ADR-0004).
+///
+/// Wire format: canonical CBOR `{ wrap_alg, wrap_nonce (24B), wrapped_data_key
+/// (48B = 32B ciphertext + 16B Poly1305 tag) }`. The struct fields below are
+/// declared in that exact order and their CBOR key lengths are already strictly
+/// ascending (`wrap_alg`=8, `wrap_nonce`=10, `wrapped_data_key`=16 chars), so
+/// plain (declaration-order) `ciborium` struct serialization already satisfies
+/// RFC 8949 §4.2.1's canonical map-key order for this type — no explicit
+/// reordering pass is needed (contrast `ft-manifest`, whose page structs are NOT
+/// naturally in that order and do need one).
+pub mod sidecar {
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+    use rand::RngCore;
+    use serde::{Deserialize, Serialize};
+
+    use crate::{Error, Result};
+
+    /// The sidecar's `wrap_alg` value this crate produces and accepts:
+    /// [`ft_core::WRAP_ALG_XCHACHA20_POLY1305`].
+    pub const WRAP_ALG: u8 = ft_core::WRAP_ALG_XCHACHA20_POLY1305;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct SidecarWire {
+        wrap_alg: u8,
+        #[serde(with = "serde_bytes")]
+        wrap_nonce: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        wrapped_data_key: Vec<u8>,
+    }
+
+    /// Derives the wrap subkey from the Space key: `BLAKE3.derive_key
+    /// ("filething.keywrap.v1", space_key)` (`docs/format.md §2.1`). The Space
+    /// key itself is never used directly as the AEAD key — the KDF subkey is —
+    /// so wrap keys never collide with any other use of the Space key.
+    fn derive_wrap_key(space_key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(ft_core::CTX_KEYWRAP);
+        hasher.update(space_key);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Wraps `data_key` with `space_key` (via the derived wrap subkey) into the
+    /// canonical CBOR sidecar payload described at the module level. Uses a
+    /// fresh random 24-byte nonce every call (wraps are not required to be
+    /// deterministic — only the underlying `data_key`, per `§4.4`, is).
+    pub fn wrap_data_key(data_key: &[u8; 32], space_key: &[u8; 32]) -> Vec<u8> {
+        let kek = derive_wrap_key(space_key);
+        let mut nonce_bytes = [0u8; 24];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+        let cipher = XChaCha20Poly1305::new(&Key::from(kek));
+        let wrapped_data_key = cipher
+            .encrypt(&XNonce::from(nonce_bytes), data_key.as_slice())
+            .expect(
+                "wrapping a fixed 32-byte key with a valid 32-byte key/24-byte nonce cannot fail",
+            );
+
+        let wire = SidecarWire {
+            wrap_alg: WRAP_ALG,
+            wrap_nonce: nonce_bytes.to_vec(),
+            wrapped_data_key,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&wire, &mut buf)
+            .expect("serializing the fixed-shape sidecar struct to CBOR cannot fail");
+        buf
+    }
+
+    /// Unwraps a `keys/<space_id>/<aa>/<cid>` sidecar's `data_key` using `space_key`.
+    ///
+    /// Rejects a `wrap_alg` other than [`WRAP_ALG`], a malformed CBOR payload, or
+    /// a `wrap_nonce`/`wrapped_data_key` of the wrong length before touching the
+    /// AEAD. A wrong `space_key` (hence wrong derived KEK) surfaces as
+    /// [`Error::Decrypt`], same as a tampered sidecar — AEAD does not
+    /// distinguish the two.
+    pub fn unwrap_data_key(sidecar_bytes: &[u8], space_key: &[u8; 32]) -> Result<[u8; 32]> {
+        let wire: SidecarWire = ciborium::de::from_reader(sidecar_bytes)
+            .map_err(|e| Error::MalformedSidecar(e.to_string()))?;
+
+        if wire.wrap_alg != WRAP_ALG {
+            return Err(Error::WrongAlg {
+                expected: WRAP_ALG,
+                got: wire.wrap_alg,
+            });
+        }
+        if wire.wrap_nonce.len() != 24 {
+            return Err(Error::MalformedSidecar(format!(
+                "wrap_nonce must be 24 bytes, got {}",
+                wire.wrap_nonce.len()
+            )));
+        }
+        if wire.wrapped_data_key.len() != 48 {
+            return Err(Error::MalformedSidecar(format!(
+                "wrapped_data_key must be 48 bytes, got {}",
+                wire.wrapped_data_key.len()
+            )));
+        }
+        // Lengths just checked above, so these conversions cannot fail.
+        let nonce_arr: [u8; 24] = wire.wrap_nonce.as_slice().try_into().unwrap();
+
+        let kek = derive_wrap_key(space_key);
+        let cipher = XChaCha20Poly1305::new(&Key::from(kek));
+        let plaintext = cipher
+            .decrypt(&XNonce::from(nonce_arr), wire.wrapped_data_key.as_slice())
+            .map_err(|_| Error::Decrypt)?;
+
+        plaintext.as_slice().try_into().map_err(|_| {
+            Error::MalformedSidecar(format!(
+                "unwrapped data key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -406,23 +672,295 @@ mod tests {
         assert!(verify(&obj, &cid_for(payload)).is_ok());
     }
 
-    // ----- reserved alg=1 branch -----
+    // ----- unsupported alg (neither 0 nor 1) -----
 
     #[test]
-    fn cid_of_object_rejects_alg1() {
-        // Hand-build an otherwise-valid object whose header says alg=1.
-        let payload = b"ciphertext-ish";
+    fn cid_of_object_rejects_unknown_alg() {
+        let payload = b"mystery bytes";
         let mut obj = encode(payload);
-        obj[5] = ft_core::ALG_AEAD; // alg = 1.
-        assert!(matches!(cid_of_object(&obj), Err(Error::UnsupportedAlg(1))));
+        obj[5] = 7; // not a known alg.
+        assert!(matches!(cid_of_object(&obj), Err(Error::UnsupportedAlg(7))));
     }
 
     #[test]
-    fn verify_rejects_alg1_object() {
-        let payload = b"ciphertext-ish";
+    fn verify_rejects_unknown_alg_object() {
+        let payload = b"mystery bytes";
         let mut obj = encode(payload);
-        obj[5] = ft_core::ALG_AEAD;
+        obj[5] = 7;
         let cid = cid_for(payload);
-        assert!(matches!(verify(&obj, &cid), Err(Error::UnsupportedAlg(1))));
+        assert!(matches!(verify(&obj, &cid), Err(Error::UnsupportedAlg(7))));
+    }
+
+    // ===== alg=1 (XChaCha20-Poly1305) =====
+
+    const DEDUP_SECRET_A: [u8; 32] = [0x11u8; 32];
+    const DEDUP_SECRET_B: [u8; 32] = [0x22u8; 32];
+    const SPACE_KEY_A: [u8; 32] = [0xAAu8; 32];
+    const SPACE_KEY_B: [u8; 32] = [0xBBu8; 32];
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let payload = b"the quick brown fox jumps over the lazy dog, encrypted this time";
+        let (cid, pcid, obj, data_key) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+
+        assert_eq!(pcid, ft_hash::pcid_of(payload));
+        assert!(verify(&obj, &cid).is_ok());
+
+        let decrypted = decode_encrypted(&obj, &data_key).unwrap();
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn encrypted_header_is_well_formed() {
+        let payload = b"header shape check";
+        let (_, _, obj, _) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        let header = BlockHeader::decode(&obj).unwrap();
+        assert_eq!(header.magic, MAGIC_BLOCK);
+        assert_eq!(header.alg, ft_core::ALG_XCHACHA20_POLY1305);
+        assert_eq!(header.alg, 1);
+        assert_eq!(header.payload_len, payload.len() as u64 + 16); // + Poly1305 tag.
+        assert_ne!(
+            header.nonce, [0u8; 24],
+            "alg=1 nonce must not be the MVP zero nonce"
+        );
+        assert_eq!(obj.len(), BLOCK_HEADER_LEN + payload.len() + 16);
+    }
+
+    #[test]
+    fn encrypted_cid_equals_blake3_of_nonce_then_ciphertext() {
+        // Locks §4.4's cid formula against the implementation, not just against
+        // itself: recompute independently from the object's raw bytes.
+        let payload = b"cid formula check";
+        let (cid, _, obj, _) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        let header = BlockHeader::decode(&obj).unwrap();
+        let ciphertext = &obj[BLOCK_HEADER_LEN..];
+        let mut hashed = header.nonce.to_vec();
+        hashed.extend_from_slice(ciphertext);
+        assert_eq!(cid, ft_hash::cid_of(&hashed));
+        assert_eq!(cid, cid_for_encrypted(&header.nonce, ciphertext));
+    }
+
+    #[test]
+    fn encrypt_dedup_determinism_same_secret_same_payload() {
+        // §4.4: same cleartext + same dedup_secret -> same cid AND same stored
+        // bytes (mismo ciphertext), on any Device / any call.
+        let payload = b"dedup me twice";
+        let (cid1, pcid1, obj1, key1) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        let (cid2, pcid2, obj2, key2) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        assert_eq!(cid1, cid2);
+        assert_eq!(pcid1, pcid2);
+        assert_eq!(obj1, obj2);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn encrypt_different_dedup_secret_yields_different_cid() {
+        // §4.4: different Account (different dedup_secret) -> different cid for
+        // the SAME cleartext -> no cross-account dedup, no convergent encryption.
+        let payload = b"same cleartext, different account";
+        let (cid_a, _, obj_a, key_a) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        let (cid_b, _, obj_b, key_b) = encode_encrypted(payload, &DEDUP_SECRET_B).unwrap();
+        assert_ne!(cid_a, cid_b);
+        assert_ne!(obj_a, obj_b);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn alg0_path_is_unaffected_by_alg1_support() {
+        // Regression guard: adding alg=1 must not perturb the alg=0 MVP path.
+        let payload = b"still plain cleartext";
+        let obj = encode(payload);
+        let (header, decoded) = decode(&obj).unwrap();
+        assert_eq!(header.alg, ft_core::ALG_CLEARTEXT);
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            cid_for(payload).as_bytes(),
+            ft_hash::pcid_of(payload).as_bytes()
+        );
+        assert!(verify(&obj, &cid_for(payload)).is_ok());
+    }
+
+    #[test]
+    fn decrypt_fails_on_ciphertext_tamper() {
+        let payload = b"tamper the ciphertext";
+        let (cid, _, mut obj, data_key) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        // verify() (no key needed) must still catch this via the cid mismatch.
+        let last = obj.len() - 1;
+        obj[last] ^= 0x01;
+        assert!(matches!(verify(&obj, &cid), Err(Error::CidMismatch { .. })));
+        // And decode_encrypted (which authenticates via AEAD) must also reject it.
+        assert!(matches!(
+            decode_encrypted(&obj, &data_key),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn decrypt_fails_on_header_aad_tamper() {
+        // Flipping a header byte (the AAD) must not change payload_len/nonce in
+        // a way that breaks framing, but MUST break AEAD authentication.
+        let payload = b"tamper the header aad";
+        let (_, _, mut obj, data_key) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        obj[6] ^= 0x01; // flags byte, part of the header/AAD.
+        assert!(matches!(
+            decode_encrypted(&obj, &data_key),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn decrypt_fails_with_wrong_data_key() {
+        let payload = b"wrong key must fail";
+        let (_, _, obj, _) = encode_encrypted(payload, &DEDUP_SECRET_A).unwrap();
+        let wrong_key = [0x99u8; 32];
+        assert!(matches!(
+            decode_encrypted(&obj, &wrong_key),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn decode_encrypted_rejects_alg0_object() {
+        let obj = encode(b"cleartext, not encrypted");
+        let some_key = [0x01u8; 32];
+        match decode_encrypted(&obj, &some_key) {
+            Err(Error::WrongAlg { expected, got }) => {
+                assert_eq!(expected, ft_core::ALG_XCHACHA20_POLY1305);
+                assert_eq!(got, ft_core::ALG_CLEARTEXT);
+            }
+            other => panic!("expected WrongAlg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypt_roundtrip_empty_payload() {
+        let (cid, pcid, obj, data_key) = encode_encrypted(b"", &DEDUP_SECRET_A).unwrap();
+        assert_eq!(obj.len(), BLOCK_HEADER_LEN + 16); // just the Poly1305 tag.
+        assert!(verify(&obj, &cid).is_ok());
+        assert_eq!(decode_encrypted(&obj, &data_key).unwrap(), b"");
+        assert_eq!(pcid, ft_hash::pcid_of(b""));
+    }
+
+    // ----- sidecar: wrap / unwrap the data key -----
+
+    #[test]
+    fn sidecar_wrap_unwrap_roundtrip() {
+        let data_key = [0x77u8; 32];
+        let wrapped = sidecar::wrap_data_key(&data_key, &SPACE_KEY_A);
+        let unwrapped = sidecar::unwrap_data_key(&wrapped, &SPACE_KEY_A).unwrap();
+        assert_eq!(unwrapped, data_key);
+    }
+
+    #[test]
+    fn sidecar_unwrap_fails_with_wrong_space_key() {
+        let data_key = [0x77u8; 32];
+        let wrapped = sidecar::wrap_data_key(&data_key, &SPACE_KEY_A);
+        assert!(matches!(
+            sidecar::unwrap_data_key(&wrapped, &SPACE_KEY_B),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn sidecar_wrap_uses_fresh_nonce_each_call() {
+        // Not deterministic by design (only the underlying data_key is, per
+        // §4.4); two wraps of the same data_key must differ (fresh random nonce)
+        // yet both must unwrap back to the same data_key.
+        let data_key = [0x77u8; 32];
+        let wrapped1 = sidecar::wrap_data_key(&data_key, &SPACE_KEY_A);
+        let wrapped2 = sidecar::wrap_data_key(&data_key, &SPACE_KEY_A);
+        assert_ne!(wrapped1, wrapped2);
+        assert_eq!(
+            sidecar::unwrap_data_key(&wrapped1, &SPACE_KEY_A).unwrap(),
+            data_key
+        );
+        assert_eq!(
+            sidecar::unwrap_data_key(&wrapped2, &SPACE_KEY_A).unwrap(),
+            data_key
+        );
+    }
+
+    #[test]
+    fn sidecar_is_exact_canonical_cbor_shape() {
+        // §4.5: canonical CBOR { wrap_alg, wrap_nonce(24B), wrapped_data_key(48B) }.
+        let data_key = [0x01u8; 32];
+        let wrapped = sidecar::wrap_data_key(&data_key, &SPACE_KEY_A);
+
+        let value: ciborium::value::Value = ciborium::de::from_reader(&wrapped[..]).unwrap();
+        let map = value.as_map().expect("sidecar is a CBOR map");
+
+        // Declaration order == canonical order (see module doc on `sidecar`).
+        let keys: Vec<&str> = map.iter().map(|(k, _)| k.as_text().unwrap()).collect();
+        assert_eq!(keys, vec!["wrap_alg", "wrap_nonce", "wrapped_data_key"]);
+
+        let get = |name: &str| -> ciborium::value::Value {
+            map.iter()
+                .find(|(k, _)| k.as_text() == Some(name))
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(get("wrap_alg").as_integer().unwrap(), 1.into());
+        assert_eq!(get("wrap_nonce").as_bytes().unwrap().len(), 24);
+        assert_eq!(get("wrapped_data_key").as_bytes().unwrap().len(), 48);
+    }
+
+    #[test]
+    fn sidecar_unwrap_rejects_unknown_wrap_alg() {
+        // Hand-build a sidecar with wrap_alg = 9 (not implemented).
+        #[derive(serde::Serialize)]
+        struct BadSidecar {
+            wrap_alg: u8,
+            #[serde(with = "serde_bytes")]
+            wrap_nonce: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            wrapped_data_key: Vec<u8>,
+        }
+        let bad = BadSidecar {
+            wrap_alg: 9,
+            wrap_nonce: vec![0u8; 24],
+            wrapped_data_key: vec![0u8; 48],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&bad, &mut buf).unwrap();
+
+        match sidecar::unwrap_data_key(&buf, &SPACE_KEY_A) {
+            Err(Error::WrongAlg { expected, got }) => {
+                assert_eq!(expected, sidecar::WRAP_ALG);
+                assert_eq!(got, 9);
+            }
+            other => panic!("expected WrongAlg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_unwrap_rejects_malformed_cbor() {
+        assert!(matches!(
+            sidecar::unwrap_data_key(b"not cbor at all \xff\xff", &SPACE_KEY_A),
+            Err(Error::MalformedSidecar(_))
+        ));
+    }
+
+    #[test]
+    fn sidecar_unwrap_rejects_wrong_length_fields() {
+        #[derive(serde::Serialize)]
+        struct BadSidecar {
+            wrap_alg: u8,
+            #[serde(with = "serde_bytes")]
+            wrap_nonce: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            wrapped_data_key: Vec<u8>,
+        }
+        let bad = BadSidecar {
+            wrap_alg: sidecar::WRAP_ALG,
+            wrap_nonce: vec![0u8; 12], // wrong: must be 24.
+            wrapped_data_key: vec![0u8; 48],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&bad, &mut buf).unwrap();
+        assert!(matches!(
+            sidecar::unwrap_data_key(&buf, &SPACE_KEY_A),
+            Err(Error::MalformedSidecar(_))
+        ));
     }
 }

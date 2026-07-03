@@ -2,11 +2,17 @@
 //! (client side), `§8`.
 //!
 //! Wraps the official [`convex`] crate ([`convex::ConvexClient`]) and exposes the
-//! filething control-plane operations as typed Rust methods: device pairing
-//! ([`Coordinator::bootstrap`] / [`Coordinator::claim`]), Space creation and
-//! lookup, the Space-head compare-and-swap ([`Coordinator::commit_revision`],
-//! `§7`), revision lookup by seq, and the reactive head subscription
+//! filething control-plane operations as typed Rust methods: device/account
+//! resolution ([`Coordinator::ensure_device`], the authenticated get-or-create
+//! that replaced the MVP bootstrap/claim pairing), Space creation and lookup, the
+//! Space-head compare-and-swap ([`Coordinator::commit_revision`], `§7`), revision
+//! lookup by seq, and the reactive head subscription
 //! ([`Coordinator::subscribe_head`], the change feed of `§8`).
+//!
+//! Auth: every contract function is now authenticated (`ctx.auth`, a Convex-
+//! audience JWT minted by Better Auth). The caller attaches the JWT on the
+//! underlying [`convex::ConvexClient`] (`set_auth` / `set_auth_callback`) before
+//! building the [`Coordinator`]; this crate only shapes the typed calls.
 //!
 //! Only 32-byte pointers/hashes and tiny control scalars cross this boundary —
 //! never file bytes nor Manifests (`§1`, `§6.2`). [`Cid`]/[`Pcid`] and the
@@ -301,6 +307,24 @@ pub mod wire {
         }
     }
 
+    /// `v.union(v.bytes(), v.null())` (or an absent) field → `Option<[u8; 32]>`,
+    /// checking the 32-byte length. Used for the optional escrow `spaceKey`.
+    pub(super) fn as_opt_bytes32(
+        obj: &BTreeMap<String, Value>,
+        key: &'static str,
+        context: &'static str,
+    ) -> Result<Option<[u8; 32]>> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v @ Value::Bytes(_)) => Ok(Some(bytes32(v, key, context)?)),
+            Some(other) => Err(CoordinatorError::UnexpectedValue {
+                field: key,
+                context,
+                detail: format!("expected bytes or null, got {}", value_kind(other)),
+            }),
+        }
+    }
+
     /// Optional `u64` from a nullable number field.
     pub(super) fn as_opt_u64(
         obj: &BTreeMap<String, Value>,
@@ -332,27 +356,23 @@ pub mod wire {
 // Result / output types
 // ---------------------------------------------------------------------------
 
-/// Result of `auth:bootstrap` — the first Device of a fresh Account.
+/// Result of `auth:ensureDevice` — the authenticated get-or-create of the
+/// caller's Account (keyed by the JWT subject) and this Device (by name). Called
+/// at startup by every client; replaces the MVP bootstrap/claim pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapResult {
-    /// The freshly created Account.
+pub struct EnsureDeviceResult {
+    /// The caller's Account (created on first call for this identity).
     pub account_id: AccountId,
-    /// This (first) Device.
+    /// This Device (created on first call for this name).
     pub device_id: DeviceId,
-    /// A pairing code a second Device can `claim`.
-    pub pairing_code: String,
+    /// The AUTHORITATIVE per-Account escrow `dedup_secret` (`§4.4`). The client
+    /// sends a fresh candidate; the server returns the existing one when the
+    /// Account already had it, so every Device of the same user converges on the
+    /// same 32-byte secret.
+    pub dedup_secret: [u8; 32],
 }
 
-/// Result of `auth:claim` — a second Device joining an existing Account.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimResult {
-    /// The Account joined.
-    pub account_id: AccountId,
-    /// This (newly joined) Device.
-    pub device_id: DeviceId,
-}
-
-/// A `Space` document (`spaces:get` / `spaces:listByAccount`). `§6.2`.
+/// A `Space` document (`spaces:get` / `spaces:listMine`). `§6.2`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Space {
     /// The Space's own document id.
@@ -365,6 +385,11 @@ pub struct Space {
     pub head_revision_id: Option<RevisionId>,
     /// Pointer into the Vault to the Space metadata blob (chunk secret, …).
     pub meta_blob_cid: Cid,
+    /// The per-Space escrow `space_key` (`§4.5`): 32 bytes the client generated at
+    /// `create` and the Coordinator only hands back to the owning Account. `None`
+    /// for a legacy Space created before escrow existed — such a Space stays on
+    /// the cleartext (`alg=0`) path.
+    pub space_key: Option<[u8; 32]>,
 }
 
 /// A `Revision` document (`revisions:bySeq`). `§6.2`.
@@ -450,11 +475,10 @@ pub struct RetentionFloor {
 // ---------------------------------------------------------------------------
 
 mod func {
-    pub const AUTH_BOOTSTRAP: &str = "auth:bootstrap";
-    pub const AUTH_CLAIM: &str = "auth:claim";
+    pub const AUTH_ENSURE_DEVICE: &str = "auth:ensureDevice";
     pub const SPACES_CREATE: &str = "spaces:create";
     pub const SPACES_GET: &str = "spaces:get";
-    pub const SPACES_LIST_BY_ACCOUNT: &str = "spaces:listByAccount";
+    pub const SPACES_LIST_MINE: &str = "spaces:listMine";
     pub const SPACES_HEAD: &str = "spaces:head";
     pub const SPACES_REFRESH_RETENTION_FLOOR: &str = "spaces:refreshRetentionFloor";
     pub const REVISIONS_COMMIT: &str = "revisions:commit";
@@ -476,35 +500,27 @@ fn obj(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<Strin
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-fn bootstrap_args(device_name: &str) -> BTreeMap<String, Value> {
-    obj([("deviceName", Value::String(device_name.to_string()))])
-}
-
-fn claim_args(code: &str, device_name: &str) -> BTreeMap<String, Value> {
+fn ensure_device_args(device_name: &str, dedup_secret: &[u8; 32]) -> BTreeMap<String, Value> {
     obj([
-        ("code", Value::String(code.to_string())),
         ("deviceName", Value::String(device_name.to_string())),
+        ("dedupSecret", Value::Bytes(dedup_secret.to_vec())),
     ])
 }
 
 fn create_space_args(
-    account_id: &AccountId,
     name: &[u8],
     meta_blob_cid: &Cid,
+    space_key: &[u8; 32],
 ) -> BTreeMap<String, Value> {
     obj([
-        ("accountId", account_id.to_value()),
         ("name", Value::Bytes(name.to_vec())),
         ("metaBlobCid", wire::cid_to_value(meta_blob_cid)),
+        ("spaceKey", Value::Bytes(space_key.to_vec())),
     ])
 }
 
 fn get_space_args(space_id: &SpaceId) -> BTreeMap<String, Value> {
     obj([("spaceId", space_id.to_value())])
-}
-
-fn list_spaces_args(account_id: &AccountId) -> BTreeMap<String, Value> {
-    obj([("accountId", account_id.to_value())])
 }
 
 fn head_args(space_id: &SpaceId) -> BTreeMap<String, Value> {
@@ -567,10 +583,10 @@ fn refresh_retention_floor_args(space_id: &SpaceId) -> BTreeMap<String, Value> {
 // Response parsers (pure)
 // ---------------------------------------------------------------------------
 
-fn parse_bootstrap(v: &Value) -> Result<BootstrapResult> {
-    const CTX: &str = func::AUTH_BOOTSTRAP;
+fn parse_ensure_device(v: &Value) -> Result<EnsureDeviceResult> {
+    const CTX: &str = func::AUTH_ENSURE_DEVICE;
     let o = wire::as_object(v, CTX)?;
-    Ok(BootstrapResult {
+    Ok(EnsureDeviceResult {
         account_id: AccountId(wire::as_string(
             wire::field(o, "accountId", CTX)?,
             "accountId",
@@ -581,24 +597,7 @@ fn parse_bootstrap(v: &Value) -> Result<BootstrapResult> {
             "deviceId",
             CTX,
         )?),
-        pairing_code: wire::as_string(wire::field(o, "pairingCode", CTX)?, "pairingCode", CTX)?,
-    })
-}
-
-fn parse_claim(v: &Value) -> Result<ClaimResult> {
-    const CTX: &str = func::AUTH_CLAIM;
-    let o = wire::as_object(v, CTX)?;
-    Ok(ClaimResult {
-        account_id: AccountId(wire::as_string(
-            wire::field(o, "accountId", CTX)?,
-            "accountId",
-            CTX,
-        )?),
-        device_id: DeviceId(wire::as_string(
-            wire::field(o, "deviceId", CTX)?,
-            "deviceId",
-            CTX,
-        )?),
+        dedup_secret: wire::bytes32(wire::field(o, "dedupSecret", CTX)?, "dedupSecret", CTX)?,
     })
 }
 
@@ -635,11 +634,12 @@ fn parse_space(v: &Value) -> Result<Space> {
         },
         head_revision_id: wire::as_opt_string(o, "headRevisionId", CTX)?.map(RevisionId),
         meta_blob_cid: wire::value_to_cid(wire::field(o, "metaBlobCid", CTX)?, "metaBlobCid", CTX)?,
+        space_key: wire::as_opt_bytes32(o, "spaceKey", CTX)?,
     })
 }
 
 fn parse_space_list(v: &Value) -> Result<Vec<Space>> {
-    const CTX: &str = func::SPACES_LIST_BY_ACCOUNT;
+    const CTX: &str = func::SPACES_LIST_MINE;
     match v {
         Value::Array(items) => items.iter().map(parse_space).collect(),
         other => Err(CoordinatorError::UnexpectedValue {
@@ -842,42 +842,52 @@ impl Coordinator {
 
     // ----- auth -----
 
-    /// `auth:bootstrap` — create the first Account + Device and mint a pairing
-    /// code.
-    pub async fn bootstrap(&mut self, device_name: &str) -> Result<BootstrapResult> {
+    /// `auth:ensureDevice` — the authenticated get-or-create every client calls at
+    /// startup. Resolves the caller's identity (the JWT `sub`) to an Account
+    /// (creating it on first use) and this Device (by `device_name`), and returns
+    /// the authoritative escrow `dedup_secret`.
+    ///
+    /// The client ALWAYS generates a fresh 32-byte `dedup_secret` candidate and
+    /// passes it; the server keeps the first one an Account ever saw and returns
+    /// it, so every Device of the same user converges on the same secret.
+    /// Idempotent — a repeat call for a known (Account, name) returns the existing
+    /// rows. Replaces the MVP bootstrap/claim pairing.
+    pub async fn ensure_device(
+        &mut self,
+        device_name: &str,
+        dedup_secret_candidate: &[u8; 32],
+    ) -> Result<EnsureDeviceResult> {
         let v = self
-            .call_mutation(func::AUTH_BOOTSTRAP, bootstrap_args(device_name))
+            .call_mutation(
+                func::AUTH_ENSURE_DEVICE,
+                ensure_device_args(device_name, dedup_secret_candidate),
+            )
             .await?;
-        parse_bootstrap(&v)
-    }
-
-    /// `auth:claim` — join an existing Account with a pairing `code`.
-    pub async fn claim(&mut self, code: &str, device_name: &str) -> Result<ClaimResult> {
-        let v = self
-            .call_mutation(func::AUTH_CLAIM, claim_args(code, device_name))
-            .await?;
-        parse_claim(&v)
+        parse_ensure_device(&v)
     }
 
     // ----- spaces -----
 
-    /// `spaces:create` — create a Space (head starts `null`). Returns its id.
+    /// `spaces:create` — create a Space (head starts `null`). The owning Account
+    /// is derived from the caller's JWT (not an arg). `space_key` is the 32-byte
+    /// escrow key the CLIENT generates (`§4.5`); the Coordinator stores it and
+    /// hands it back only to the owning Account. Returns the new Space id.
     pub async fn create_space(
         &mut self,
-        account_id: &AccountId,
         name: &[u8],
         meta_blob_cid: &Cid,
+        space_key: &[u8; 32],
     ) -> Result<SpaceId> {
         let v = self
             .call_mutation(
                 func::SPACES_CREATE,
-                create_space_args(account_id, name, meta_blob_cid),
+                create_space_args(name, meta_blob_cid, space_key),
             )
             .await?;
         parse_space_id(&v)
     }
 
-    /// `spaces:get` — fetch a Space document.
+    /// `spaces:get` — fetch a Space document (including its escrow `space_key`).
     pub async fn get_space(&mut self, space_id: &SpaceId) -> Result<Space> {
         let v = self
             .call_query(func::SPACES_GET, get_space_args(space_id))
@@ -885,11 +895,10 @@ impl Coordinator {
         parse_space(&v)
     }
 
-    /// `spaces:listByAccount` — every Space of an Account.
-    pub async fn list_spaces(&mut self, account_id: &AccountId) -> Result<Vec<Space>> {
-        let v = self
-            .call_query(func::SPACES_LIST_BY_ACCOUNT, list_spaces_args(account_id))
-            .await?;
+    /// `spaces:listMine` — every Space owned by the authenticated caller's
+    /// Account (the owner is derived from the JWT, so no account arg).
+    pub async fn list_mine(&mut self) -> Result<Vec<Space>> {
+        let v = self.call_query(func::SPACES_LIST_MINE, obj([])).await?;
         parse_space_list(&v)
     }
 
@@ -1052,43 +1061,35 @@ mod tests {
     // ----- argument builders carry the exact contract keys -----
 
     #[test]
-    fn bootstrap_args_have_device_name() {
-        let args = bootstrap_args("laptop");
-        assert_eq!(args.keys().cloned().collect::<Vec<_>>(), vec!["deviceName"]);
-        assert_eq!(args["deviceName"], Value::String("laptop".into()));
-    }
-
-    #[test]
-    fn claim_args_have_code_and_device_name() {
-        let args = claim_args("ABCD-1234", "phone");
+    fn ensure_device_args_carry_name_and_dedup_secret() {
+        let dedup = [9u8; 32];
+        let args = ensure_device_args("laptop", &dedup);
         let keys: Vec<_> = args.keys().cloned().collect();
-        assert_eq!(keys, vec!["code", "deviceName"]);
-        assert_eq!(args["code"], Value::String("ABCD-1234".into()));
-        assert_eq!(args["deviceName"], Value::String("phone".into()));
+        assert_eq!(keys, vec!["dedupSecret", "deviceName"]); // BTreeMap orders keys
+        assert_eq!(args["deviceName"], Value::String("laptop".into()));
+        assert_eq!(args["dedupSecret"], Value::Bytes(vec![9u8; 32]));
     }
 
     #[test]
-    fn create_space_args_use_bytes_for_name_and_meta() {
-        let acct = AccountId::new("acc_1");
+    fn create_space_args_use_bytes_for_name_meta_and_key() {
         let name = "My Space".as_bytes();
         let meta = cid(3);
-        let args = create_space_args(&acct, name, &meta);
+        let key = [5u8; 32];
+        let args = create_space_args(name, &meta, &key);
         let keys: Vec<_> = args.keys().cloned().collect();
-        assert_eq!(keys, vec!["accountId", "metaBlobCid", "name"]); // BTreeMap orders keys
-        assert_eq!(args["accountId"], Value::String("acc_1".into()));
+        assert_eq!(keys, vec!["metaBlobCid", "name", "spaceKey"]); // BTreeMap orders keys
         assert_eq!(args["name"], Value::Bytes(name.to_vec()));
         assert_eq!(args["metaBlobCid"], Value::Bytes(vec![3u8; 32]));
+        assert_eq!(args["spaceKey"], Value::Bytes(vec![5u8; 32]));
+        // The owning Account is derived from the JWT server-side, never an arg.
+        assert!(!args.contains_key("accountId"));
     }
 
     #[test]
-    fn get_and_list_and_head_args() {
+    fn get_and_head_args() {
         assert_eq!(
             get_space_args(&SpaceId::new("sp_1"))["spaceId"],
             Value::String("sp_1".into())
-        );
-        assert_eq!(
-            list_spaces_args(&AccountId::new("acc_1"))["accountId"],
-            Value::String("acc_1".into())
         );
         assert_eq!(
             head_args(&SpaceId::new("sp_2"))["spaceId"],
@@ -1221,27 +1222,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_bootstrap_result() {
+    fn parse_ensure_device_result() {
         let v = objv([
             ("accountId", Value::String("acc_1".into())),
             ("deviceId", Value::String("dev_1".into())),
-            ("pairingCode", Value::String("WXYZ-9999".into())),
+            ("dedupSecret", Value::Bytes(vec![7u8; 32])),
         ]);
-        let r = parse_bootstrap(&v).unwrap();
+        let r = parse_ensure_device(&v).unwrap();
         assert_eq!(r.account_id, AccountId::new("acc_1"));
         assert_eq!(r.device_id, DeviceId::new("dev_1"));
-        assert_eq!(r.pairing_code, "WXYZ-9999");
+        assert_eq!(r.dedup_secret, [7u8; 32]);
     }
 
     #[test]
-    fn parse_claim_result() {
+    fn parse_ensure_device_rejects_wrong_dedup_len() {
         let v = objv([
-            ("accountId", Value::String("acc_2".into())),
-            ("deviceId", Value::String("dev_2".into())),
+            ("accountId", Value::String("acc_1".into())),
+            ("deviceId", Value::String("dev_1".into())),
+            ("dedupSecret", Value::Bytes(vec![7u8; 16])),
         ]);
-        let r = parse_claim(&v).unwrap();
-        assert_eq!(r.account_id, AccountId::new("acc_2"));
-        assert_eq!(r.device_id, DeviceId::new("dev_2"));
+        assert!(matches!(
+            parse_ensure_device(&v),
+            Err(CoordinatorError::InvalidIdLength { field, got, .. }) if field == "dedupSecret" && got == 16
+        ));
     }
 
     #[test]
@@ -1258,6 +1261,7 @@ mod tests {
             ("name", Value::Bytes("hello".as_bytes().to_vec())),
             ("headRevisionId", Value::String("rev_3".into())),
             ("metaBlobCid", Value::Bytes(vec![4u8; 32])),
+            ("spaceKey", Value::Bytes(vec![8u8; 32])),
         ]);
         let s = parse_space(&v).unwrap();
         assert_eq!(s.space_id, SpaceId::new("sp_1"));
@@ -1265,6 +1269,7 @@ mod tests {
         assert_eq!(s.name, b"hello".to_vec());
         assert_eq!(s.head_revision_id, Some(RevisionId::new("rev_3")));
         assert_eq!(s.meta_blob_cid, cid(4));
+        assert_eq!(s.space_key, Some([8u8; 32]));
     }
 
     #[test]
@@ -1275,9 +1280,25 @@ mod tests {
             ("name", Value::Bytes(vec![])),
             ("headRevisionId", Value::Null),
             ("metaBlobCid", Value::Bytes(vec![0u8; 32])),
+            ("spaceKey", Value::Bytes(vec![1u8; 32])),
         ]);
         let s = parse_space(&v).unwrap();
         assert_eq!(s.head_revision_id, None);
+    }
+
+    #[test]
+    fn parse_space_without_space_key_is_legacy_none() {
+        // A legacy Space created before escrow has no spaceKey field → None
+        // (the client leaves it on the cleartext alg=0 path).
+        let v = objv([
+            ("_id", Value::String("sp_1".into())),
+            ("accountId", Value::String("acc_1".into())),
+            ("name", Value::Bytes(vec![])),
+            ("headRevisionId", Value::Null),
+            ("metaBlobCid", Value::Bytes(vec![0u8; 32])),
+        ]);
+        let s = parse_space(&v).unwrap();
+        assert_eq!(s.space_key, None);
     }
 
     #[test]
@@ -1288,6 +1309,7 @@ mod tests {
             ("name", Value::Bytes(vec![1])),
             ("headRevisionId", Value::Null),
             ("metaBlobCid", Value::Bytes(vec![1u8; 32])),
+            ("spaceKey", Value::Bytes(vec![1u8; 32])),
         ]);
         let two = objv([
             ("_id", Value::String("sp_2".into())),
@@ -1295,6 +1317,7 @@ mod tests {
             ("name", Value::Bytes(vec![2])),
             ("headRevisionId", Value::String("rev_9".into())),
             ("metaBlobCid", Value::Bytes(vec![2u8; 32])),
+            ("spaceKey", Value::Bytes(vec![2u8; 32])),
         ]);
         let list = parse_space_list(&Value::Array(vec![one, two])).unwrap();
         assert_eq!(list.len(), 2);
@@ -1494,46 +1517,52 @@ mod tests {
     // network. Run it explicitly with the env wired up:
     //
     //   CONVEX_SELF_HOSTED_URL=http://localhost:3210 \
-    //   CONVEX_SELF_HOSTED_ADMIN_KEY=<admin-key> \
+    //   FILETHING_TEST_JWT=<a Convex-audience JWT from Better Auth> \
     //   cargo test -p ft-coordinator -- --ignored seq_args_are_accepted_by_live_backend
     //
-    // It exercises the exact path the bug breaks: a `v.number()` validator on
-    // `revisions:bySeq` and `devices:setBaseSeq` rejects `Value::Int64`. With
-    // the Float64 fix the round trip below must complete WITHOUT a function
-    // error.
+    // NOTE: since Fase 3 every contract function is authenticated (`ctx.auth`),
+    // so this needs a real USER JWT (minted by Better Auth), not the deployment
+    // admin key — `set_admin_auth` no longer yields a `getUserIdentity()` and
+    // `ensure_device` would reject with `unauthenticated`. Obtain a JWT the same
+    // way the CLI does (see `apps/cli` login) and pass it in `FILETHING_TEST_JWT`.
+    //
+    // It exercises the exact path the seq bug breaks: a `v.number()` validator on
+    // `revisions:bySeq` and `devices:setBaseSeq` rejects `Value::Int64`. With the
+    // Float64 fix the round trip below must complete WITHOUT a function error.
     #[tokio::test]
-    #[ignore = "requires a live self-hosted Convex backend (CONVEX_SELF_HOSTED_URL / _ADMIN_KEY)"]
+    #[ignore = "requires a live self-hosted Convex backend + a user JWT (FILETHING_TEST_JWT)"]
     async fn seq_args_are_accepted_by_live_backend() {
         let url = match std::env::var("CONVEX_SELF_HOSTED_URL") {
             Ok(u) => u,
             Err(_) => "http://localhost:3210".to_string(),
         };
-        let admin_key = std::env::var("CONVEX_SELF_HOSTED_ADMIN_KEY")
-            .expect("CONVEX_SELF_HOSTED_ADMIN_KEY must be set to run this test");
+        let jwt = std::env::var("FILETHING_TEST_JWT")
+            .expect("FILETHING_TEST_JWT (a Better Auth Convex-audience JWT) must be set");
 
-        // Connect as a deployment admin so the contract functions run.
+        // Connect and present the user JWT so the authenticated functions run.
         let mut client = ConvexClient::new(&url)
             .await
             .expect("connect to self-hosted Convex");
-        client.set_admin_auth(admin_key, None).await;
+        client.set_auth(Some(jwt)).await;
         let mut coord = Coordinator::from_client(client);
 
-        // bootstrap: first Account + Device.
-        let boot = coord
-            .bootstrap("it-device")
+        // ensureDevice: get-or-create this identity's Account + Device.
+        let ensured = coord
+            .ensure_device("it-device", &[1u8; 32])
             .await
-            .expect("bootstrap must succeed");
+            .expect("ensure_device must succeed");
 
-        // create_space: a fresh Space (head starts null).
+        // create_space: a fresh Space (head starts null). The client generates the
+        // escrow space_key; the owning Account is derived from the JWT.
         let meta = cid(1);
         let space_id = coord
-            .create_space(&boot.account_id, b"it-space", &meta)
+            .create_space(b"it-space", &meta, &[2u8; 32])
             .await
             .expect("create_space must succeed");
 
         // commit(base=None): the first Revision; the server assigns seq = 0.
         let ok = coord
-            .commit_revision(&space_id, None, &cid(2), &boot.device_id)
+            .commit_revision(&space_id, None, &cid(2), &ensured.device_id)
             .await
             .expect("first commit must succeed");
         assert_eq!(ok.seq, 0, "first Revision seq should be 0");
@@ -1550,7 +1579,7 @@ mod tests {
         // set_base_seq(0): the second call that sends a number arg under a
         // `v.number()` validator.
         coord
-            .set_base_seq(&boot.device_id, 0)
+            .set_base_seq(&ensured.device_id, 0)
             .await
             .expect("set_base_seq(0) must NOT return a server error");
     }

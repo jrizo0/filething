@@ -447,25 +447,29 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
 /// cargo test -p ft-engine --test scan_commit -- --ignored commit_against_live_backend
 /// ```
 #[tokio::test]
-#[ignore = "requires a live self-hosted Convex backend + an S3/MinIO or FsVault"]
+#[ignore = "requires a live self-hosted Convex backend + a user JWT (FILETHING_TEST_JWT) + an S3/MinIO or FsVault"]
 async fn commit_against_live_backend() {
     use convex::ConvexClient;
     use ft_engine::Coordinator;
 
     let url = std::env::var("CONVEX_SELF_HOSTED_URL")
         .unwrap_or_else(|_| "http://localhost:3210".to_string());
-    let admin_key = std::env::var("CONVEX_SELF_HOSTED_ADMIN_KEY")
-        .expect("CONVEX_SELF_HOSTED_ADMIN_KEY must be set to run this test");
+    // Fase 3: authenticated contract → present a real user JWT (Better Auth),
+    // not the deployment admin key. Obtain one the way the CLI does.
+    let jwt = std::env::var("FILETHING_TEST_JWT")
+        .expect("FILETHING_TEST_JWT (a Better Auth Convex-audience JWT) must be set");
 
-    // Connect as a deployment admin (same wiring as the ft-coordinator live test).
     let mut client = ConvexClient::new(&url)
         .await
         .expect("connect to self-hosted Convex");
-    client.set_admin_auth(admin_key, None).await;
+    client.set_auth(Some(jwt)).await;
     let mut coord = Coordinator::from_client(client);
 
-    // bootstrap: first Account + Device.
-    let boot = coord.bootstrap("it-engine").await.expect("bootstrap");
+    // ensureDevice: get-or-create this identity's Account + Device.
+    let ensured = coord
+        .ensure_device("it-engine", &[0x11; 32])
+        .await
+        .expect("ensure_device");
 
     // A toy dir with 2-3 files + an FsVault temp dir (no MinIO needed).
     let work = tempfile::tempdir().unwrap();
@@ -477,16 +481,23 @@ async fn commit_against_live_backend() {
     let index = Index::open_in_memory().unwrap();
     let vault: Box<dyn Vault> = Box::new(FsVault::new(work.path().join("vault")));
 
-    // init_space: writes the meta blob, create_space, persists state, first
-    // commit (seq 0).
+    // init_space: writes the meta blob, create_space (escrowing the space_key),
+    // persists state, attaches crypto, first commit (seq 0, `alg=1`).
+    let crypto = ft_core::SpaceCrypto {
+        dedup_secret: ensured.dedup_secret,
+        space_key: [0xAA; 32],
+        // `init_space` stamps the real id from `create_space`; placeholder here.
+        space_id: String::new(),
+    };
     let mut ctx = SpaceContext::init_space(
         index,
         vault,
         coord.clone(),
-        boot.account_id.clone(),
-        boot.device_id.clone(),
+        ensured.account_id.clone(),
+        ensured.device_id.clone(),
         b"it-engine-space",
         toy,
+        crypto,
     )
     .await
     .expect("init_space must succeed against the live backend");
@@ -540,4 +551,249 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
     }
     out.truncate(n);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Encryption (alg=1): scan encrypts + dedups, commit uploads the sidecars, and
+// the round trip yields the cleartext while the Vault never holds it (§4.4/§4.5).
+// ---------------------------------------------------------------------------
+
+/// The Space's runtime key material for the encryption tests. `space_id` scopes
+/// the `keys/<space_id>/<cid>` sidecars (`§4.5`) — it must match the Space the
+/// context is mounted for so commit and materialize agree on the sidecar key.
+fn test_crypto(space_id: &str) -> ft_core::SpaceCrypto {
+    ft_core::SpaceCrypto {
+        dedup_secret: [0x11; 32],
+        space_key: [0xAA; 32],
+        space_id: space_id.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn encrypted_stage_roundtrips_to_cleartext_and_vault_hides_the_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let secret_bytes: &[u8] = b"TOPSECRET-content-that-must-never-appear-in-the-vault-in-cleartext";
+    write_file(root, "docs/secret.txt", secret_bytes, false);
+
+    let vdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-enc";
+    seed_space_state(&index, space_id, root, [0x33; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(vdir.path()));
+    let mut ctx = mount_ctx(index, vault, space_id);
+    ctx.attach_crypto(test_crypto(space_id));
+
+    // Stage to the Vault (scan -> encrypted Blocks + sidecars + Manifest pages).
+    let staged = ctx.stage_to_vault().await.unwrap();
+    let entry = entry_for(&staged.scan.entries, "docs/secret.txt")
+        .expect("the file must be in the scan")
+        .clone();
+
+    // Materialize into a fresh dir with the SAME key material -> exact cleartext.
+    let out = tempfile::tempdir().unwrap();
+    let crypto = test_crypto(space_id);
+    ft_diff::materialize(
+        ctx.vault.as_ref(),
+        &LinuxFs,
+        out.path(),
+        &entry,
+        Some(&crypto),
+    )
+    .await
+    .unwrap();
+    let on_disk = std::fs::read(out.path().join("docs").join("secret.txt")).unwrap();
+    assert_eq!(
+        &on_disk[..],
+        secret_bytes,
+        "alg=1 must round-trip to the cleartext"
+    );
+
+    // Every Block is stored as ciphertext (no cleartext substring) and each one
+    // has its `keys/<cid>` sidecar uploaded alongside it.
+    for cid in &entry.bk {
+        let obj = ctx.vault.get(&ft_hash::block_key(cid)).await.unwrap();
+        assert!(
+            !obj.windows(9).any(|w| w == b"TOPSECRET"),
+            "the cleartext must not leak into the Vault object"
+        );
+        assert!(
+            ctx.vault
+                .head(&ft_diff::keys_key(space_id, cid))
+                .await
+                .unwrap(),
+            "each alg=1 Block must have its keys/<space_id>/<cid> sidecar in the Vault"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_spaces_of_one_account_each_keep_their_own_sidecar_for_a_shared_chunk() {
+    // Regression for the per-Space sidecar bug (§4.5). alg=1 derives the Block cid
+    // from the per-ACCOUNT dedup_secret, so two Spaces of one Account holding the
+    // same chunk share ONE `blocks/<cid>` object (account-wide dedup). But each
+    // Space wraps the data key with its OWN space_key, so each needs its own
+    // sidecar. When the sidecar object key had no Space component (`keys/<cid>`),
+    // the second Space's commit HEAD-skipped the already-present object and only
+    // the FIRST Space's wrap survived; materializing in the second Space then read
+    // the wrong sidecar and failed to unwrap (Error::Decrypt). Scoping the key by
+    // Space (`keys/<space_id>/<cid>`) gives each Space its own sidecar.
+    let work = tempfile::tempdir().unwrap();
+    // ONE shared vault dir across both Spaces = account-wide dedup.
+    let vault_dir = work.path().join("vault");
+    // A small file = a single chunk, so both Spaces derive the SAME chunk pcid
+    // (hence the same cid) despite their different per-Space chunk secrets.
+    let secret: &[u8] = b"a shared chunk that lives in two spaces";
+
+    // Space A — its own local dir, chunk secret, and space_key.
+    let dir_a = work.path().join("a");
+    write_file(&dir_a, "note.txt", secret, false);
+    let index_a = Index::open_in_memory().unwrap();
+    seed_space_state(&index_a, "space-a", &dir_a, [0x01; 32]);
+    let vault_a: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
+    let mut ctx_a = mount_ctx(index_a, vault_a, "space-a");
+    ctx_a.attach_crypto(ft_core::SpaceCrypto {
+        dedup_secret: [0x11; 32],
+        space_key: [0xA1; 32],
+        space_id: "space-a".to_string(),
+    });
+    let staged_a = ctx_a.stage_to_vault().await.unwrap();
+
+    // Space B — SAME account dedup_secret + SAME content, but a DIFFERENT chunk
+    // secret and DIFFERENT space_key, committing into the SAME vault so its Block
+    // object dedups against A's.
+    let dir_b = work.path().join("b");
+    write_file(&dir_b, "note.txt", secret, false);
+    let index_b = Index::open_in_memory().unwrap();
+    seed_space_state(&index_b, "space-b", &dir_b, [0x02; 32]);
+    let vault_b: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
+    let mut ctx_b = mount_ctx(index_b, vault_b, "space-b");
+    let crypto_b = ft_core::SpaceCrypto {
+        dedup_secret: [0x11; 32],
+        space_key: [0xB2; 32],
+        space_id: "space-b".to_string(),
+    };
+    ctx_b.attach_crypto(crypto_b.clone());
+    let staged_b = ctx_b.stage_to_vault().await.unwrap();
+
+    // Precondition: the two Spaces really do share the Block cid (account dedup).
+    // If chunking diverged this assert would fail rather than the test silently
+    // not exercising the bug.
+    let entry_a = entry_for(&staged_a.scan.entries, "note.txt").unwrap();
+    let entry_b = entry_for(&staged_b.scan.entries, "note.txt").unwrap();
+    assert_eq!(
+        entry_a.bk, entry_b.bk,
+        "same account + same content -> same block cid (shared object)"
+    );
+    let cid = entry_b.bk[0];
+
+    // Each Space has its OWN sidecar under its own `keys/<space_id>/` subtree.
+    assert!(
+        ctx_b
+            .vault
+            .head(&ft_diff::keys_key("space-a", &cid))
+            .await
+            .unwrap(),
+        "Space A's sidecar must exist under its own subtree"
+    );
+    assert!(
+        ctx_b
+            .vault
+            .head(&ft_diff::keys_key("space-b", &cid))
+            .await
+            .unwrap(),
+        "Space B's commit must have written its OWN sidecar, not HEAD-skipped A's"
+    );
+
+    // The crux: materialize the shared chunk in Space B with Space B's key. It
+    // reads `keys/space-b/<cid>` (wrapped with B's key) and succeeds; before the
+    // fix it read A's sidecar and failed to unwrap.
+    let out = tempfile::tempdir().unwrap();
+    ft_diff::materialize(
+        ctx_b.vault.as_ref(),
+        &LinuxFs,
+        out.path(),
+        entry_b,
+        Some(&crypto_b),
+    )
+    .await
+    .expect("Space B must unwrap its OWN sidecar and decrypt the shared chunk");
+    let on_disk = std::fs::read(out.path().join("note.txt")).unwrap();
+    assert_eq!(
+        &on_disk[..],
+        secret,
+        "the shared chunk must round-trip to cleartext in Space B"
+    );
+}
+
+#[test]
+fn encrypted_scan_dedups_identical_content_and_is_deterministic_across_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let content = b"identical bytes in two different files";
+    write_file(root, "a.bin", content, false);
+    write_file(root, "b.bin", content, false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dedup";
+    seed_space_state(&index, space_id, root, [0x44; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__v")));
+    let mut ctx = mount_ctx(index, vault, space_id);
+    ctx.attach_crypto(test_crypto(space_id));
+    let scan = ctx.scan().unwrap();
+
+    // Two identical files share the same block cids and dedup to ONE object.
+    let a = entry_for(&scan.entries, "a.bin").unwrap();
+    let b = entry_for(&scan.entries, "b.bin").unwrap();
+    assert_eq!(
+        a.bk, b.bk,
+        "identical content must share the same block cids"
+    );
+    assert_eq!(
+        scan.blocks_to_upload.len(),
+        1,
+        "encryption must not defeat dedup: one object for identical content"
+    );
+    assert_eq!(
+        scan.sidecars.len(),
+        1,
+        "one sidecar per unique encrypted block"
+    );
+
+    // A second Device (independent mount) with the SAME dedup secret + chunk
+    // secret derives the SAME addressing cid (cross-Device convergent encryption).
+    let index2 = Index::open_in_memory().unwrap();
+    seed_space_state(&index2, "space-dedup-2", root, [0x44; 32]);
+    let vault2: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__v2")));
+    let mut ctx2 = mount_ctx(index2, vault2, "space-dedup-2");
+    ctx2.attach_crypto(test_crypto("space-dedup-2"));
+    let scan2 = ctx2.scan().unwrap();
+    assert_eq!(
+        scan.blocks_to_upload[0].0, scan2.blocks_to_upload[0].0,
+        "same content + same dedup secret -> same cid on any Device"
+    );
+}
+
+#[test]
+fn scan_without_crypto_stays_cleartext_alg0() {
+    // Regression guard: with no key material the scan must produce cleartext
+    // (alg=0) objects and NO sidecars — the default path is untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "plain.txt", b"just cleartext", false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-plain";
+    seed_space_state(&index, space_id, root, [0x66; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vp")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let scan = ctx.scan().unwrap();
+    assert!(scan.sidecars.is_empty(), "no crypto -> no sidecars");
+    // The single Block object is a plain alg=0 object: its cid equals the
+    // cleartext pcid and it decodes without a key.
+    let (cid, obj) = &scan.blocks_to_upload[0];
+    assert_eq!(ft_block::cid_of_object(obj).unwrap(), *cid);
+    let (header, _payload) = ft_block::decode(obj).unwrap();
+    assert_eq!(header.alg, ft_core::ALG_CLEARTEXT);
 }

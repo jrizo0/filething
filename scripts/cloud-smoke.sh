@@ -19,7 +19,22 @@ FAILED=0
 ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; FAILED=1; }
 hr()  { echo; echo "==================== $* ===================="; }
-cleanup() { command rm -rf "$WORK"; }
+# Signup (Better Auth) está deshabilitado por defecto en el deployment (backend
+# hardening, Fase 3 Fix B: convex/betterAuth.ts disableSignUp) — solo se abre
+# con FILETHING_ALLOW_SIGNUP=1. Este smoke hace signup real (PASO 1), así que lo
+# abrimos aquí y lo devolvemos a como estaba al terminar (éxito o fallo).
+ALLOW_SIGNUP_TOUCHED=0
+ORIG_ALLOW_SIGNUP=""
+cleanup() {
+  if [ "$ALLOW_SIGNUP_TOUCHED" -eq 1 ]; then
+    if [ -n "$ORIG_ALLOW_SIGNUP" ]; then
+      ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP "$ORIG_ALLOW_SIGNUP" ) >/dev/null 2>&1
+    else
+      ( cd "$REPO/packages/backend" && bunx convex env remove FILETHING_ALLOW_SIGNUP ) >/dev/null 2>&1
+    fi
+  fi
+  command rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 # Dos Devices = dos FILETHING_HOME distintos sobre el mismo binario.
@@ -36,6 +51,17 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+: "${CONVEX_DEPLOY_KEY:?falta CONVEX_DEPLOY_KEY en $ENV_FILE (hace falta para abrir/cerrar signup)}"
+export CONVEX_DEPLOY_KEY
+
+hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
+ORIG_ALLOW_SIGNUP="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
+if ! ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ); then
+  echo "ERROR: no se pudo fijar FILETHING_ALLOW_SIGNUP=1 en el deployment (revisa CONVEX_DEPLOY_KEY)." >&2
+  exit 1
+fi
+ALLOW_SIGNUP_TOUCHED=1
+ok "signup habilitado para esta corrida (se revierte al terminar)"
 
 hr "BUILD — binario release (target/release/filething)"
 ( cd "$REPO" && cargo build --release -p filething )
@@ -43,14 +69,15 @@ hr "BUILD — binario release (target/release/filething)"
 
 mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 
-hr "PASO 1 — login A (bootstrap) + login B (claim por código)"
-OUT_A=$(a login --name device-a-cloud); echo "$OUT_A"
-# Anclado a "--code XXXX" (mismo criterio que scripts/demo-gates.sh): un grep suelto
-# de [A-Z0-9]{6,} podría capturar dígitos del account id impreso arriba.
-CODE=$(echo "$OUT_A" | sed -n 's/.*--code \([A-Z0-9]\{1,\}\).*/\1/p' | head -1)
-if [ -n "$CODE" ]; then ok "A generó pairing code ($CODE)"; else bad "A no imprimió pairing code"; echo "SMOKE FAIL"; exit 1; fi
-b login --code "$CODE" --name device-b-cloud; echo
-ok "B se emparejó con el código"
+hr "PASO 1 — login A (signup) + login B (mismo usuario, otro Device)"
+# Auth real (Better Auth): email único por corrida + password por env var. El
+# segundo Device es el MISMO usuario logueando en otro FILETHING_HOME (pairing
+# eliminado). CONVEX_SITE_URL se deriva de CONVEX_URL (*.convex.cloud →
+# *.convex.site) si no se fija en el .env.
+FT_EMAIL="${FILETHING_TEST_EMAIL:-smoke-$(date +%s)-$$@example.com}"
+export FILETHING_PASSWORD="${FILETHING_PASSWORD:?define FILETHING_PASSWORD en $ENV_FILE}"
+if a login --signup --email "$FT_EMAIL" --name device-a-cloud; then ok "A creó la cuenta ($FT_EMAIL)"; else bad "login --signup de A"; echo "SMOKE FAIL"; exit 1; fi
+if b login --email "$FT_EMAIL" --name device-b-cloud; then ok "B se logueó (mismo usuario, Device nuevo)"; else bad "login de B"; echo "SMOKE FAIL"; exit 1; fi
 
 hr "PASO 2 — A init (con archivo) + B clone => el archivo aparece en B"
 mkdir -p "$A_DIR/src"

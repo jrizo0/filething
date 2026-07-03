@@ -154,25 +154,101 @@ publicar el mismo schema/funciones. **Éxito** = el deploy termina sin error e i
 scripts/cloud-smoke.sh
 ```
 Construye el binario release y simula **dos Devices** (dos `FILETHING_HOME`) contra Convex
-Cloud + R2: `login` (pairing) → `init` con un archivo → `clone` en el segundo Device →
-edición + `sync`. Imprime `✓`/`✗` por chequeo. **Éxito** = todos los chequeos en `✓` y
-`SMOKE OK` al final. Que el `clone` traiga el archivo valida el commit, el change feed
-(WebSocket) y el round-trip por R2 contra la infra gestionada.
+Cloud + R2: `login --signup` con email+password (`FILETHING_PASSWORD`) → `init` con un archivo
+→ `login` del mismo usuario en el segundo Device + `clone` → edición + `sync`. Imprime `✓`/`✗`
+por chequeo. **Éxito** = todos los chequeos en `✓` y `SMOKE OK` al final. Que el `clone`
+traiga el archivo valida el commit, el change feed (WebSocket), el round-trip por R2 y el
+**descifrado cross-device** (`alg=1`) contra la infra gestionada.
 
-### 4.3 Caveat del deploy key (VERIFICAR EN VIVO)
-El cliente Rust usa la ruta `set_admin_auth(<deploy_key>)` del crate `convex`, que autentica
-sobre `wss://<name>.convex.cloud/api/sync`. Esa ruta **acepta** un deploy key, pero la API es
-`#[doc(hidden)]` / no documentada: **hay que verificarla empíricamente**. El smoke test del
-4.2 es esa verificación.
+> El signup está deshabilitado por defecto en el deployment (ver 4.3 más abajo). El script lo
+> habilita él mismo (`convex env set FILETHING_ALLOW_SIGNUP 1`) antes de correr y lo revierte
+> al terminar (éxito o fallo) — no hace falta tocar nada a mano para correr el smoke.
 
-- **Si el smoke pasa con `CONVEX_DEPLOY_KEY`**: listo, esa es la ruta buena para uso personal.
-- **Si falla en el `login`/conexión por culpa del deploy key**: las funciones de Convex son
-  **públicas por defecto** y el backend de filething **no tiene checks de `ctx.auth`**, así que
-  el cliente puede funcionar **sin credencial**. `connect_coordinator` (`apps/cli/src/env.rs`)
-  ya contempla ese caso: si no hay `CONVEX_DEPLOY_KEY` / `CONVEX_ADMIN_KEY` /
-  `CONVEX_SELF_HOSTED_ADMIN_KEY`, conecta **sin** `set_admin_auth` y solo emite un warning. Para
-  probar esta ruta, comenta `CONVEX_DEPLOY_KEY` en `infra/.env.cloud` y repite el smoke.
-  (Aceptable solo para uso personal, porque el backend no valida identidad — ver Riesgos.)
+### 4.3 Auth real (Fase 3): Better Auth en el deployment
+Desde la Fase 3 (ADR 0014) el cliente ya **no** usa el deploy key: cada Device hace
+`filething login --email <email>` (password por prompt o `FILETHING_PASSWORD`; `--signup` la
+primera vez), guarda su token de sesión en `credentials.json` (0600) y autentica el websocket
+con un JWT (`set_auth`). El deployment necesita dos env vars (una sola vez):
+```bash
+cd packages/backend
+bunx convex env set BETTER_AUTH_SECRET "$(openssl rand -base64 32)"
+bunx convex env set SITE_URL https://<name>.convex.site
+```
+Los endpoints HTTP de Better Auth viven en `https://<name>.convex.site` (Cloud) o en el
+puerto 3211 (self-hosted); el CLI deriva esa URL de `CONVEX_URL` automáticamente
+(`CONVEX_SITE_URL` la sobreescribe). El deploy key queda **solo** para `convex deploy` y como
+fallback de ops en el CLI cuando no hay sesión.
+
+**Signup cerrado por defecto**: `https://<name>.convex.site` es una URL pública — sin esto,
+cualquiera que la encuentre podría crear una cuenta en lo que es un deployment personal de un
+solo dueño. El signup (`POST /api/auth/sign-up/email`) está **deshabilitado** salvo que la
+variable `FILETHING_ALLOW_SIGNUP` valga `1`/`true` en el deployment. Para crear tu(s) cuenta(s)
+a mano (fuera del smoke, que ya se auto-gestiona esto — ver 4.2):
+```bash
+cd packages/backend
+bunx convex env set FILETHING_ALLOW_SIGNUP 1
+filething login --signup --email tu@email --name mi-primer-device
+bunx convex env remove FILETHING_ALLOW_SIGNUP   # vuelve a cerrarlo
+```
+Los Devices siguientes del mismo usuario usan `filething login --email ...` (sin `--signup`,
+sin necesidad de la variable).
+
+### 4.4 Upgrade desde Fase 2: reclamar Accounts/Spaces pre-existentes
+
+Si ya tenías Accounts/Spaces creados **antes** de este upgrade (era de pairing, `subject`
+opaco que no es un `sub` de Better Auth), quedan huérfanos tras pasar a auth real: el primer
+`filething login` del dueño crea una Account **nueva**, porque `ensureDevice` busca la Account
+por el `sub` del JWT de Better Auth, que nunca va a coincidir con el `subject` viejo. Sin este
+paso esas Spaces quedan **inalcanzables para siempre** (`requireOwnedSpace` nunca matchea la
+Account nueva contra la Space vieja).
+
+> ⚠️ **No corras `init`/`sync`/ningún otro comando con este Device entre los pasos 1 y 4.**
+> El paso 1 ya registra un Device en la Account nueva (`login` siempre llama a `ensureDevice`)
+> con un `dedup_secret` propio; si cifras contenido con él antes de reclamar la Account vieja,
+> ese secreto se descarta en el paso 3 y el contenido quedaría cifrado con una clave huérfana.
+
+1. Login normal del dueño (crea la Account nueva — y, con ella, un Device del mismo nombre que
+   probablemente ya existía en la Account vieja si reusas la misma máquina, ver más abajo):
+   ```bash
+   filething login --signup --email tu@email --name mi-device   # recuerda habilitar FILETHING_ALLOW_SIGNUP (4.3)
+   ```
+   Anota el `subject` (el `sub` del JWT) de esta Account nueva — visible en el dashboard de
+   Convex, tabla `accounts`.
+2. Encuentra el `subject` de la Account **vieja** (mismo dashboard/tabla — la que tiene las
+   Spaces que quieres recuperar).
+3. Corre la migración con el deploy key (root — trátalo como tal; puede reescribir cualquier
+   Account):
+   ```bash
+   cd packages/backend
+   bunx convex run migrations:claimAccount '{"oldSubject": "<subject-viejo>", "newSubject": "<sub-nuevo-de-better-auth>"}'
+   ```
+   Re-apunta el `subject` de la Account vieja al nuevo y borra la Account nueva creada en el
+   paso 1. Si esa Account nueva **ya tiene Spaces propios**, la migración se niega (fusión
+   ambigua de datos reales, no fusiona en silencio) — resuélvelo a mano antes de reintentar.
+   Los Devices de la Account nueva SÍ se mueven automáticamente a la Account vieja (conservando
+   su id, que es el que tu CLI local ya tiene cacheado en `config.json`); si un Device de la
+   Account nueva tiene el mismo nombre que uno ya existente en la vieja, se descarta la fila
+   vieja (solo pierde `baseSeqInUse`, que se recalcula solo — ver `spaces:refreshRetentionFloor`).
+   La respuesta de la mutation lista `reparentedDeviceIds`/`deletedDeviceIds` para que confirmes
+   qué pasó.
+4. **Re-loguea el MISMO Device del paso 1 (sin `--signup`)** para refrescar su estado local —
+   `config.json` todavía apunta a la Account nueva que el paso 3 borró, y `credentials.json`
+   todavía tiene el `dedup_secret` descartado:
+   ```bash
+   filething login --email tu@email --name mi-device
+   ```
+   `ensureDevice` ahora resuelve la Account vieja (ya reclamada) y su Device (ya reparentado);
+   si la Account vieja nunca tuvo `dedup_secret` (pairing-era, anterior al escrow) lo fija con
+   el candidato de esta llamada — a partir de aquí es el canónico para todos los Devices.
+5. Si alguna Space vieja no tiene `spaceKey` (pre-existe a esa columna), fíjala una única vez
+   (first-write-wins; falla si ya tiene una), impersonando al dueño ya reclamado:
+   ```bash
+   bunx convex run spaces:ensureSpaceKey \
+     '{"spaceId": "<space-id>", "spaceKey": {"$bytes": "<32-bytes-en-base64>"}}' \
+     --identity '{"subject": "<sub-nuevo-de-better-auth>"}'
+   ```
+6. Loguea los demás Devices normalmente (`filething login --email tu@email --name otro-device`)
+   — ya resuelven la Account correcta y comparten el `dedup_secret` fijado en el paso 4.
 
 ---
 
@@ -192,19 +268,22 @@ al mes en Convex). Para uso personal de unos pocos GB no deberías acercarte.
 
 ## Riesgos conocidos
 
-- **Deploy key por la ruta `#[doc(hidden)]`**: filething autentica al cliente con el deploy key
-  vía `set_admin_auth` sobre una API no documentada del crate `convex`. Puede romperse en una
-  actualización del crate; verifica siempre con el smoke test (4.2/4.3).
 - **El deploy key es un secreto ROOT**: da control total del deployment (puede impersonar a
-  cualquier usuario). Guárdalo como tal; `infra/.env.cloud` debe estar gitignoreado (Paso 3).
-- **Backend sin auth**: las funciones de Convex son públicas y el backend no valida `ctx.auth`.
-  Es **aceptable solo mientras todos los Devices sean tuyos**. Antes de terceros hace falta auth
-  real (Better Auth) — ver `TODO.md`, Fase B.
-- **Sin cifrado en runtime**: los bytes se guardan en R2 en claro (`alg=0`). Solo para uso
-  personal; el cifrado (`alg=1`) es un hueco reservado del formato, aún no construido.
+  cualquier usuario). Desde la Fase 3 solo hace falta para `convex deploy` (y como fallback de
+  ops del CLI); guárdalo como tal; `infra/.env.cloud` debe estar gitignoreado (Paso 3).
+- **JWT de ~15 min en el daemon**: el daemon re-mintea el JWT en cada (re)conexión del
+  websocket (`set_auth_callback`), pero una conexión muy estable >15 min no refresca
+  proactivamente; si aparecen errores de auth en daemons longevos, reiniciar el servicio los
+  resuelve (mejora futura: refresh proactivo).
+- **Escrow server-side**: Convex custodia `dedupSecret`/`spaceKey` (ADR 0015). El cifrado
+  `alg=1` protege los bytes en R2; **no** es zero-knowledge frente al Coordinator (diferido).
 - **GC = solo huérfanos (por ahora)**: `filething gc <dir>` hace mark-and-sweep account-wide
   con grace-period, **dry-run por defecto** (`--apply` para borrar). Retiene TODO el historial
   y solo borra objetos que ninguna Revision referencia (basura de commits abortados). La poda
   de historial (retention floor) está **diferida**: un floor sound por-Space necesita telemetría
   por-(device,space) que el escalar `baseSeqInUse` actual no da (ver `docs/adr/0012`). Revisa
   siempre el dry-run antes de `--apply`.
+- **Signup cerrado por defecto**: `convex.site` es una URL pública; el signup queda
+  deshabilitado salvo `FILETHING_ALLOW_SIGNUP=1` en el deployment (Paso 4.3). No hay rate
+  limiting ni verificación de email — es un candado binario, no protección contra abuso
+  mientras la variable esté puesta. Ábrela solo el tiempo que tardes en crear tu(s) cuenta(s).

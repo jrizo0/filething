@@ -20,11 +20,28 @@
 
 use std::path::{Path, PathBuf};
 
-use ft_core::{CasefoldKey, Cid, FileEntry};
+use ft_core::{CasefoldKey, Cid, FileEntry, SpaceCrypto};
 use ft_fsmap::OsFs;
 use ft_manifest::{decode_page, Page};
 use ft_vault::Vault;
 use thiserror::Error;
+
+/// Vault key for a Block's data-key sidecar:
+/// `"keys/<space_id>/<aa>/<cid_hex>"` — the same 2-char fan-out as
+/// `blocks/<aa>/<cid>`, but under a per-Space subtree of the `keys/` prefix
+/// (`§4.5`). The sidecar lives and dies with `blocks/<cid>` (ADR 0015): the
+/// download path reads it to unwrap the data key, the commit path writes it, and
+/// the GC treats it as an attachment of the Block.
+///
+/// Unlike the Block object, which is Account-scoped and deduped across Spaces,
+/// the sidecar is wrapped with a specific Space's `space_key`. Two Spaces of one
+/// Account that share a chunk therefore need one sidecar EACH — the `<space_id>`
+/// component keeps them from colliding on a single object key (which would leave
+/// the second Space unable to unwrap the first Space's sidecar).
+pub fn keys_key(space_id: &str, cid: &Cid) -> String {
+    let prefix = format!("keys/{space_id}");
+    ft_hash::fanout_key(&prefix, &ft_hash::hex_lower(cid.as_bytes()))
+}
 
 /// Errors produced while diffing or applying Manifest trees.
 #[derive(Debug, Error)]
@@ -66,6 +83,18 @@ pub enum Error {
         expected: Cid,
         /// The id the fetched bytes actually hash to.
         computed: Cid,
+    },
+
+    /// A Block object on the wire was encrypted (`alg=1`) but no
+    /// [`SpaceCrypto`] was supplied to `materialize`/`apply`, so its data key
+    /// cannot be unwrapped and the cleartext cannot be recovered. A typed error
+    /// (never a panic): the caller mounted the Space without its key material.
+    #[error(
+        "block {cid} is encrypted (alg=1) but no Space key material was provided to decrypt it"
+    )]
+    EncryptedBlockWithoutKey {
+        /// The addressing id of the encrypted Block that could not be decrypted.
+        cid: Cid,
     },
 
     /// Writing/removing a file or symlink through the [`OsFs`] adapter failed.
@@ -448,11 +477,19 @@ fn same_identity(a: &FileEntry, b: &FileEntry) -> bool {
 ///
 /// The on-disk path is `space_root` joined with the entry's canonical path; any
 /// missing parent directories are created first.
+///
+/// `crypto` carries the Space's key material when runtime encryption is ON:
+/// `alg=1` Block objects are decrypted with it (unwrapping each data key from its
+/// `keys/<space_id>/<cid>` sidecar, where the Space id also comes from `crypto`).
+/// It is `None` in the cleartext (`alg=0`) case — the
+/// default; an `alg=1` object then fails with [`Error::EncryptedBlockWithoutKey`]
+/// rather than panicking. An `alg=0` object never consults `crypto`.
 pub async fn materialize(
     vault: &dyn Vault,
     fs: &dyn OsFs,
     space_root: &Path,
     entry: &FileEntry,
+    crypto: Option<&SpaceCrypto>,
 ) -> Result<()> {
     let dest = join_canonical(space_root, entry);
 
@@ -481,10 +518,26 @@ pub async fn materialize(
             for cid in &bk {
                 let key = ft_hash::block_key(cid);
                 let obj = vault.get(&key).await?;
-                // Wire-integrity check: a corrupt object fails here (`§4.3`).
+                // Wire-integrity check: a corrupt object fails here (`§4.3`). It
+                // recomputes the addressing hash from the object's own bytes and
+                // works for BOTH algs with no key, so it also guarantees the
+                // header's `alg` is 0 or 1 before we branch on it below.
                 ft_block::verify(&obj, cid)?;
-                let (_header, payload) = ft_block::decode(&obj)?;
-                contents.extend_from_slice(&payload);
+                let (header, payload) = ft_block::decode(&obj)?;
+                if header.alg == ft_core::ALG_CLEARTEXT {
+                    // Cleartext (`alg=0`): the payload IS the content (`§4.3`).
+                    contents.extend_from_slice(&payload);
+                } else {
+                    // Encrypted (`alg=1`): unwrap this Block's data key from its
+                    // `keys/<space_id>/<cid>` sidecar with the Space key, then
+                    // AEAD-decrypt the object (`§4.4`/`§4.5`). No key material ⇒
+                    // typed error, never a panic.
+                    let crypto = crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
+                    let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
+                    let data_key = ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
+                    let cleartext = ft_block::decode_encrypted(&obj, &data_key)?;
+                    contents.extend_from_slice(&cleartext);
+                }
             }
 
             ensure_parent(fs, &dest)?;
@@ -594,16 +647,21 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 ///
 /// Removing an already-absent path is a no-op (a delete is idempotent), so a
 /// re-apply does not fail.
+///
+/// `crypto` is forwarded to [`materialize`] for every Added/Modified change so an
+/// `alg=1` Block can be decrypted; `None` keeps the cleartext path (see
+/// [`materialize`]).
 pub async fn apply(
     vault: &dyn Vault,
     fs: &dyn OsFs,
     space_root: &Path,
     changes: &[Change],
+    crypto: Option<&SpaceCrypto>,
 ) -> Result<()> {
     for change in changes {
         match change {
             Change::Added(entry) | Change::Modified { new: entry, .. } => {
-                materialize(vault, fs, space_root, entry).await?;
+                materialize(vault, fs, space_root, entry, crypto).await?;
             }
             Change::Deleted(entry) => {
                 let dest = join_canonical(space_root, entry);
@@ -924,7 +982,7 @@ mod tests {
         ];
         let (entry, content) = upload_multiblock_file(&vault, "dir/multi.bin", &chunks).await;
 
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
 
@@ -963,7 +1021,7 @@ mod tests {
             wu: None,
         };
 
-        let err = materialize(&vault, &fs, space_dir.path(), &entry)
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap_err();
         assert!(
@@ -1017,7 +1075,7 @@ mod tests {
             wu: None,
         };
 
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
         let on_disk = std::fs::read(space_dir.path().join("ext.bin")).unwrap();
@@ -1035,7 +1093,7 @@ mod tests {
             upload_multiblock_file(&vault, "run.sh", &[b"#!/bin/sh\n" as &[u8]]).await;
         entry.x = true;
 
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
         let meta = std::fs::symlink_metadata(space_dir.path().join("run.sh")).unwrap();
@@ -1060,7 +1118,7 @@ mod tests {
             lt: Some("../target/x.md".to_string()),
             wu: None,
         };
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
         let target = fs.read_symlink(&space_dir.path().join("link")).unwrap();
@@ -1085,7 +1143,7 @@ mod tests {
             lt: None,
             wu: None,
         };
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
         assert!(!space_dir
@@ -1136,7 +1194,7 @@ mod tests {
         assert!(changes.iter().all(|c| matches!(c, Change::Added(_))));
 
         // apply -> the files land on disk byte-identical.
-        apply(&vault, &fs, space_dir.path(), &changes)
+        apply(&vault, &fs, space_dir.path(), &changes, None)
             .await
             .unwrap();
         for (name, content) in &expected {
@@ -1159,7 +1217,7 @@ mod tests {
         // Put a file on disk, then apply a Deleted change for it.
         let (entry, _content) =
             upload_multiblock_file(&vault, "victim.txt", &[b"bye" as &[u8]]).await;
-        materialize(&vault, &fs, space_dir.path(), &entry)
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
         assert!(space_dir.path().join("victim.txt").exists());
@@ -1169,15 +1227,22 @@ mod tests {
             &fs,
             space_dir.path(),
             &[Change::Deleted(entry.clone())],
+            None,
         )
         .await
         .unwrap();
         assert!(!space_dir.path().join("victim.txt").exists());
 
         // Idempotent: deleting an already-absent path is a no-op.
-        apply(&vault, &fs, space_dir.path(), &[Change::Deleted(entry)])
-            .await
-            .unwrap();
+        apply(
+            &vault,
+            &fs,
+            space_dir.path(),
+            &[Change::Deleted(entry)],
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -1199,7 +1264,7 @@ mod tests {
         // Materialize the path as a regular file first.
         let (file_entry, _content) =
             upload_multiblock_file(&vault, "shifter", &[b"i was a file" as &[u8]]).await;
-        materialize(&vault, &fs, space_dir.path(), &file_entry)
+        materialize(&vault, &fs, space_dir.path(), &file_entry, None)
             .await
             .unwrap();
         let dest = space_dir.path().join("shifter");
@@ -1233,6 +1298,7 @@ mod tests {
                 },
                 Change::Added(sentinel),
             ],
+            None,
         )
         .await
         .unwrap();
@@ -1274,7 +1340,7 @@ mod tests {
             lt: Some("victim".to_string()),
             wu: None,
         };
-        materialize(&vault, &fs, space_dir.path(), &link_entry)
+        materialize(&vault, &fs, space_dir.path(), &link_entry, None)
             .await
             .unwrap();
         let dest = space_dir.path().join("shifter");
@@ -1295,6 +1361,7 @@ mod tests {
                 old: link_entry,
                 new: file_entry,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1373,7 +1440,7 @@ mod tests {
             wu: None,
         };
 
-        let err = materialize(&vault, &fs, space_dir.path(), &entry)
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap_err();
         assert!(
@@ -1483,5 +1550,141 @@ mod tests {
             .collect();
         // 3 entries changed (seed differs from their originals at these indices).
         assert!(keys.len() <= 3 && !keys.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Encryption (alg=1): materialize decrypts, mixes with alg=0, and refuses
+    // without key material (§4.4/§4.5).
+    // -----------------------------------------------------------------------
+
+    const DEDUP_SECRET: [u8; 32] = [0x11u8; 32];
+    const SPACE_KEY: [u8; 32] = [0xAAu8; 32];
+    const SPACE_ID: &str = "space-under-test";
+
+    fn crypto() -> SpaceCrypto {
+        SpaceCrypto {
+            dedup_secret: DEDUP_SECRET,
+            space_key: SPACE_KEY,
+            space_id: SPACE_ID.to_string(),
+        }
+    }
+
+    /// Encrypts `chunks` into `alg=1` Block objects, uploads each Block AND its
+    /// `keys/<space_id>/<cid>` sidecar to `vault`, and returns (entry, cleartext).
+    async fn upload_encrypted_file(
+        vault: &FsVault,
+        name: &str,
+        chunks: &[&[u8]],
+    ) -> (FileEntry, Vec<u8>) {
+        let mut bk = Vec::new();
+        let mut content = Vec::new();
+        for chunk in chunks {
+            let (cid, _pcid, obj, data_key) =
+                ft_block::encode_encrypted(chunk, &DEDUP_SECRET).unwrap();
+            vault.put(&ft_hash::block_key(&cid), obj).await.unwrap();
+            let sidecar = ft_block::sidecar::wrap_data_key(&data_key, &SPACE_KEY);
+            vault.put(&keys_key(SPACE_ID, &cid), sidecar).await.unwrap();
+            bk.push(cid);
+            content.extend_from_slice(chunk);
+        }
+        let entry = FileEntry {
+            p: CanonicalPath(name.to_string()),
+            t: FileType::File,
+            x: false,
+            sz: content.len() as u64,
+            pcid: ft_hash::pcid_of(&content),
+            bk,
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+        (entry, content)
+    }
+
+    #[tokio::test]
+    async fn materialize_decrypts_alg1_and_vault_never_holds_the_cleartext() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let chunks: Vec<&[u8]> = vec![b"SECRET-alpha-", b"SECRET-omega-", b"SECRET-tail!!"];
+        let (entry, content) = upload_encrypted_file(&vault, "secret.bin", &chunks).await;
+
+        // Materialize WITH key material -> the cleartext is reconstructed exactly.
+        let c = crypto();
+        materialize(&vault, &fs, space_dir.path(), &entry, Some(&c))
+            .await
+            .unwrap();
+        let on_disk = std::fs::read(space_dir.path().join("secret.bin")).unwrap();
+        assert_eq!(on_disk, content, "alg=1 must round-trip to the cleartext");
+
+        // The stored Block objects must NOT contain the cleartext bytes: what
+        // lives in the Vault is ciphertext, the plaintext only exists after decrypt.
+        for cid in &entry.bk {
+            let obj = vault.get(&ft_hash::block_key(cid)).await.unwrap();
+            assert!(
+                !contains_subslice(&obj, b"SECRET-"),
+                "the encrypted Vault object must not carry the cleartext"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_alg1_without_key_material_is_a_typed_error_not_a_panic() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (entry, _content) =
+            upload_encrypted_file(&vault, "secret.bin", &[b"needs a key"]).await;
+
+        // No SpaceCrypto -> a clean EncryptedBlockWithoutKey, and nothing written.
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::EncryptedBlockWithoutKey { .. }),
+            "alg=1 without key material must be a typed error, got {err:?}"
+        );
+        assert!(!space_dir.path().join("secret.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_resolves_a_space_mixing_alg0_and_alg1_blocks() {
+        // A Space with a preexisting cleartext (alg=0) file plus a new encrypted
+        // (alg=1) file: both must materialize when key material is present (§11,
+        // mixed vault is allowed forever).
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (plain_entry, plain) =
+            upload_multiblock_file(&vault, "plain.txt", &[b"i am cleartext" as &[u8]]).await;
+        let (enc_entry, enc) = upload_encrypted_file(&vault, "enc.bin", &[b"i am encrypted"]).await;
+
+        let c = crypto();
+        materialize(&vault, &fs, space_dir.path(), &plain_entry, Some(&c))
+            .await
+            .unwrap();
+        materialize(&vault, &fs, space_dir.path(), &enc_entry, Some(&c))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(space_dir.path().join("plain.txt")).unwrap(),
+            plain
+        );
+        assert_eq!(
+            std::fs::read(space_dir.path().join("enc.bin")).unwrap(),
+            enc
+        );
+    }
+
+    /// True if `haystack` contains `needle` as a contiguous subslice.
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

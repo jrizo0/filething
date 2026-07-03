@@ -30,9 +30,20 @@ tracing-subscriber = { workspace = true }
 # To read the single space_state row out of a Space's local index when resolving
 # a dir to its Space id (ft-index keys space_state by id, no "only row" getter).
 rusqlite = { workspace = true }
-# The CLI builds the Coordinator's ConvexClient itself so it can attach admin
-# auth (self-hosted MVP); the same pattern the engine's live tests use.
+# The CLI builds the Coordinator's ConvexClient itself so it can attach the
+# per-Device JWT (set_auth / set_auth_callback) before handing it to the
+# Coordinator; the admin path remains only as an ops fallback.
 convex = { workspace = true }
+# Real auth: the CLI talks to Better Auth over HTTP (signup / login / mint the
+# Convex-audience JWT). reqwest is async (fits the tokio CLI) and reuses the
+# native-tls stack already compiled for the Convex websocket.
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+# Parse the Convex deployment URL to derive the Better Auth site URL.
+url = "2"
+# CSPRNG for the per-Account dedup_secret + per-Space space_key candidates.
+rand = { workspace = true }
+# Hex-encode the 32-byte escrow secrets when persisting them (credentials.json).
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

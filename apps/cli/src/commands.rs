@@ -101,6 +101,15 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     let root = normalize_abs(&dir);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("creating Space dir {}", root.display()))?;
+    if let Some(existing) = env::existing_space_id_at(&root)? {
+        anyhow::bail!(
+            "{} is already a filething Space ({existing}) — `init` would register a \
+             second remote Space over the same folder and corrupt the local index. \
+             Use `filething sync` to sync it; to re-init from scratch (e.g. against \
+             a new backend), delete its .filething/ dir first.",
+            root.display()
+        );
+    }
 
     let space_name = name.unwrap_or_else(|| {
         root.file_name()
@@ -150,6 +159,13 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
     let (url, account_id, device_id) = require_identity(&config)?;
     let root = normalize_abs(&dir);
     let space_id = SpaceId::new(space_id);
+    if let Some(existing) = env::existing_space_id_at(&root)? {
+        anyhow::bail!(
+            "{} is already a filething Space ({existing}) — clone into a fresh folder, \
+             or delete its .filething/ dir first to re-materialize it.",
+            root.display()
+        );
+    }
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;

@@ -118,6 +118,27 @@ pub fn open_index(root: &Path) -> anyhow::Result<ft_index::Index> {
 /// folder is self-describing). Read via the index connection since ft-index keys
 /// `space_state` by id and exposes no "the only row" accessor.
 pub fn space_id_at(root: &Path) -> anyhow::Result<ft_engine::SpaceId> {
+    let id = existing_space_id_at(root)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not a filething Space (no {}/{}). Run `filething init` or `clone` first.",
+            root.display(),
+            CONTROL_DIR,
+            INDEX_FILE
+        )
+    })?;
+    Ok(id)
+}
+
+/// Like [`space_id_at`] but returns `None` (instead of erroring) when `root` is
+/// not a Space yet — no index file on disk, or an index with no `space_state`
+/// row. `init`/`clone` use it as a guard: initializing over an existing Space
+/// would create a second remote Space and a second `space_state` row in the same
+/// index, breaking the one-root ↔ one-Space invariant this module relies on.
+/// Checks the file first so probing does not create an empty control dir.
+pub fn existing_space_id_at(root: &Path) -> anyhow::Result<Option<ft_engine::SpaceId>> {
+    if !index_path(root).exists() {
+        return Ok(None);
+    }
     let index = open_index(root)?;
     let id: Option<String> = index
         .connection()
@@ -130,13 +151,5 @@ pub fn space_id_at(root: &Path) -> anyhow::Result<ft_engine::SpaceId> {
             other => Err(other),
         })
         .with_context(|| format!("reading space_state at {}", index_path(root).display()))?;
-    let id = id.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{} is not a filething Space (no {}/{}). Run `filething init` or `clone` first.",
-            root.display(),
-            CONTROL_DIR,
-            INDEX_FILE
-        )
-    })?;
-    Ok(ft_engine::SpaceId::new(id))
+    Ok(id.map(ft_engine::SpaceId::new))
 }

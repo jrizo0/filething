@@ -156,14 +156,17 @@ En MVP (cifrado OFF) el dedup es trivial: `cid == pcid`, se consulta la tabla de
 ### 4.5 Sidecar de data key envuelta (hueco de cifrado, OFF en MVP) [DECISIÓN]
 
 ```
-keys/<aa>/<cid_hex>     // objeto diminuto, MUTABLE bajo rotación, separado del Block inmutable
+keys/<space_id>/<aa>/<cid_hex>   // objeto diminuto, MUTABLE bajo rotación, separado del Block inmutable
 ```
 
 Contenido (CBOR canónico): `{ wrap_alg, wrap_nonce(24B), wrapped_data_key(48B = 32B ct + 16B tag) }`.
 
+- **La clave del objeto está scoped por Space** (`<space_id>`). El objeto `blocks/<cid>` es account-scoped y se deduplica entre Spaces (mismo `dedup_secret` + `pcid` ⇒ mismo `cid`), pero el sidecar se envuelve con la **Space key** de UN Space concreto. Dos Spaces de una misma Account que comparten un chunk necesitan por tanto **un sidecar cada uno**; el componente `<space_id>` evita que colisionen en una sola clave (lo que dejaría al segundo Space sin poder desenvolver el sidecar del primero). Ver el changelog al final de §4.5.
 - **No existe en el MVP** (cifrado OFF): no se escribe ningún objeto `keys/*`. El header del Block tiene `alg=0` y nadie consulta sidecars.
-- Al activar cifrado: por cada Block cifrado se escribe su sidecar. Rotar la Space key = reescribir solo los sidecars (objetos de ~88 B), sin tocar los objetos `blocks/*` ni sus `cid`.
+- Al activar cifrado: por cada Block cifrado se escribe su sidecar bajo el subárbol de su Space. Rotar la Space key = reescribir solo los sidecars de ese Space (objetos de ~88 B), sin tocar los objetos `blocks/*` ni sus `cid`.
 - Esto resuelve la contradicción inline-vs-sidecar que `mvp-minimal` (slot de 32 B insuficiente) y `convex-first` (auto-contradicción) tenían: el wrap NUNCA cupo ni debió ir en el header. El header de 64 B reserva `alg`/`nonce`/`flags` (lo que SÍ es función del contenido y entra en el `cid` vía nonce); el wrap (lo que cambia con la rotación) vive aparte. Trade-off notado: con cifrado on hay ~2× objetos (Block + sidecar), aceptable y aislado al futuro.
+
+> **Changelog (pre-deployment):** la clave del sidecar pasó de `keys/<aa>/<cid>` (sin componente de Space) a `keys/<space_id>/<aa>/<cid>`. El layout anterior colisionaba entre dos Spaces de una misma Account que compartían un chunk: el `blocks/<cid>` se deduplica pero cada sidecar se envuelve con la Space key de su Space, así que la única entrada `keys/<cid>` quedaba envuelta con la key del PRIMER Space y el segundo Space fallaba al desenvolver (Error::Decrypt) al clonar/materializar. `alg=1` aún no está desplegado en ningún entorno real, así que **no hace falta migración de datos**.
 
 ---
 
@@ -261,7 +264,7 @@ Como las páginas son content-addressed e inmutables, una Revision que cambia 5 
 blocks/<aa>/<cid>        // Block: header 64B + payload (§4)
 manifest/<aa>/<page_cid> // páginas hoja e index del B-tree de Manifest (§5.3)
 blocklist/<aa>/<cid>     // listas bk externalizadas de FileEntries enormes (§5.3, raro)
-keys/<aa>/<cid>          // sidecar de data key envuelta — NO existe en MVP (cifrado OFF, §4.5)
+keys/<space_id>/<aa>/<cid> // sidecar de data key envuelta, scoped por Space — NO existe en MVP (cifrado OFF, §4.5)
 reach/<manifestRoot>     // sidecar de alcanzabilidad para GC en zero-knowledge — NO en MVP (§6.3)
 ```
 
@@ -334,7 +337,7 @@ Un Device con base `B` (la Revision con la que sincronizó por última vez) y ca
 
 2. DEDUP: por cada Block nuevo consulta índice local + (caché) dedup[accountId,pcid];
    si falta, HEAD blocks/<aa>/<cid>; sube SOLO los ausentes -> PUT blocks/<aa>/<cid>.
-   Con cifrado, escribe también el sidecar keys/<aa>/<cid>. Verifica que cada PUT cerró OK.
+   Con cifrado, escribe también el sidecar keys/<space_id>/<aa>/<cid>. Verifica que cada PUT cerró OK.
 
 3. CONSTRUYE el nuevo Manifest: parte de las páginas de B (content-addressed, reusadas),
    reescribe solo las hojas tocadas + ancestros hasta la raíz (§5.4), externaliza bk enormes
@@ -463,7 +466,7 @@ Para leer el `pcid` del estado base, el Device usa la FileEntry del path en el M
 
 ## 11. Reservas explícitas y qué NO se construye en el MVP
 
-- **Cifrado en runtime (huecos cableados, OFF en MVP):** header de 64 B con `alg`/`nonce`/`flags`; `cid = BLAKE3(nonce||payload)` excluye la data key envuelta; sidecar `keys/<cid>` (no escrito en MVP); data key y nonce DETERMINISTAS por `pcid` (§4.4); wrap con la Space key para rotación barata. Activar cifrado: poner `alg=1`, derivar+cifrar, escribir sidecars. **No cambia layout de Block, naming del Vault, schema de Convex ni paginación de Manifest.** **Vault mixto permitido:** Blocks `alg=0` (claros, del MVP) y `alg=1` (cifrados) coexisten indefinidamente; se cifra solo lo nuevo, sin re-subir lo viejo (corrige la "migración implícita" que `restic-git` no documentaba).
+- **Cifrado en runtime (huecos cableados, OFF en MVP):** header de 64 B con `alg`/`nonce`/`flags`; `cid = BLAKE3(nonce||payload)` excluye la data key envuelta; sidecar `keys/<space_id>/<cid>` scoped por Space (no escrito en MVP); data key y nonce DETERMINISTAS por `pcid` (§4.4); wrap con la Space key para rotación barata. Activar cifrado: poner `alg=1`, derivar+cifrar, escribir sidecars. **No cambia layout de Block, naming del Vault, schema de Convex ni paginación de Manifest.** **Vault mixto permitido:** Blocks `alg=0` (claros, del MVP) y `alg=1` (cifrados) coexisten indefinidamente; se cifra solo lo nuevo, sin re-subir lo viejo (corrige la "migración implícita" que `restic-git` no documentaba).
 - **Zero-knowledge (futuro):** cifrar payloads de páginas `manifest/*` con la maquinaria del Block; publicar `reach/<manifestRoot>` para GC; `spaces.name` ya es `v.bytes()` para volverse ciphertext sin cambio de tipo; chunk secret ya tratado como blob opaco. Fuga residual de estructura/tamaños notada; modelo de confianza del sidecar `reach` reservado.
 - **GC / retención:** alcanzabilidad enumerable hoy; grace-period y retention floor reservados en el schema (§6.3). Política de retención y barredor físico: fuera del MVP.
 - **Packing de Blocks chicos:** reservado vía un `magic` distinto (p.ej. `FTP1`) y una capa de indirección `cid → (pack, offset, len)`; no cambia Manifest ni `cid` semánticamente, sí cómo se resuelve un GET. Fuera del MVP.
@@ -498,7 +501,7 @@ Para leer el `pcid` del estado base, el Device usa la FileEntry del path en el M
 
 1. **`cid = BLAKE3-256(nonce || payload)`** — excluye la data key envuelta para que rotar la Space key no renombre objetos.
 2. **data key y nonce DETERMINISTAS por `pcid`** derivados del **dedup secret por-Account** — habilita dedup cross-Device bajo cifrado; invierte el "data key aleatoria" de la memoria (escalado en §4.4).
-3. **data key envuelta en sidecar `keys/<cid>`**, no en el header — dimensionado correcto y rotación barata.
+3. **data key envuelta en sidecar `keys/<space_id>/<cid>`** (scoped por Space), no en el header — dimensionado correcto y rotación barata.
 4. **B-tree de Manifest con paginación determinista**: orden por `casefold(NFC(p))`, `LEAF_FANOUT=256`, `INDEX_FANOUT=256`, construcción bottom-up función pura, `bk` externalizado a `blocklist/<cid>` sobre `ENTRY_INLINE_MAX=256 KiB`.
 5. **Colisión por NFC tratada como conflicto**; NFC aplica solo a la key del Manifest, no al contenido ni al target de symlink.
 6. **Safety de GC reservada en el protocolo**: grace-period por antigüedad + `retentionFloorSeq = min(devices.baseSeqInUse)`.

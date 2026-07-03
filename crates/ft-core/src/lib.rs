@@ -406,9 +406,14 @@ pub struct FileEntry {
 ///   per-content data key and nonce (`ft_hash::data_key` / `ft_hash::nonce`,
 ///   `§4.4`), so the same cleartext in the same Account always encrypts to the
 ///   same `cid` — the property cross-Device dedup relies on under encryption.
-/// - `space_key` wraps/unwraps each Block's data key in its `keys/<aa>/<cid>`
-///   sidecar (`§4.5`), so rotating it re-wraps the ~88-byte sidecars without
-///   touching the immutable Block objects.
+/// - `space_key` wraps/unwraps each Block's data key in its
+///   `keys/<space_id>/<aa>/<cid>` sidecar (`§4.5`), so rotating it re-wraps the
+///   ~88-byte sidecars without touching the immutable Block objects.
+/// - `space_id` scopes the sidecar OBJECT KEY to this Space. The Block object
+///   (`blocks/<cid>`) is Account-scoped and deduped across Spaces, but the
+///   sidecar is wrapped with THIS Space's `space_key`, so two Spaces of one
+///   Account sharing a chunk each need their own sidecar — hence the Space
+///   component in the key (`§4.5`).
 ///
 /// This type carries only the raw secrets; it deliberately has NO serde impl —
 /// the escrow/keyring that supplies it lives outside this crate. Its [`Debug`]
@@ -419,6 +424,9 @@ pub struct SpaceCrypto {
     pub dedup_secret: [u8; 32],
     /// Per-Space key wrapping the sidecar data keys (`§4.5`). Never logged.
     pub space_key: [u8; 32],
+    /// Id of the Space this key material belongs to; scopes the sidecar object
+    /// key `keys/<space_id>/<aa>/<cid>` (`§4.5`). Not a secret.
+    pub space_id: String,
 }
 
 impl fmt::Debug for SpaceCrypto {
@@ -428,6 +436,7 @@ impl fmt::Debug for SpaceCrypto {
         f.debug_struct("SpaceCrypto")
             .field("dedup_secret", &"<redacted>")
             .field("space_key", &"<redacted>")
+            .field("space_id", &self.space_id)
             .finish()
     }
 }

@@ -5,7 +5,7 @@
 //! by its payload. This crate encodes/decodes that object, computes the
 //! addressing [`Cid`], and verifies wire integrity by recomputing the hash and
 //! comparing it against an expected `cid`. It also implements the `alg=1`
-//! (XChaCha20-Poly1305) runtime encryption path and its `keys/<aa>/<cid>`
+//! (XChaCha20-Poly1305) runtime encryption path and its `keys/<space_id>/<aa>/<cid>`
 //! sidecar codec ([`sidecar`]).
 //!
 //! ## Cleartext (`alg=0`)
@@ -40,7 +40,7 @@
 //! from the object's own bytes with NO key required — only [`decode_encrypted`]
 //! (which actually recovers the cleartext) needs the `data_key`. The wrapped
 //! data key itself never lives in the Block object; it lives in a
-//! `keys/<aa>/<cid>` sidecar (`§4.5`), encoded/decoded by [`sidecar`].
+//! `keys/<space_id>/<aa>/<cid>` sidecar (`§4.5`), encoded/decoded by [`sidecar`].
 //!
 //! [`cid_of_object`] / [`verify`] return [`Error::UnsupportedAlg`] for any `alg`
 //! other than `0` or `1` — a third algorithm is not a format this crate knows.
@@ -117,7 +117,7 @@ pub enum Error {
     #[error("AEAD decryption failed: wrong key or tampered data")]
     Decrypt,
 
-    /// A `keys/<aa>/<cid>` sidecar's CBOR payload failed to decode, or decoded
+    /// A `keys/<space_id>/<aa>/<cid>` sidecar's CBOR payload failed to decode, or decoded
     /// to a `wrap_nonce`/`wrapped_data_key` of the wrong length.
     #[error("malformed sidecar: {0}")]
     MalformedSidecar(String),
@@ -246,7 +246,7 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 /// associated data, then `cid = cid_for_encrypted(nonce, ciphertext)`.
 ///
 /// Returns `(cid, pcid, object_bytes, data_key)`. The caller is responsible for
-/// wrapping `data_key` into a `keys/<aa>/<cid>` sidecar ([`sidecar::wrap_data_key`])
+/// wrapping `data_key` into a `keys/<space_id>/<aa>/<cid>` sidecar ([`sidecar::wrap_data_key`])
 /// before/alongside uploading `object_bytes` — this function does not touch the
 /// sidecar.
 pub fn encode_encrypted(
@@ -293,7 +293,7 @@ pub fn encode_encrypted(
 /// surface as [`Error::Decrypt`] (AEAD does not distinguish these — that is the
 /// point: it authenticates the header without revealing which part failed).
 ///
-/// The caller obtains `data_key` by unwrapping the object's `keys/<aa>/<cid>`
+/// The caller obtains `data_key` by unwrapping the object's `keys/<space_id>/<aa>/<cid>`
 /// sidecar ([`sidecar::unwrap_data_key`]) with the Space key.
 pub fn decode_encrypted(obj: &[u8], data_key: &[u8; 32]) -> Result<Vec<u8>> {
     let (header, ciphertext) = decode(obj)?;
@@ -320,7 +320,7 @@ pub fn decode_encrypted(obj: &[u8], data_key: &[u8; 32]) -> Result<Vec<u8>> {
 // Sidecar: wrapped data key (docs/format.md §4.5)
 // ---------------------------------------------------------------------------
 
-/// Codec for the `keys/<aa>/<cid>` sidecar: the Block's data key, wrapped with
+/// Codec for the `keys/<space_id>/<aa>/<cid>` sidecar: the Block's data key, wrapped with
 /// the Space key so rotating the Space key re-wraps (~88-byte objects) without
 /// touching the (immutable) Block object or its `cid` (`docs/format.md §4.5`,
 /// ADR-0004).
@@ -391,7 +391,7 @@ pub mod sidecar {
         buf
     }
 
-    /// Unwraps a `keys/<aa>/<cid>` sidecar's `data_key` using `space_key`.
+    /// Unwraps a `keys/<space_id>/<aa>/<cid>` sidecar's `data_key` using `space_key`.
     ///
     /// Rejects a `wrap_alg` other than [`WRAP_ALG`], a malformed CBOR payload, or
     /// a `wrap_nonce`/`wrapped_data_key` of the wrong length before touching the

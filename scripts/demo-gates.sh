@@ -26,6 +26,25 @@ b() { FILETHING_HOME="$B_HOME" "$BIN" "$@"; }
 hr() { echo; echo "==================== $* ===================="; }
 fail() { echo "GATE FAIL: $*"; exit 1; }
 
+# Un único cleanup para todo el script (los daemons de los gates e/f también
+# viven aquí — un segundo `trap ... EXIT` más abajo pisaría este). Revierte
+# FILETHING_ALLOW_SIGNUP (ver PRECHEQUEO) y mata cualquier daemon lanzado.
+DA_PID=""; DB_PID=""
+ALLOW_SIGNUP_TOUCHED=0
+ORIG_ALLOW_SIGNUP=""
+cleanup() {
+    [ -n "$DA_PID" ] && kill "$DA_PID" >/dev/null 2>&1
+    [ -n "$DB_PID" ] && kill "$DB_PID" >/dev/null 2>&1
+    if [ "$ALLOW_SIGNUP_TOUCHED" -eq 1 ]; then
+        if [ -n "$ORIG_ALLOW_SIGNUP" ]; then
+            ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP "$ORIG_ALLOW_SIGNUP" ) >/dev/null 2>&1
+        else
+            ( cd "$REPO/packages/backend" && bunx convex env remove FILETHING_ALLOW_SIGNUP ) >/dev/null 2>&1
+        fi
+    fi
+}
+trap cleanup EXIT
+
 rm -rf "$WORK"; mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 
 # Auth real (Better Auth): un email único por corrida (para poder repetir el gate
@@ -33,6 +52,15 @@ rm -rf "$WORK"; mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 # Device es el MISMO usuario logueando en otro FILETHING_HOME (ya no hay pairing).
 FT_EMAIL="${FILETHING_TEST_EMAIL:-demo-$(date +%s)-$$@example.com}"
 export FILETHING_PASSWORD="${FILETHING_PASSWORD:-test-password-12345}"
+
+hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
+# Signup (Better Auth) está deshabilitado por defecto en el backend (Fase 3 Fix
+# B: convex/betterAuth.ts disableSignUp) — este gate hace signup real (abajo),
+# así que lo abrimos en el backend self-hosted de ESTE arbol y lo revertimos
+# al terminar (via el trap `cleanup`, éxito o fallo).
+ORIG_ALLOW_SIGNUP="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
+( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ) || fail "no se pudo fijar FILETHING_ALLOW_SIGNUP=1 (revisa CONVEX_SELF_HOSTED_ADMIN_KEY en $ENV_FILE)"
+ALLOW_SIGNUP_TOUCHED=1
 
 hr "SETUP — login A (signup) + login B (mismo usuario, otro Device)"
 a login --signup --email "$FT_EMAIL" --name device-a || fail "login --signup de A"
@@ -130,18 +158,10 @@ DWORK=/tmp/ft-demo-daemons
 DA_HOME="$DWORK/devA-home"; DB_HOME="$DWORK/devB-home"
 DA_DIR="$DWORK/dirA";       DB_DIR="$DWORK/dirB"
 DA_LOG="$DWORK/daemon-a.log"; DB_LOG="$DWORK/daemon-b.log"
-DA_PID=""; DB_PID=""
+# DA_PID/DB_PID ya declarados arriba (los usa el `cleanup` de todo el script).
 
 da() { FILETHING_HOME="$DA_HOME" "$BIN" "$@"; }
 db() { FILETHING_HOME="$DB_HOME" "$BIN" "$@"; }
-
-# Mata cualquier daemon que hayamos lanzado, por PID guardado. Se llama en las
-# salidas normal y en fail() via trap.
-cleanup_daemons() {
-    [ -n "$DA_PID" ] && kill "$DA_PID" >/dev/null 2>&1
-    [ -n "$DB_PID" ] && kill "$DB_PID" >/dev/null 2>&1
-}
-trap cleanup_daemons EXIT
 
 # Sondea hasta ~$2 segundos (por defecto 30) a que el comando $1 sea verdadero.
 wait_for() {
@@ -229,8 +249,8 @@ wait_for "(f) A refleja el borrado offline de seed.txt" 30 \
     || fail "(f) A todavia tiene seed.txt (startup_sync no comprometio el borrado offline)"
 echo "OK (f): A ya no tiene seed.txt (borrado offline propagado)"
 
-cleanup_daemons
-DA_PID=""; DB_PID=""
+# El `trap cleanup EXIT` de arriba mata A/B y revierte FILETHING_ALLOW_SIGNUP
+# al salir del script — no hace falta repetirlo aquí.
 
 hr "RESULTADO FINAL"
 echo "Gates a, b, c, d, e, f: PASARON via la CLI real contra Convex+MinIO."

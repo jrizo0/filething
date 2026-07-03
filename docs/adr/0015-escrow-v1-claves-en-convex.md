@@ -19,9 +19,13 @@ Reglas operativas:
 
 - Cuentas/Spaces creados antes de la Fase 3 no tienen claves: sus Blocks siguen `alg=0` y el
   Vault mixto está permitido indefinidamente (format.md §11). Con claves presentes, los
-  commits nuevos escriben `alg=1` + sidecar `keys/<aa>/<cid>`.
-- El GC trata el sidecar `keys/<cid>` como adjunto al Block `blocks/<cid>`: vive y muere con
-  él (mismo mark-and-sweep, ADR 0012).
+  commits nuevos escriben `alg=1` + sidecar `keys/<space_id>/<aa>/<cid>` (la clave del sidecar
+  está scoped por Space: el `blocks/<cid>` se deduplica entre Spaces de la Account pero cada
+  sidecar se envuelve con la Space key de su Space, así que cada Space guarda el suyo; ver
+  format.md §4.5).
+- El GC trata el sidecar `keys/<space_id>/<cid>` como adjunto al Block `blocks/<cid>`: vive y
+  muere con él (mismo mark-and-sweep, ADR 0012), marcando el sidecar de cada Space desde los
+  Manifests de ESE Space.
 - Rotación de Space key = re-wrap de sidecars (mutables por diseño, ADR 0004); fuera del
   alcance de esta fase.
 

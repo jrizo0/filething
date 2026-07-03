@@ -68,7 +68,7 @@ pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow:
         session_token: session_token.clone(),
         dedup_secret_hex: String::new(),
     };
-    let mut coordinator = env::connect(&url, Some(&session_only), false).await?;
+    let mut coordinator = env::connect(&url, Some(&session_only)).await?;
 
     // (3) ensureDevice: get-or-create Account + Device; the server returns the
     // authoritative dedup_secret (ours if the Account is new, the existing one
@@ -184,7 +184,7 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let coordinator = env::connect(&url, Some(&creds), false).await?;
+    let coordinator = env::connect(&url, Some(&creds)).await?;
 
     // Generate this Space's escrow key and turn on `alg=1`: `init_space` sends the
     // key to `spaces:create` and encrypts the first Revision. `dedup_secret` is
@@ -193,6 +193,9 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     let crypto = SpaceCrypto {
         dedup_secret: creds.dedup_secret()?,
         space_key,
+        // `init_space` stamps the real id once the Coordinator assigns it (it is
+        // not known before `create_space`), so a placeholder is correct here.
+        space_id: String::new(),
     };
 
     let ctx = SpaceContext::init_space(
@@ -248,7 +251,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, Some(&creds), false).await?;
+    let mut coordinator = env::connect(&url, Some(&creds)).await?;
 
     // Cache the Space's escrow key locally (0600) before materializing, so later
     // commands open it offline. `clone_space` uses it + dedup_secret to decrypt
@@ -327,7 +330,7 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     // Attach crypto from the LOCAL cache so the scanned Manifest root matches the
     // committed `alg=1` base (the block cids — and hence the root — differ under
     // encryption; without the key status would always report false local changes).
-    if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+    if let Some(crypto) = env::load_space_crypto(&root, &space_id, creds.as_ref())? {
         ctx.attach_crypto(crypto);
     }
 
@@ -352,7 +355,7 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Best-effort remote head check (does not fail status if the Coordinator is
     // unreachable — status must work offline).
-    match env::connect(&url, creds.as_ref(), false).await {
+    match env::connect(&url, creds.as_ref()).await {
         Ok(mut coordinator) => match coordinator.get_space(&space_id).await {
             Ok(space) => match space.head_revision_id {
                 Some(head) => {
@@ -417,14 +420,25 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
 
     let index = env::open_index(&root)?;
     let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, creds.as_ref(), false).await?;
+    let mut coordinator = env::connect(&url, creds.as_ref()).await?;
     // Recover the escrow key into the cache if it is missing, so encryption is
     // attached correctly below (a commit on an `alg=1` Space MUST encrypt).
-    env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
+    let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
 
-    let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
-        .context("opening Space")?;
-    if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+    let mut ctx = SpaceContext::open(
+        index,
+        vault,
+        coordinator,
+        account_id,
+        device_id,
+        space_id.clone(),
+    )
+    .context("opening Space")?;
+    let crypto = env::load_space_crypto(&root, &space_id, creds.as_ref())?;
+    // Refuse to commit an encrypted Space in cleartext if crypto could not be
+    // attached (Fix A: e.g. a deploy-key ops fallback with no Device session).
+    env::assert_crypto_matches_escrow(&space_id, escrow_key, crypto.as_ref())?;
+    if let Some(crypto) = crypto {
         ctx.attach_crypto(crypto);
     }
 
@@ -475,10 +489,10 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         let space_id = env::space_id_at(&root)?;
         let index = env::open_index(&root)?;
         let vault = env::build_vault().await?;
-        // Long-running: the JWT is re-minted on every reconnect (set_auth_callback)
-        // so the daemon outlives the ~15-min token expiry.
-        let mut coordinator = env::connect(&url, creds.as_ref(), true).await?;
-        env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
+        // The JWT is re-minted on every connect and reconnect (set_auth_callback,
+        // see env::connect) so the daemon outlives the ~15-min token expiry.
+        let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+        let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
         let mut ctx = SpaceContext::open(
             index,
             vault,
@@ -488,7 +502,9 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
             space_id.clone(),
         )
         .with_context(|| format!("opening Space at {}", root.display()))?;
-        if let Some(crypto) = env::load_space_crypto(&root, creds.as_ref())? {
+        let crypto = env::load_space_crypto(&root, &space_id, creds.as_ref())?;
+        env::assert_crypto_matches_escrow(&space_id, escrow_key, crypto.as_ref())?;
+        if let Some(crypto) = crypto {
             ctx.attach_crypto(crypto);
         }
         tracing::info!(space = %space_id, root = %root.display(), "mounted Space for daemon");
@@ -524,7 +540,7 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     let vault = env::build_vault().await?;
     // GC walks cleartext Manifests + meta blobs and deletes Vault objects (sidecars
     // included); it never decrypts Block content, so no crypto is attached here.
-    let coordinator = env::connect(&url, creds.as_ref(), false).await?;
+    let coordinator = env::connect(&url, creds.as_ref()).await?;
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
         .context("opening Space")?;
 

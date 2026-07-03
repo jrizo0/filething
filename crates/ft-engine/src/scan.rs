@@ -71,7 +71,7 @@ fn is_junk_name(name: &std::ffi::OsStr) -> bool {
 /// `blocks_to_upload` is the de-duplicated `(cid, encoded_object)` list for the
 /// commit's upload step (`§7` step 2) — within a single scan the same `cid`
 /// appears once. `sidecars` is the PARALLEL de-duplicated `(cid, wrapped_data_key)`
-/// list when encryption is ON (`alg=1`): each entry is the `keys/<cid>` sidecar
+/// list when encryption is ON (`alg=1`): each entry is the `keys/<space_id>/<cid>` sidecar
 /// for the Block of the same `cid`, to be uploaded alongside it (`§4.5`). It is
 /// EMPTY when encryption is off (`alg=0`), so the cleartext path is unchanged.
 #[derive(Debug, Clone, Default)]
@@ -82,7 +82,7 @@ pub struct ScanResult {
     /// object is `ft_block::encode(span)` (`alg=0`) or the encrypted object from
     /// `ft_block::encode_encrypted` (`alg=1`).
     pub blocks_to_upload: Vec<(Cid, Vec<u8>)>,
-    /// Unique `keys/<cid>` data-key sidecars for the `alg=1` Blocks above, keyed
+    /// Unique `keys/<space_id>/<cid>` data-key sidecars for the `alg=1` Blocks above, keyed
     /// by the same `cid`. Empty when encryption is off.
     pub sidecars: Vec<(Cid, Vec<u8>)>,
 }
@@ -287,7 +287,7 @@ impl SpaceContext {
             // is the cleartext payload, no sidecar. Encryption ON (`alg=1`): the
             // cid is `BLAKE3(nonce || ciphertext)` and DIVERGES from the cleartext
             // pcid — `bk`/the Manifest address by `cid`, the local index/dedup key
-            // by `pcid`; the wrapped data key becomes the `keys/<cid>` sidecar.
+            // by `pcid`; the wrapped data key becomes the `keys/<space_id>/<cid>` sidecar.
             let (cid, pcid, obj, sidecar): (Cid, Pcid, Vec<u8>, Option<Vec<u8>>) =
                 match self.crypto.as_ref() {
                     None => {

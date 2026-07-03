@@ -26,13 +26,21 @@ use ft_manifest::{decode_page, Page};
 use ft_vault::Vault;
 use thiserror::Error;
 
-/// Vault key for a Block's data-key sidecar: `"keys/<aa>/<cid_hex>"` — the same
-/// 2-char fan-out as `blocks/<aa>/<cid>`, under the `keys/` prefix (`§4.5`). The
-/// sidecar lives and dies with `blocks/<cid>` (ADR 0015): the download path reads
-/// it to unwrap the data key, the commit path writes it, and the GC treats it as
-/// an attachment of the Block.
-pub fn keys_key(cid: &Cid) -> String {
-    ft_hash::fanout_key("keys", &ft_hash::hex_lower(cid.as_bytes()))
+/// Vault key for a Block's data-key sidecar:
+/// `"keys/<space_id>/<aa>/<cid_hex>"` — the same 2-char fan-out as
+/// `blocks/<aa>/<cid>`, but under a per-Space subtree of the `keys/` prefix
+/// (`§4.5`). The sidecar lives and dies with `blocks/<cid>` (ADR 0015): the
+/// download path reads it to unwrap the data key, the commit path writes it, and
+/// the GC treats it as an attachment of the Block.
+///
+/// Unlike the Block object, which is Account-scoped and deduped across Spaces,
+/// the sidecar is wrapped with a specific Space's `space_key`. Two Spaces of one
+/// Account that share a chunk therefore need one sidecar EACH — the `<space_id>`
+/// component keeps them from colliding on a single object key (which would leave
+/// the second Space unable to unwrap the first Space's sidecar).
+pub fn keys_key(space_id: &str, cid: &Cid) -> String {
+    let prefix = format!("keys/{space_id}");
+    ft_hash::fanout_key(&prefix, &ft_hash::hex_lower(cid.as_bytes()))
 }
 
 /// Errors produced while diffing or applying Manifest trees.
@@ -472,7 +480,8 @@ fn same_identity(a: &FileEntry, b: &FileEntry) -> bool {
 ///
 /// `crypto` carries the Space's key material when runtime encryption is ON:
 /// `alg=1` Block objects are decrypted with it (unwrapping each data key from its
-/// `keys/<cid>` sidecar). It is `None` in the cleartext (`alg=0`) case — the
+/// `keys/<space_id>/<cid>` sidecar, where the Space id also comes from `crypto`).
+/// It is `None` in the cleartext (`alg=0`) case — the
 /// default; an `alg=1` object then fails with [`Error::EncryptedBlockWithoutKey`]
 /// rather than panicking. An `alg=0` object never consults `crypto`.
 pub async fn materialize(
@@ -520,11 +529,11 @@ pub async fn materialize(
                     contents.extend_from_slice(&payload);
                 } else {
                     // Encrypted (`alg=1`): unwrap this Block's data key from its
-                    // `keys/<cid>` sidecar with the Space key, then AEAD-decrypt
-                    // the object (`§4.4`/`§4.5`). No key material ⇒ typed error,
-                    // never a panic.
+                    // `keys/<space_id>/<cid>` sidecar with the Space key, then
+                    // AEAD-decrypt the object (`§4.4`/`§4.5`). No key material ⇒
+                    // typed error, never a panic.
                     let crypto = crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
-                    let sidecar = vault.get(&keys_key(cid)).await?;
+                    let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
                     let data_key = ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
                     let cleartext = ft_block::decode_encrypted(&obj, &data_key)?;
                     contents.extend_from_slice(&cleartext);
@@ -1550,16 +1559,18 @@ mod tests {
 
     const DEDUP_SECRET: [u8; 32] = [0x11u8; 32];
     const SPACE_KEY: [u8; 32] = [0xAAu8; 32];
+    const SPACE_ID: &str = "space-under-test";
 
     fn crypto() -> SpaceCrypto {
         SpaceCrypto {
             dedup_secret: DEDUP_SECRET,
             space_key: SPACE_KEY,
+            space_id: SPACE_ID.to_string(),
         }
     }
 
     /// Encrypts `chunks` into `alg=1` Block objects, uploads each Block AND its
-    /// `keys/<cid>` sidecar to `vault`, and returns (entry, cleartext).
+    /// `keys/<space_id>/<cid>` sidecar to `vault`, and returns (entry, cleartext).
     async fn upload_encrypted_file(
         vault: &FsVault,
         name: &str,
@@ -1572,7 +1583,7 @@ mod tests {
                 ft_block::encode_encrypted(chunk, &DEDUP_SECRET).unwrap();
             vault.put(&ft_hash::block_key(&cid), obj).await.unwrap();
             let sidecar = ft_block::sidecar::wrap_data_key(&data_key, &SPACE_KEY);
-            vault.put(&keys_key(&cid), sidecar).await.unwrap();
+            vault.put(&keys_key(SPACE_ID, &cid), sidecar).await.unwrap();
             bk.push(cid);
             content.extend_from_slice(chunk);
         }

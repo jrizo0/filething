@@ -191,13 +191,16 @@ impl SpaceContext {
             self.index.put_block(space_id, cid)?;
             uploaded += 1;
         }
-        // Encryption ON (`alg=1`): each Block has a `keys/<cid>` data-key sidecar
-        // to upload alongside it (`§4.5`, ADR 0015 — the sidecar lives and dies
-        // with its Block). Same HEAD-before-PUT skip: the wrap uses a fresh nonce
-        // each call so the bytes differ run-to-run, but it unwraps to the same
-        // data key, so writing it once is enough. Empty with encryption off.
+        // Encryption ON (`alg=1`): each Block has a `keys/<space_id>/<cid>`
+        // data-key sidecar to upload alongside it (`§4.5`, ADR 0015 — the sidecar
+        // lives and dies with its Block). The key is scoped by THIS Space: the
+        // sidecar is wrapped with the Space key, so a chunk shared with another
+        // Space needs its own sidecar there. Same HEAD-before-PUT skip: the wrap
+        // uses a fresh nonce each call so the bytes differ run-to-run, but it
+        // unwraps to the same data key, so writing it once is enough. Empty with
+        // encryption off.
         for (cid, sidecar) in &scan.sidecars {
-            let key = ft_diff::keys_key(cid);
+            let key = ft_diff::keys_key(space_id, cid);
             if self.vault.head(&key).await? {
                 continue;
             }
@@ -235,6 +238,8 @@ impl SpaceContext {
     /// `crypto` bundles the Account `dedup_secret` and the freshly-generated
     /// per-Space `space_key`; the same `space_key` is escrowed with the Coordinator
     /// so any Device of the Account can clone the Space (see [`SpaceContext::clone_space`]).
+    /// Its `space_id` field is ignored on input and overwritten with the id the
+    /// Coordinator assigns (the caller cannot know it before `create_space`).
     ///
     /// On success returns the mounted context (whose `last_synced` reflects the
     /// committed first Revision). A first-commit [`CommitOutcome::Conflict`] (a
@@ -278,7 +283,7 @@ impl SpaceContext {
         device_id: DeviceId,
         name: &[u8],
         local_root: impl Into<std::path::PathBuf>,
-        crypto: SpaceCrypto,
+        mut crypto: SpaceCrypto,
     ) -> Result<Self> {
         let local_root = local_root.into();
 
@@ -291,6 +296,11 @@ impl SpaceContext {
         let space_id: SpaceId = coordinator
             .create_space(name, &meta_cid, &crypto.space_key)
             .await?;
+
+        // The Coordinator assigns the Space id, so the caller could not set it on
+        // `crypto` up front — stamp it now so the first commit's `keys/<space_id>/
+        // <cid>` sidecars land under this Space's subtree (`§4.5`).
+        crypto.space_id = space_id.as_str().to_string();
 
         // (4) persist the initial space_state: seq = -1 marks "never synced",
         // so the first commit is never short-circuited as NoChange. The base
@@ -322,7 +332,7 @@ impl SpaceContext {
         )?;
 
         // Turn ON encryption BEFORE the first commit so seq 0 is already `alg=1`
-        // (each Block encrypted + a `keys/<cid>` sidecar, `§4.4`/`§4.5`).
+        // (each Block encrypted + a `keys/<space_id>/<cid>` sidecar, `§4.4`/`§4.5`).
         ctx.attach_crypto(crypto);
 
         // (5) first commit (seq 0). expected_base = None.

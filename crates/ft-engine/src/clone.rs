@@ -118,12 +118,15 @@ impl SpaceContext {
 
         // Turn ON `alg=1` decryption BEFORE the pull materializes the tree: an
         // escrowed `space_key` + the Account `dedup_secret` let `materialize`
-        // unwrap each Block's data key from its `keys/<cid>` sidecar (`§4.5`). A
-        // legacy Space without a `space_key` stays on the cleartext path.
+        // unwrap each Block's data key from its `keys/<space_id>/<cid>` sidecar
+        // (`§4.5`). A legacy Space without a `space_key` stays on the cleartext
+        // path.
         if let Some(space_key) = space_key {
+            let space_id = ctx.space_id.as_str().to_string();
             ctx.attach_crypto(SpaceCrypto {
                 dedup_secret,
                 space_key,
+                space_id,
             });
         }
 

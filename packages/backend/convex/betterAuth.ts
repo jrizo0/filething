@@ -19,10 +19,13 @@
 // session with no cookie.
 //
 // Env vars (set on the deployment, never in code):
-//   BETTER_AUTH_SECRET — signing secret (openssl rand -base64 32).
-//   CONVEX_SITE_URL    — injected by Convex; the HTTP-actions origin, and the
-//                        JWT issuer + JWKS host (self-hosted: http://localhost:3211).
-//   SITE_URL           — optional app origin for trustedOrigins/baseURL.
+//   BETTER_AUTH_SECRET     — signing secret (openssl rand -base64 32).
+//   CONVEX_SITE_URL        — injected by Convex; the HTTP-actions origin, and the
+//                            JWT issuer + JWKS host (self-hosted: http://localhost:3211).
+//   SITE_URL               — optional app origin for trustedOrigins/baseURL.
+//   FILETHING_ALLOW_SIGNUP — "1"/"true" to open POST /api/auth/sign-up/email;
+//                            unset (default) closes it. See the disableSignUp
+//                            note below.
 
 import { createClient, type GenericCtx } from "@convex-dev/better-auth";
 import { convex } from "@convex-dev/better-auth/plugins";
@@ -30,6 +33,10 @@ import { betterAuth } from "better-auth/minimal";
 import { components } from "./_generated/api";
 import type { DataModel } from "./_generated/dataModel";
 import authConfig from "./auth.config";
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return value === "1" || value === "true";
+}
 
 // The component client: adapter (DB) + registerRoutes (HTTP) + helpers.
 export const authComponent = createClient<DataModel>(components.betterAuth);
@@ -50,6 +57,12 @@ export const createAuth = (ctx: GenericCtx<DataModel>) => {
       // Headless CLI: no email-delivery loop in the MVP. autoSignIn (default on)
       // means sign-up returns a usable session token immediately.
       requireEmailVerification: false,
+      // convex.site is a public URL; with signup always-on, anyone who finds it
+      // could create an Account on what is meant to be a single-owner personal
+      // deployment. Closed by default — flip FILETHING_ALLOW_SIGNUP=1 (`npx
+      // convex env set FILETHING_ALLOW_SIGNUP 1`) for the window needed to
+      // create the owner's account(s), then unset it.
+      disableSignUp: !isTruthyEnv(process.env.FILETHING_ALLOW_SIGNUP),
     },
     plugins: [convex({ authConfig })],
   });

@@ -81,7 +81,7 @@ pub struct SpaceContext {
     /// Runtime encryption key material for this Space (`§4.4`/`§4.5`). `None`
     /// (the default) ⇒ Blocks ship in cleartext (`alg=0`) and NOTHING about the
     /// scan/commit/pull behavior changes. `Some` ⇒ each scanned Block is encrypted
-    /// (`alg=1`) with a `keys/<cid>` sidecar on commit, and each `alg=1` Block is
+    /// (`alg=1`) with a `keys/<space_id>/<cid>` sidecar on commit, and each `alg=1` Block is
     /// decrypted on materialize. Set by the caller via
     /// [`attach_crypto`](SpaceContext::attach_crypto) after mounting; it is NOT
     /// persisted in `space_state` (the escrow/keyring that supplies it lives
@@ -225,7 +225,7 @@ impl SpaceContext {
     /// Turns ON runtime `alg=1` encryption for this mounted Space by attaching the
     /// key material ([`SpaceCrypto`]: the Account `dedup_secret` + the `space_key`,
     /// `§4.4`/`§4.5`). After this call the scan encrypts each Block and produces
-    /// its `keys/<cid>` sidecar, the commit uploads both, and materialize decrypts
+    /// its `keys/<space_id>/<cid>` sidecar, the commit uploads both, and materialize decrypts
     /// `alg=1` Blocks. Without it the Space stays on the cleartext (`alg=0`) path.
     /// The caller obtains the material from the escrow/keyring (outside the engine)
     /// and attaches it after [`open`](SpaceContext::open) / `init_space` /

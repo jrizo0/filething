@@ -4,11 +4,15 @@
 //! The Coordinator URL and the Vault `S3_*` credentials come from the
 //! environment; the per-Device identity (the Better Auth session) comes from the
 //! Device's [`Credentials`]. The normal path is authenticated: the CLI trades the
-//! session for a Convex JWT and attaches it to the websocket
-//! ([`ConvexClient::set_auth`] one-shot, or [`ConvexClient::set_auth_callback`]
-//! for the long-running daemon so it re-mints across the ~15-min expiry). The
-//! deployment admin/deploy key is now ONLY an ops fallback for when there is no
-//! session (see [`connect`]).
+//! session for a Convex JWT and attaches it to the websocket via
+//! [`ConvexClient::set_auth_callback`], which re-mints the JWT on every connect
+//! and reconnect. This applies to one-shot commands too, not just the daemon: the
+//! convex client's `set_auth` wraps a STATIC token in a fetcher that keeps
+//! returning the same (now-expired) token forever, so a one-shot command whose
+//! work outlives the ~15-min JWT expiry (e.g. a large `sync` upload) would
+//! otherwise hang in an infinite AuthError/reconnect loop on its next mutation.
+//! The deployment admin/deploy key is now ONLY an ops fallback for when there is
+//! no session (see [`connect`]).
 //!
 //! Deployments (`docs/PRODUCTION-SETUP.md`): local Docker infra
 //! (`CONVEX_SELF_HOSTED_URL`) or managed cloud (`CONVEX_URL`); the URL selects
@@ -63,59 +67,42 @@ pub fn coordinator_url_from_env() -> String {
 /// Builds a [`Coordinator`] connected to `url`, authenticated as this Device.
 ///
 /// - With a Better Auth session (`creds`): trade it for a Convex JWT and attach
-///   it. `long_running` (the daemon) uses [`ConvexClient::set_auth_callback`] so
-///   the JWT is re-minted on every websocket reconnect (surviving the ~15-min
-///   expiry); one-shot commands use [`ConvexClient::set_auth`].
+///   it via [`ConvexClient::set_auth_callback`], which re-mints the JWT (calling
+///   `auth::convex_token` again) on every websocket connect and reconnect —
+///   surviving the ~15-min expiry with no operator action, for one-shot commands
+///   and the daemon alike (see the module doc comment for why one-shot commands
+///   need this too).
 /// - Without a session: fall back to the deployment admin/deploy key
 ///   ([`connect_ops_fallback`]) — an OPS escape hatch, no longer the normal flow.
-pub async fn connect(
-    url: &str,
-    creds: Option<&Credentials>,
-    long_running: bool,
-) -> anyhow::Result<Coordinator> {
+pub async fn connect(url: &str, creds: Option<&Credentials>) -> anyhow::Result<Coordinator> {
     match creds {
-        Some(c) if !c.session_token.is_empty() => {
-            connect_authed(url, &c.session_token, long_running).await
-        }
+        Some(c) if !c.session_token.is_empty() => connect_authed(url, &c.session_token).await,
         _ => connect_ops_fallback(url).await,
     }
 }
 
-/// Connects with the per-Device Better Auth session attached as a Convex JWT.
-async fn connect_authed(
-    url: &str,
-    session_token: &str,
-    long_running: bool,
-) -> anyhow::Result<Coordinator> {
+/// Connects with the per-Device Better Auth session attached as a Convex JWT,
+/// re-minted on every connect/reconnect via [`ConvexClient::set_auth_callback`]
+/// (see [`connect`]'s doc comment).
+async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<Coordinator> {
     let base = auth::auth_base_url(url)?;
     let mut client = ConvexClient::new(url)
         .await
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
 
-    if long_running {
-        // Re-mint the JWT on connect and every reconnect (force_refresh) so a
-        // daemon outlives the ~15-min JWT expiry without operator action.
+    let token = session_token.to_string();
+    let fetcher: AuthTokenFetcher = Box::new(move |_force_refresh: bool| {
         let base = base.clone();
-        let token = session_token.to_string();
-        let fetcher: AuthTokenFetcher = Box::new(move |_force_refresh: bool| {
-            let base = base.clone();
-            let token = token.clone();
-            Box::pin(async move {
-                let jwt = auth::convex_token(&base, &token).await?;
-                Ok(AuthenticationToken::User(jwt))
-            })
-                as std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = anyhow::Result<AuthenticationToken>>
-                            + Send,
-                    >,
-                >
-        });
-        client.set_auth_callback(Some(fetcher)).await;
-    } else {
-        let jwt = auth::convex_token(&base, session_token).await?;
-        client.set_auth(Some(jwt)).await;
-    }
+        let token = token.clone();
+        Box::pin(async move {
+            let jwt = auth::convex_token(&base, &token).await?;
+            Ok(AuthenticationToken::User(jwt))
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<AuthenticationToken>> + Send>,
+            >
+    });
+    client.set_auth_callback(Some(fetcher)).await;
     Ok(Coordinator::from_client(client))
 }
 
@@ -147,20 +134,70 @@ async fn connect_ops_fallback(url: &str) -> anyhow::Result<Coordinator> {
 
 /// Loads this Device's encryption key material for the Space at `root` from the
 /// LOCAL caches (no network): the per-Space `space_key` cache plus the Account
-/// `dedup_secret` in [`Credentials`]. Returns `None` (so the Space stays on the
-/// cleartext `alg=0` path) when either is absent — a legacy Space with no
-/// escrowed key, or a Device that has not logged in.
+/// `dedup_secret` in [`Credentials`]. `space_id` scopes the sidecar object keys
+/// (`keys/<space_id>/<cid>`, `§4.5`).
+///
+/// The two secrets are NOT symmetric (Fix A / the "silent cleartext commit"
+/// hardening): the `space_key` cache is local evidence that THIS Space is
+/// encrypted (`alg=1`) — once it exists, cleartext is no longer a legitimate
+/// path for this Space, credentials or not.
+///
+/// - Neither secret present: a legacy Space with no escrowed key. Returns `None`
+///   so the Space stays on the cleartext `alg=0` path, unchanged.
+/// - `space_key` cached but no credentials (deploy-key ops fallback, or a
+///   session lost after it was cached): errors instead of silently falling back
+///   to `None`/cleartext — a commit here would upload the whole tree
+///   unencrypted under a divergent `alg=0` root. Run `filething login`.
+/// - Both present: builds the [`SpaceCrypto`].
 pub fn load_space_crypto(
     root: &Path,
+    space_id: &SpaceId,
     creds: Option<&Credentials>,
 ) -> anyhow::Result<Option<SpaceCrypto>> {
-    let (Some(creds), Some(space_key)) = (creds, credentials::read_space_key(root)?) else {
+    let Some(space_key) = credentials::read_space_key(root)? else {
         return Ok(None);
     };
+    let creds = creds.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Space {space_id} is encrypted (alg=1: a cached escrow key was found at \
+             {}) but no Device credentials were found — refusing to proceed, which would \
+             silently commit/read this Space in CLEARTEXT. Run `filething login` to \
+             authenticate this Device.",
+            credentials::space_key_path(root).display()
+        )
+    })?;
     Ok(Some(SpaceCrypto {
         dedup_secret: creds.dedup_secret()?,
         space_key,
+        space_id: space_id.as_str().to_string(),
     }))
+}
+
+/// Guard-2 (Fix A, layer 2): the online-authoritative counterpart to the
+/// [`load_space_crypto`] local-cache asymmetry. `escrow_key` is the Space's
+/// escrow key as authoritatively resolved by [`ensure_space_key_cached`] (a
+/// local cache hit, or — on a cache miss — a live Coordinator `spaces:get`);
+/// `crypto` is what this run actually attached. If the Space is known to be
+/// encrypted (`escrow_key` is `Some`) but crypto could not be attached, refuse
+/// to proceed rather than let the caller commit/scan the Space in cleartext.
+///
+/// This should be unreachable once `load_space_crypto`'s guard above holds (it
+/// would already have errored), but callers wire it in as a second, independent
+/// check at the call sites that can commit — cheap insurance against the two
+/// checks ever drifting apart.
+pub fn assert_crypto_matches_escrow(
+    space_id: &SpaceId,
+    escrow_key: Option<[u8; 32]>,
+    crypto: Option<&SpaceCrypto>,
+) -> anyhow::Result<()> {
+    if escrow_key.is_some() && crypto.is_none() {
+        anyhow::bail!(
+            "Space {space_id} is encrypted (alg=1, escrow key on file) but no crypto is \
+             attached for this run — refusing to proceed and commit/read it in cleartext. \
+             Run `filething login` to authenticate this Device."
+        );
+    }
+    Ok(())
 }
 
 /// Ensures the Space's `space_key` is cached locally, fetching it from the
@@ -262,4 +299,90 @@ pub fn existing_space_id_at(root: &Path) -> anyhow::Result<Option<ft_engine::Spa
         })
         .with_context(|| format!("reading space_state at {}", index_path(root).display()))?;
     Ok(id.map(ft_engine::SpaceId::new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds() -> Credentials {
+        Credentials {
+            session_token: "sess-abc".into(),
+            dedup_secret_hex: hex::encode([0x11u8; 32]),
+        }
+    }
+
+    fn space_id() -> SpaceId {
+        SpaceId::new("space1".to_string())
+    }
+
+    #[test]
+    fn load_space_crypto_none_when_neither_secret_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // No space_key cache, no credentials: legacy cleartext Space.
+        let out = load_space_crypto(dir.path(), &space_id(), None).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn load_space_crypto_none_when_only_creds_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // Logged in, but this Space has no escrowed key on file: still legacy.
+        let out = load_space_crypto(dir.path(), &space_id(), Some(&creds())).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn load_space_crypto_errors_when_space_key_cached_but_no_creds() {
+        let dir = tempfile::tempdir().unwrap();
+        credentials::write_space_key(dir.path(), &[0x22u8; 32]).unwrap();
+        // The Space is known-encrypted (cache on file) but we have no session:
+        // must error, not silently fall back to cleartext.
+        let err = load_space_crypto(dir.path(), &space_id(), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "unexpected message: {msg}");
+        assert!(msg.contains("login"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn load_space_crypto_some_when_both_secrets_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x33u8; 32];
+        credentials::write_space_key(dir.path(), &key).unwrap();
+        let crypto = load_space_crypto(dir.path(), &space_id(), Some(&creds()))
+            .unwrap()
+            .expect("crypto should be attached");
+        assert_eq!(crypto.space_key, key);
+        assert_eq!(crypto.dedup_secret, [0x11u8; 32]);
+        assert_eq!(crypto.space_id, "space1");
+    }
+
+    #[test]
+    fn assert_crypto_matches_escrow_ok_when_both_none() {
+        assert_crypto_matches_escrow(&space_id(), None, None).unwrap();
+    }
+
+    #[test]
+    fn assert_crypto_matches_escrow_ok_when_both_present() {
+        let crypto = SpaceCrypto {
+            dedup_secret: [0u8; 32],
+            space_key: [1u8; 32],
+            space_id: "space1".to_string(),
+        };
+        assert_crypto_matches_escrow(&space_id(), Some([1u8; 32]), Some(&crypto)).unwrap();
+    }
+
+    #[test]
+    fn assert_crypto_matches_escrow_errors_when_escrow_known_but_crypto_missing() {
+        let err = assert_crypto_matches_escrow(&space_id(), Some([1u8; 32]), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "unexpected message: {msg}");
+        assert!(msg.contains("cleartext"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn assert_crypto_matches_escrow_ok_when_no_escrow_key_and_no_crypto() {
+        // Legacy Space: no escrow key anywhere, no crypto — expected, not an error.
+        assert_crypto_matches_escrow(&space_id(), None, None).unwrap();
+    }
 }

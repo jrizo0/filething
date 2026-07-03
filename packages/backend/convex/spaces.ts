@@ -10,6 +10,7 @@
 //   query    spaces:head({ spaceId })
 //     -> { headRevisionId|null, seq|null, manifestRootCid|null, parent|null }
 //   mutation spaces:refreshRetentionFloor({ spaceId })
+//   mutation spaces:ensureSpaceKey({ spaceId, spaceKey }) -> null (first-write-wins)
 //
 // spaces:head is a QUERY so Convex's reactivity turns it into the change feed
 // (format.md §8): a subscriber re-runs whenever headRevisionId — or the head
@@ -127,6 +128,40 @@ export const head = query({
       manifestRootCid: headRev.manifestRootCid,
       parent: headRev.parent,
     };
+  },
+});
+
+// Back-fill the escrow spaceKey on a pre-existing Space that predates it
+// (schema.ts spaceKey is v.optional for exactly this reason: pairing-era
+// Spaces created before spaceKey existed). First-write-wins: sets the key iff
+// it is currently unset, then refuses any further call — once a Space has a
+// key the client has already used it to encrypt/decrypt content, so silently
+// overwriting it would strand that content. Used during the Fase 3 upgrade
+// path (docs/PRODUCTION-SETUP.md, "Upgrade desde Fase 2") after
+// migrations:claimAccount restores ownership of an old Space.
+export const ensureSpaceKey = mutation({
+  args: {
+    spaceId: v.id("spaces"),
+    spaceKey: v.bytes(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const account = await requireAccount(ctx);
+    const space = await requireOwnedSpace(ctx, account, args.spaceId);
+    if (args.spaceKey.byteLength !== SPACE_KEY_BYTES) {
+      throw new ConvexError({
+        code: "bad_space_key",
+        message: `spaceKey must be exactly ${SPACE_KEY_BYTES} bytes`,
+      });
+    }
+    if (space.spaceKey !== undefined) {
+      throw new ConvexError({
+        code: "space_key_already_set",
+        message: "Space already has a spaceKey; ensureSpaceKey does not overwrite",
+      });
+    }
+    await ctx.db.patch(args.spaceId, { spaceKey: args.spaceKey });
+    return null;
   },
 });
 

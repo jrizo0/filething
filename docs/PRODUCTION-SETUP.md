@@ -160,6 +160,10 @@ por chequeo. **Éxito** = todos los chequeos en `✓` y `SMOKE OK` al final. Que
 traiga el archivo valida el commit, el change feed (WebSocket), el round-trip por R2 y el
 **descifrado cross-device** (`alg=1`) contra la infra gestionada.
 
+> El signup está deshabilitado por defecto en el deployment (ver 4.3 más abajo). El script lo
+> habilita él mismo (`convex env set FILETHING_ALLOW_SIGNUP 1`) antes de correr y lo revierte
+> al terminar (éxito o fallo) — no hace falta tocar nada a mano para correr el smoke.
+
 ### 4.3 Auth real (Fase 3): Better Auth en el deployment
 Desde la Fase 3 (ADR 0014) el cliente ya **no** usa el deploy key: cada Device hace
 `filething login --email <email>` (password por prompt o `FILETHING_PASSWORD`; `--signup` la
@@ -174,6 +178,77 @@ Los endpoints HTTP de Better Auth viven en `https://<name>.convex.site` (Cloud) 
 puerto 3211 (self-hosted); el CLI deriva esa URL de `CONVEX_URL` automáticamente
 (`CONVEX_SITE_URL` la sobreescribe). El deploy key queda **solo** para `convex deploy` y como
 fallback de ops en el CLI cuando no hay sesión.
+
+**Signup cerrado por defecto**: `https://<name>.convex.site` es una URL pública — sin esto,
+cualquiera que la encuentre podría crear una cuenta en lo que es un deployment personal de un
+solo dueño. El signup (`POST /api/auth/sign-up/email`) está **deshabilitado** salvo que la
+variable `FILETHING_ALLOW_SIGNUP` valga `1`/`true` en el deployment. Para crear tu(s) cuenta(s)
+a mano (fuera del smoke, que ya se auto-gestiona esto — ver 4.2):
+```bash
+cd packages/backend
+bunx convex env set FILETHING_ALLOW_SIGNUP 1
+filething login --signup --email tu@email --name mi-primer-device
+bunx convex env remove FILETHING_ALLOW_SIGNUP   # vuelve a cerrarlo
+```
+Los Devices siguientes del mismo usuario usan `filething login --email ...` (sin `--signup`,
+sin necesidad de la variable).
+
+### 4.4 Upgrade desde Fase 2: reclamar Accounts/Spaces pre-existentes
+
+Si ya tenías Accounts/Spaces creados **antes** de este upgrade (era de pairing, `subject`
+opaco que no es un `sub` de Better Auth), quedan huérfanos tras pasar a auth real: el primer
+`filething login` del dueño crea una Account **nueva**, porque `ensureDevice` busca la Account
+por el `sub` del JWT de Better Auth, que nunca va a coincidir con el `subject` viejo. Sin este
+paso esas Spaces quedan **inalcanzables para siempre** (`requireOwnedSpace` nunca matchea la
+Account nueva contra la Space vieja).
+
+> ⚠️ **No corras `init`/`sync`/ningún otro comando con este Device entre los pasos 1 y 4.**
+> El paso 1 ya registra un Device en la Account nueva (`login` siempre llama a `ensureDevice`)
+> con un `dedup_secret` propio; si cifras contenido con él antes de reclamar la Account vieja,
+> ese secreto se descarta en el paso 3 y el contenido quedaría cifrado con una clave huérfana.
+
+1. Login normal del dueño (crea la Account nueva — y, con ella, un Device del mismo nombre que
+   probablemente ya existía en la Account vieja si reusas la misma máquina, ver más abajo):
+   ```bash
+   filething login --signup --email tu@email --name mi-device   # recuerda habilitar FILETHING_ALLOW_SIGNUP (4.3)
+   ```
+   Anota el `subject` (el `sub` del JWT) de esta Account nueva — visible en el dashboard de
+   Convex, tabla `accounts`.
+2. Encuentra el `subject` de la Account **vieja** (mismo dashboard/tabla — la que tiene las
+   Spaces que quieres recuperar).
+3. Corre la migración con el deploy key (root — trátalo como tal; puede reescribir cualquier
+   Account):
+   ```bash
+   cd packages/backend
+   bunx convex run migrations:claimAccount '{"oldSubject": "<subject-viejo>", "newSubject": "<sub-nuevo-de-better-auth>"}'
+   ```
+   Re-apunta el `subject` de la Account vieja al nuevo y borra la Account nueva creada en el
+   paso 1. Si esa Account nueva **ya tiene Spaces propios**, la migración se niega (fusión
+   ambigua de datos reales, no fusiona en silencio) — resuélvelo a mano antes de reintentar.
+   Los Devices de la Account nueva SÍ se mueven automáticamente a la Account vieja (conservando
+   su id, que es el que tu CLI local ya tiene cacheado en `config.json`); si un Device de la
+   Account nueva tiene el mismo nombre que uno ya existente en la vieja, se descarta la fila
+   vieja (solo pierde `baseSeqInUse`, que se recalcula solo — ver `spaces:refreshRetentionFloor`).
+   La respuesta de la mutation lista `reparentedDeviceIds`/`deletedDeviceIds` para que confirmes
+   qué pasó.
+4. **Re-loguea el MISMO Device del paso 1 (sin `--signup`)** para refrescar su estado local —
+   `config.json` todavía apunta a la Account nueva que el paso 3 borró, y `credentials.json`
+   todavía tiene el `dedup_secret` descartado:
+   ```bash
+   filething login --email tu@email --name mi-device
+   ```
+   `ensureDevice` ahora resuelve la Account vieja (ya reclamada) y su Device (ya reparentado);
+   si la Account vieja nunca tuvo `dedup_secret` (pairing-era, anterior al escrow) lo fija con
+   el candidato de esta llamada — a partir de aquí es el canónico para todos los Devices.
+5. Si alguna Space vieja no tiene `spaceKey` (pre-existe a esa columna), fíjala una única vez
+   (first-write-wins; falla si ya tiene una), impersonando al dueño ya reclamado:
+   ```bash
+   bunx convex run spaces:ensureSpaceKey \
+     '{"spaceId": "<space-id>", "spaceKey": {"$bytes": "<32-bytes-en-base64>"}}' \
+     --identity '{"subject": "<sub-nuevo-de-better-auth>"}'
+   ```
+6. Loguea los demás Devices normalmente (`filething login --email tu@email --name otro-device`)
+   — ya resuelven la Account correcta y comparten el `dedup_secret` fijado en el paso 4.
 
 ---
 
@@ -208,3 +283,7 @@ al mes en Convex). Para uso personal de unos pocos GB no deberías acercarte.
   de historial (retention floor) está **diferida**: un floor sound por-Space necesita telemetría
   por-(device,space) que el escalar `baseSeqInUse` actual no da (ver `docs/adr/0012`). Revisa
   siempre el dry-run antes de `--apply`.
+- **Signup cerrado por defecto**: `convex.site` es una URL pública; el signup queda
+  deshabilitado salvo `FILETHING_ALLOW_SIGNUP=1` en el deployment (Paso 4.3). No hay rate
+  limiting ni verificación de email — es un candado binario, no protección contra abuso
+  mientras la variable esté puesta. Ábrela solo el tiempo que tardes en crear tu(s) cuenta(s).

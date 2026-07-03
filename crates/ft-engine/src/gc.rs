@@ -53,6 +53,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
+use ft_coordinator::SpaceId;
 use ft_core::{Cid, FileEntry};
 use ft_manifest::{decode_page, Page};
 use ft_vault::{Vault, VaultObject};
@@ -60,11 +61,13 @@ use ft_vault::{Vault, VaultObject};
 use crate::context::SpaceContext;
 use crate::error::{EngineError, Result};
 
-/// The Vault prefixes the GC enumerates and may sweep. `keys/<cid>` data-key
-/// sidecars (`§4.5`, ADR 0015) are attachments of `blocks/<cid>`: a sidecar is
-/// reachable iff its Block is (see [`mark_entry_blocks`]), so an orphan sidecar —
-/// one whose Block is gone, or which never had a live Block — is swept here just
-/// like any other orphan. `reach/` stays reserved and is never touched.
+/// The Vault prefixes the GC enumerates and may sweep. `keys/<space_id>/<cid>`
+/// data-key sidecars (`§4.5`, ADR 0015) are attachments of `blocks/<cid>`: a
+/// sidecar is reachable iff its Block is reachable FROM ITS OWN SPACE (see
+/// [`mark_entry_blocks`]), so an orphan sidecar — one whose Block is gone, or
+/// which never had a live Block — is swept here just like any other orphan. The
+/// `keys/` prefix covers every Space's per-Space subtree in one sweep. `reach/`
+/// stays reserved and is never touched.
 const SWEEP_PREFIXES: [&str; 5] = ["blocks/", "manifest/", "blocklist/", "meta/", "keys/"];
 
 /// The default grace-period: 24h. An object younger than this is never swept.
@@ -142,7 +145,10 @@ impl SpaceContext {
             .list_mine()
             .await?;
 
-        let mut root_cids: Vec<Cid> = Vec::new();
+        // Each root is paired with its owning Space id so the mark can name that
+        // Space's `keys/<space_id>/<cid>` sidecars (`§4.5`): the sidecar key is
+        // per-Space even though the Block object it attaches to is Account-wide.
+        let mut root_cids: Vec<(SpaceId, Cid)> = Vec::new();
         let mut meta_cids: Vec<Cid> = Vec::new();
         let mut retained_revisions = 0usize;
         let heads_before = head_snapshot(&spaces);
@@ -167,7 +173,11 @@ impl SpaceContext {
                 )));
             }
             retained_revisions += roots.len();
-            root_cids.extend(roots.into_iter().map(|r| r.manifest_root_cid));
+            root_cids.extend(
+                roots
+                    .into_iter()
+                    .map(|r| (space.space_id.clone(), r.manifest_root_cid)),
+            );
         }
 
         // ----- mark: every reachable Vault key across all Spaces -----
@@ -249,7 +259,7 @@ fn head_snapshot(spaces: &[ft_coordinator::Space]) -> Vec<(String, Option<String
 /// live data.
 pub(crate) async fn mark_reachable(
     vault: &dyn Vault,
-    roots: &[Cid],
+    roots: &[(SpaceId, Cid)],
     meta_cids: &[Cid],
 ) -> Result<HashSet<String>> {
     let mut reachable: HashSet<String> = HashSet::new();
@@ -263,17 +273,21 @@ pub(crate) async fn mark_reachable(
     // from the Vault, which must not fail the mark).
     let empty_root = ft_manifest::build(Vec::new()).root;
     reachable.insert(ft_hash::manifest_key(&empty_root));
-    // Walk every retained Revision's tree. Shared pages/blocks dedupe by cid.
-    for root in roots {
-        mark_from_root(vault, root, &mut reachable).await?;
+    // Walk every retained Revision's tree. Shared pages/blocks dedupe by cid; a
+    // sidecar, however, is per-Space, so the walk carries the owning Space id.
+    for (space_id, root) in roots {
+        mark_from_root(vault, space_id.as_str(), root, &mut reachable).await?;
     }
     Ok(reachable)
 }
 
 /// Adds every Vault key reachable from a single Manifest `root` to `reachable`.
-/// Iterative walk with an explicit stack; pages dedupe by cid.
+/// Iterative walk with an explicit stack; pages dedupe by cid. `space_id` scopes
+/// the per-Space `keys/<space_id>/<cid>` sidecars marked for the Blocks found
+/// (`§4.5`); pages/blocks/blocklists are Account-scoped and need no Space id.
 async fn mark_from_root(
     vault: &dyn Vault,
+    space_id: &str,
     root: &Cid,
     reachable: &mut HashSet<String>,
 ) -> Result<()> {
@@ -293,7 +307,7 @@ async fn mark_from_root(
             }
             Page::Leaf(leaf) => {
                 for entry in leaf.e {
-                    mark_entry_blocks(vault, &entry, reachable).await?;
+                    mark_entry_blocks(vault, space_id, &entry, reachable).await?;
                 }
             }
         }
@@ -306,14 +320,18 @@ async fn mark_from_root(
 /// `bk` list. Verifies an externalized blocklist hashes to its `bk_ref` and
 /// refuses to proceed on a mismatch (never sweep on corruption).
 ///
-/// For every reachable Block cid it ALSO marks the Block's `keys/<cid>` data-key
-/// sidecar reachable (`§4.5`, ADR 0015). Marking a sidecar key that has no
-/// physical object (an `alg=0` Block never wrote one) is harmless: a reachable
-/// key with no listed object simply never matches during the sweep. This is what
-/// keeps a live encrypted Block's sidecar from being collected, and — with the
-/// `keys/` prefix now swept — lets an orphan sidecar be reclaimed.
+/// For every reachable Block cid it ALSO marks the Block's
+/// `keys/<space_id>/<cid>` data-key sidecar reachable (`§4.5`, ADR 0015) for the
+/// Space this entry's Manifest belongs to — the sidecar is per-Space, so the
+/// mark must name the same Space that wrote it or the sweep would reclaim a live
+/// sidecar. Marking a sidecar key that has no physical object (an `alg=0` Block
+/// never wrote one) is harmless: a reachable key with no listed object simply
+/// never matches during the sweep. This is what keeps a live encrypted Block's
+/// sidecar from being collected, and — with the `keys/` prefix now swept — lets
+/// an orphan sidecar be reclaimed.
 async fn mark_entry_blocks(
     vault: &dyn Vault,
+    space_id: &str,
     entry: &FileEntry,
     reachable: &mut HashSet<String>,
 ) -> Result<()> {
@@ -336,13 +354,13 @@ async fn mark_entry_blocks(
             })?;
             for c in list {
                 reachable.insert(ft_hash::block_key(&c));
-                reachable.insert(ft_diff::keys_key(&c));
+                reachable.insert(ft_diff::keys_key(space_id, &c));
             }
         }
         None => {
             for c in &entry.bk {
                 reachable.insert(ft_hash::block_key(c));
-                reachable.insert(ft_diff::keys_key(c));
+                reachable.insert(ft_diff::keys_key(space_id, c));
             }
         }
     }
@@ -446,7 +464,9 @@ mod tests {
         )
         .await;
 
-        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
+        let reachable = mark_reachable(&vault, &[(SpaceId::new("s1"), root)], &[meta])
+            .await
+            .unwrap();
 
         assert!(reachable.contains(&ft_hash::manifest_key(&root)));
         assert!(reachable.contains(&ft_hash::block_key(&block_a)));
@@ -492,7 +512,9 @@ mod tests {
         };
         let root = upload_manifest(&vault, vec![(ft_fsmap::casefold_key(&p), entry)]).await;
 
-        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
+        let reachable = mark_reachable(&vault, &[(SpaceId::new("s1"), root)], &[meta])
+            .await
+            .unwrap();
 
         assert!(reachable.contains(&ft_hash::blocklist_key(&bl_cid)));
         assert!(reachable.contains(&ft_hash::block_key(&block_a)));
@@ -528,7 +550,7 @@ mod tests {
         };
         let root = upload_manifest(&vault, vec![(ft_fsmap::casefold_key(&p), entry)]).await;
 
-        let err = mark_reachable(&vault, &[root], &[cid(200)])
+        let err = mark_reachable(&vault, &[(SpaceId::new("s1"), root)], &[cid(200)])
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::SpaceState(_)));
@@ -536,10 +558,10 @@ mod tests {
 
     #[tokio::test]
     async fn mark_retains_the_sidecar_of_a_live_block_and_leaves_orphans_unmarked() {
-        // A live (reachable) Block's `keys/<cid>` sidecar must be marked reachable
-        // so the GC never collects it (§4.5, ADR 0015 — sidecar lives with its
-        // Block). A sidecar whose Block is NOT referenced stays unmarked, so the
-        // `keys/` sweep can reclaim it.
+        // A live (reachable) Block's `keys/<space_id>/<cid>` sidecar must be
+        // marked reachable so the GC never collects it (§4.5, ADR 0015 — sidecar
+        // lives with its Block). A sidecar whose Block is NOT referenced stays
+        // unmarked, so the `keys/` sweep can reclaim it.
         let dir = tempfile::tempdir().unwrap();
         let vault = FsVault::new(dir.path());
         let meta = cid(200);
@@ -547,20 +569,63 @@ mod tests {
         let orphan_block = cid(2);
 
         let root = upload_manifest(&vault, vec![file_entry("a.txt", vec![live_block])]).await;
-        let reachable = mark_reachable(&vault, &[root], &[meta]).await.unwrap();
+        let reachable = mark_reachable(&vault, &[(SpaceId::new("s1"), root)], &[meta])
+            .await
+            .unwrap();
 
-        // The live Block AND its sidecar are reachable.
+        // The live Block AND its sidecar (under THIS Space's subtree) are reachable.
         assert!(reachable.contains(&ft_hash::block_key(&live_block)));
-        assert!(reachable.contains(&ft_diff::keys_key(&live_block)));
+        assert!(reachable.contains(&ft_diff::keys_key("s1", &live_block)));
         // A Block referenced by nothing — and thus its sidecar — is NOT reachable,
         // so both would be swept (subject to the grace-period).
         assert!(!reachable.contains(&ft_hash::block_key(&orphan_block)));
-        assert!(!reachable.contains(&ft_diff::keys_key(&orphan_block)));
+        assert!(!reachable.contains(&ft_diff::keys_key("s1", &orphan_block)));
+    }
+
+    #[tokio::test]
+    async fn mark_scopes_each_spaces_sidecar_and_never_crosses_spaces() {
+        // Two Spaces of one Account share the SAME Block cid (the Block object is
+        // Account-deduped) but each has its OWN per-Space sidecar. The mark, run
+        // over both Spaces' roots, must reach `keys/<A>/<cid>` AND `keys/<B>/<cid>`
+        // — and must NOT mark Space B's sidecar reachable only because Space A
+        // references the shared Block. If it did, a real two-Space vault could
+        // sweep a live sidecar (BUG this fix guards against).
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+        let meta = cid(200);
+        let shared_block = cid(1);
+
+        // Both Spaces reference the same shared Block from their own Manifest.
+        let root_a = upload_manifest(&vault, vec![file_entry("a.txt", vec![shared_block])]).await;
+        let root_b = upload_manifest(&vault, vec![file_entry("b.txt", vec![shared_block])]).await;
+        // (root_a == root_b would collapse the point; different paths keep them
+        // distinct so the walk genuinely visits two Spaces' trees.)
+        assert_ne!(root_a, root_b);
+
+        let reachable = mark_reachable(
+            &vault,
+            &[
+                (SpaceId::new("space-a"), root_a),
+                (SpaceId::new("space-b"), root_b),
+            ],
+            &[meta],
+        )
+        .await
+        .unwrap();
+
+        // The shared Block AND both Spaces' sidecars are reachable.
+        assert!(reachable.contains(&ft_hash::block_key(&shared_block)));
+        assert!(reachable.contains(&ft_diff::keys_key("space-a", &shared_block)));
+        assert!(reachable.contains(&ft_diff::keys_key("space-b", &shared_block)));
+
+        // A THIRD Space that references nothing has no reachable sidecar even for
+        // the shared cid — the mark is strictly per-Space, never cross-Space.
+        assert!(!reachable.contains(&ft_diff::keys_key("space-c", &shared_block)));
     }
 
     #[test]
     fn partition_sweep_reclaims_an_orphan_sidecar_under_the_keys_prefix() {
-        // With `keys/` now a swept prefix, an orphan `keys/<cid>` object (its Block
+        // With `keys/` now a swept prefix, an orphan `keys/<space_id>/<cid>` object (its Block
         // gone or never live) that is old enough is reclaimed exactly like any
         // other orphan, while a live block's sidecar (in the reachable set) is kept.
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);

@@ -82,6 +82,8 @@ async fn two_devices_end_to_end() {
     let crypto = SpaceCrypto {
         dedup_secret: ensured.dedup_secret,
         space_key: [42u8; 32],
+        // `init_space` stamps the real id from `create_space`; placeholder here.
+        space_id: String::new(),
     };
     let index_a = Index::open_in_memory().unwrap();
     let vault_a: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));

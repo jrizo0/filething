@@ -19,7 +19,22 @@ FAILED=0
 ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; FAILED=1; }
 hr()  { echo; echo "==================== $* ===================="; }
-cleanup() { command rm -rf "$WORK"; }
+# Signup (Better Auth) está deshabilitado por defecto en el deployment (backend
+# hardening, Fase 3 Fix B: convex/betterAuth.ts disableSignUp) — solo se abre
+# con FILETHING_ALLOW_SIGNUP=1. Este smoke hace signup real (PASO 1), así que lo
+# abrimos aquí y lo devolvemos a como estaba al terminar (éxito o fallo).
+ALLOW_SIGNUP_TOUCHED=0
+ORIG_ALLOW_SIGNUP=""
+cleanup() {
+  if [ "$ALLOW_SIGNUP_TOUCHED" -eq 1 ]; then
+    if [ -n "$ORIG_ALLOW_SIGNUP" ]; then
+      ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP "$ORIG_ALLOW_SIGNUP" ) >/dev/null 2>&1
+    else
+      ( cd "$REPO/packages/backend" && bunx convex env remove FILETHING_ALLOW_SIGNUP ) >/dev/null 2>&1
+    fi
+  fi
+  command rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 # Dos Devices = dos FILETHING_HOME distintos sobre el mismo binario.
@@ -36,6 +51,17 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+: "${CONVEX_DEPLOY_KEY:?falta CONVEX_DEPLOY_KEY en $ENV_FILE (hace falta para abrir/cerrar signup)}"
+export CONVEX_DEPLOY_KEY
+
+hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
+ORIG_ALLOW_SIGNUP="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
+if ! ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ); then
+  echo "ERROR: no se pudo fijar FILETHING_ALLOW_SIGNUP=1 en el deployment (revisa CONVEX_DEPLOY_KEY)." >&2
+  exit 1
+fi
+ALLOW_SIGNUP_TOUCHED=1
+ok "signup habilitado para esta corrida (se revierte al terminar)"
 
 hr "BUILD — binario release (target/release/filething)"
 ( cd "$REPO" && cargo build --release -p filething )

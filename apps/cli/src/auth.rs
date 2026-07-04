@@ -160,17 +160,29 @@ pub async fn convex_token(base_url: &str, session_token: &str) -> anyhow::Result
 mod tests {
     use super::*;
 
-    // These tests set/clear CONVEX_SITE_URL; keep them from racing each other and
-    // from leaking into other tests by owning the key and restoring it.
-    fn with_site_url_unset<T>(f: impl FnOnce() -> T) -> T {
+    // These tests set/clear CONVEX_SITE_URL — process-global state, while cargo
+    // runs tests on parallel threads. Every test that touches the key must hold
+    // this lock for its whole body (set + assert + restore), or a concurrent
+    // `remove_var` lands between another test's `set_var` and its assertion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_site_url<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(ENV_SITE_URL).ok();
-        std::env::remove_var(ENV_SITE_URL);
+        match value {
+            Some(v) => std::env::set_var(ENV_SITE_URL, v),
+            None => std::env::remove_var(ENV_SITE_URL),
+        }
         let out = f();
         match saved {
             Some(v) => std::env::set_var(ENV_SITE_URL, v),
             None => std::env::remove_var(ENV_SITE_URL),
         }
         out
+    }
+
+    fn with_site_url_unset<T>(f: impl FnOnce() -> T) -> T {
+        with_site_url(None, f)
     }
 
     #[test]
@@ -209,16 +221,12 @@ mod tests {
 
     #[test]
     fn site_url_env_override_wins() {
-        let saved = std::env::var(ENV_SITE_URL).ok();
-        std::env::set_var(ENV_SITE_URL, "https://auth.example.com/");
-        // Trailing slash is trimmed; derivation is skipped entirely.
-        assert_eq!(
-            auth_base_url("http://localhost:3210").unwrap(),
-            "https://auth.example.com/api/auth"
-        );
-        match saved {
-            Some(v) => std::env::set_var(ENV_SITE_URL, v),
-            None => std::env::remove_var(ENV_SITE_URL),
-        }
+        with_site_url(Some("https://auth.example.com/"), || {
+            // Trailing slash is trimmed; derivation is skipped entirely.
+            assert_eq!(
+                auth_base_url("http://localhost:3210").unwrap(),
+                "https://auth.example.com/api/auth"
+            );
+        });
     }
 }

@@ -56,11 +56,27 @@ fn first_env(names: &[&str]) -> Option<String> {
         .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
 }
 
+/// Compile-time default Coordinator URL for distributable builds: baked in by
+/// setting `FILETHING_DEFAULT_CONVEX_URL` at *build* time (the release/dist
+/// pipeline points it at the managed Convex Cloud deployment). `None` in a
+/// plain `cargo build`, where the localhost Docker infra remains the default.
+const BAKED_DEFAULT_URL: Option<&str> = option_env!("FILETHING_DEFAULT_CONVEX_URL");
+
 /// The Coordinator URL for this run: `CONVEX_URL`, then the self-hosted alias,
-/// else the localhost default. Used both for `login` (no config yet) and to
-/// verify a config's URL.
+/// then the baked-in distribution default, else localhost. Used both for
+/// `login` (no config yet) and to verify a config's URL.
 pub fn coordinator_url_from_env() -> String {
-    first_env(&[ENV_URL, ENV_URL_SELF_HOSTED])
+    resolve_coordinator_url(
+        first_env(&[ENV_URL, ENV_URL_SELF_HOSTED]),
+        BAKED_DEFAULT_URL,
+    )
+}
+
+/// Pure resolution order behind [`coordinator_url_from_env`]: runtime env var >
+/// baked-in build default > localhost (dev Docker infra).
+fn resolve_coordinator_url(env_url: Option<String>, baked_default: Option<&str>) -> String {
+    env_url
+        .or_else(|| baked_default.map(str::to_string))
         .unwrap_or_else(|| "http://localhost:3210".to_string())
 }
 
@@ -75,6 +91,19 @@ pub fn coordinator_url_from_env() -> String {
 /// - Without a session: fall back to the deployment admin/deploy key
 ///   ([`connect_ops_fallback`]) — an OPS escape hatch, no longer the normal flow.
 pub async fn connect(url: &str, creds: Option<&Credentials>) -> anyhow::Result<Coordinator> {
+    Ok(Coordinator::from_client(connect_client(url, creds).await?))
+}
+
+/// The raw authenticated [`ConvexClient`] behind [`connect`]. Exposed so the
+/// data plane can share the SAME authenticated connection: [`build_vault`]
+/// hands a clone of this client to the [`SignedVault`] when the `S3_*` env vars
+/// are absent (the end-user path, `docs/adr/0016`).
+///
+/// [`SignedVault`]: crate::signed_vault::SignedVault
+pub async fn connect_client(
+    url: &str,
+    creds: Option<&Credentials>,
+) -> anyhow::Result<ConvexClient> {
     match creds {
         Some(c) if !c.session_token.is_empty() => connect_authed(url, &c.session_token).await,
         _ => connect_ops_fallback(url).await,
@@ -84,7 +113,7 @@ pub async fn connect(url: &str, creds: Option<&Credentials>) -> anyhow::Result<C
 /// Connects with the per-Device Better Auth session attached as a Convex JWT,
 /// re-minted on every connect/reconnect via [`ConvexClient::set_auth_callback`]
 /// (see [`connect`]'s doc comment).
-async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<Coordinator> {
+async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<ConvexClient> {
     let base = auth::auth_base_url(url)?;
     let mut client = ConvexClient::new(url)
         .await
@@ -103,7 +132,7 @@ async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<Coordi
             >
     });
     client.set_auth_callback(Some(fetcher)).await;
-    Ok(Coordinator::from_client(client))
+    Ok(client)
 }
 
 /// Ops fallback: connect with the deployment admin/deploy key when there is no
@@ -111,7 +140,7 @@ async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<Coordi
 /// `CONVEX_DEPLOY_KEY` (Convex Cloud), `CONVEX_SELF_HOSTED_ADMIN_KEY` (local
 /// infra) — and never persisted. With NONE set, connects unauthenticated (which
 /// the auth-gated contract functions now reject — hence the login hint).
-async fn connect_ops_fallback(url: &str) -> anyhow::Result<Coordinator> {
+async fn connect_ops_fallback(url: &str) -> anyhow::Result<ConvexClient> {
     let mut client = ConvexClient::new(url)
         .await
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
@@ -129,7 +158,7 @@ async fn connect_ops_fallback(url: &str) -> anyhow::Result<Coordinator> {
              require authentication; run `filething login` first"
         ),
     }
-    Ok(Coordinator::from_client(client))
+    Ok(client)
 }
 
 /// Loads this Device's encryption key material for the Space at `root` from the
@@ -225,16 +254,72 @@ pub async fn ensure_space_key_cached(
     }
 }
 
-/// Builds the data-plane [`Vault`] from the `S3_*` env vars
-/// ([`S3Vault::from_env`](ft_vault::S3Vault::from_env)). Errors with a clear
-/// message when any `S3_*` var is unset.
-pub async fn build_vault() -> anyhow::Result<Box<dyn Vault>> {
-    match ft_vault::S3Vault::from_env().await {
-        Some(v) => Ok(Box::new(v)),
+/// Builds the data-plane [`Vault`]. Precedence (`docs/adr/0016`):
+///
+/// 1. `S3_*` env vars fully set → direct [`S3Vault`](ft_vault::S3Vault): the
+///    ops/self-hosted/dev path, and the ONLY one that supports `gc` (which
+///    needs `list`/`delete` — presigned URLs cannot list).
+/// 2. Otherwise → [`SignedVault`](crate::signed_vault::SignedVault) over
+///    `client`: the end-user path. Blobs go direct to R2 via presigned URLs
+///    minted by the Coordinator's auth-gated `vault:sign` action; the Device
+///    never holds storage credentials.
+pub async fn build_vault(client: Option<ConvexClient>) -> anyhow::Result<Box<dyn Vault>> {
+    if let Some(v) = ft_vault::S3Vault::from_env().await {
+        return Ok(Box::new(v));
+    }
+    match client {
+        Some(c) => Ok(Box::new(crate::signed_vault::SignedVault::new(c))),
         None => Err(anyhow::anyhow!(
-            "the Vault is not configured: set S3_ENDPOINT / S3_REGION / S3_ACCESS_KEY / \
-             S3_SECRET_KEY / S3_BUCKET (see infra/.env)"
+            "the Vault is not configured: run `filething login` (presigned data plane) or set \
+             S3_ENDPOINT / S3_REGION / S3_ACCESS_KEY / S3_SECRET_KEY / S3_BUCKET (direct, ops)"
         )),
+    }
+}
+
+/// One [`connect`] + [`build_vault`] over the SAME authenticated connection —
+/// the standard preamble of every online subcommand.
+pub async fn connect_and_vault(
+    url: &str,
+    creds: Option<&Credentials>,
+) -> anyhow::Result<(Coordinator, Box<dyn Vault>)> {
+    let client = connect_client(url, creds).await?;
+    let vault = build_vault(Some(client.clone())).await?;
+    Ok((Coordinator::from_client(client), vault))
+}
+
+/// A data plane for OFFLINE `status`: `status` must report local changes with
+/// no connectivity, but mounting a [`SpaceContext`](ft_engine::SpaceContext)
+/// requires a `Vault` even though scanning never touches it. Every operation
+/// errors, pointing at the two real backends.
+pub struct UnavailableVault;
+
+#[async_trait::async_trait]
+impl Vault for UnavailableVault {
+    async fn head(&self, key: &str) -> ft_vault::VaultResult<bool> {
+        Err(self.err(key))
+    }
+    async fn get(&self, key: &str) -> ft_vault::VaultResult<Vec<u8>> {
+        Err(self.err(key))
+    }
+    async fn put(&self, key: &str, _body: Vec<u8>) -> ft_vault::VaultResult<()> {
+        Err(self.err(key))
+    }
+    async fn list(&self, prefix: &str) -> ft_vault::VaultResult<Vec<ft_vault::VaultObject>> {
+        Err(self.err(prefix))
+    }
+    async fn delete(&self, key: &str) -> ft_vault::VaultResult<()> {
+        Err(self.err(key))
+    }
+}
+
+impl UnavailableVault {
+    fn err(&self, key: &str) -> ft_vault::VaultError {
+        ft_vault::VaultError::S3 {
+            key: key.to_string(),
+            message: "no Vault available offline: the signed data plane needs the Coordinator \
+                      reachable, or set S3_* for direct access"
+                .to_string(),
+        }
     }
 }
 
@@ -314,6 +399,27 @@ mod tests {
 
     fn space_id() -> SpaceId {
         SpaceId::new("space1".to_string())
+    }
+
+    #[test]
+    fn resolve_coordinator_url_env_wins_over_baked_default() {
+        let url = resolve_coordinator_url(
+            Some("https://from-env.convex.cloud".into()),
+            Some("https://baked.convex.cloud"),
+        );
+        assert_eq!(url, "https://from-env.convex.cloud");
+    }
+
+    #[test]
+    fn resolve_coordinator_url_baked_default_wins_over_localhost() {
+        let url = resolve_coordinator_url(None, Some("https://baked.convex.cloud"));
+        assert_eq!(url, "https://baked.convex.cloud");
+    }
+
+    #[test]
+    fn resolve_coordinator_url_falls_back_to_localhost_dev_infra() {
+        let url = resolve_coordinator_url(None, None);
+        assert_eq!(url, "http://localhost:3210");
     }
 
     #[test]

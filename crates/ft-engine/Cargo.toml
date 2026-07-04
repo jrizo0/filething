@@ -33,4 +33,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 async-trait = { workspace = true }
-convex = "0.10"
+convex = { workspace = true }

@@ -4,8 +4,10 @@ CLI de sync de carpetas tipo "Dropbox para developers", en Rust. Este MVP corre 
 vertical completo entre **dos Devices** (aquí simulados como dos procesos en la misma
 máquina Linux) contra un **Coordinator** (Convex) y un **Vault** (S3/MinIO).
 
-Cifrado OFF en el MVP (`alg=0`, `cid==pcid`) con todos los huecos del formato reservados
-(ver `docs/format.md`). Detalle de la arquitectura en `docs/BUILD-PLAN.md`; estado en `TODO.md`.
+Cifrado en runtime activo desde Fase 3: `alg=1` (XChaCha20-Poly1305) es el default para
+Spaces nuevas, con escrow de claves en Convex (`docs/adr/0015`). Spaces creadas antes de
+Fase 3 siguen en `alg=0` (`cid==pcid`); el Vault mixto está permitido indefinidamente
+(`docs/format.md §11`). Detalle de la arquitectura en `docs/BUILD-PLAN.md`; estado en `TODO.md`.
 
 ## 0. Requisitos
 - Rust (stable), Bun, Docker. (En este repo ya están instalados.)
@@ -31,7 +33,7 @@ cargo build --release -p filething   # binario en target/release/filething
 
 ## 3. El comando
 ```
-filething login [--code <CODE>] [--name <NAME>]   # emparejar Device (sin --code = primer Device, imprime un código)
+filething login --email <EMAIL> [--signup] [--name <NAME>]  # login (Better Auth); --signup = crear cuenta
 filething init  <dir> [--name <NAME>]             # carpeta -> Space nuevo (primer commit)
 filething clone <space_id> <dir>                  # traer un Space existente a una carpeta
 filething status [<dir>]                          # base sincronizada + cambios locales
@@ -57,8 +59,8 @@ Simula dos Devices (dos `FILETHING_HOME`) y valida, contra la infra viva:
 
 ## 5. Demo continua (dos daemons)
 ```bash
-FILETHING_HOME=/tmp/devA filething login --name a            # copia el código
-FILETHING_HOME=/tmp/devB filething login --code <CODE> --name b
+FILETHING_HOME=/tmp/devA filething login --email demo@example.com --signup --name a
+FILETHING_HOME=/tmp/devB filething login --email demo@example.com --name b   # misma cuenta, otro Device
 mkdir -p /tmp/A /tmp/B; echo hola > /tmp/A/saludo.txt
 FILETHING_HOME=/tmp/devA filething init  /tmp/A --name demo  # imprime <space_id>
 FILETHING_HOME=/tmp/devB filething clone <space_id> /tmp/B
@@ -85,6 +87,8 @@ Convex Cloud + deploy key, rellenar `infra/.env.cloud`, y `scripts/cloud-deploy.
 - `filething service <install|uninstall|status>` — daemon como servicio del SO.
 
 ## Qué NO está en el MVP (huecos reservados en el formato, no construidos)
-Cifrado en runtime, zero-knowledge, serve mode / self-hosted vault, GC/retención,
-Better Auth/OAuth navegador (MVP = pairing por código), billing, dashboard, packing de
-bloques chicos, binarios per-SO, Windows. Ver `TODO.md` (sección Reservado) y `docs/format.md §11`.
+zero-knowledge, serve mode / self-hosted vault, poda de historial / retention floor (existe
+`filething gc`: orphan-sweep account-wide, dry-run por defecto — retiene TODO el historial;
+ver `docs/adr/0012`), OAuth navegador, billing, dashboard, packing de bloques chicos, Windows.
+Ver `TODO.md` (sección Reservado) y `docs/format.md §11`. (Los binarios per-SO SÍ existen
+desde Fase 5: installer shell desde GitHub Releases, ver `README.md`.)

@@ -1,0 +1,24 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# Mac (ambas arquitecturas) + Linux musl estático (sin dependencia de glibc del
+# host — cubre VPS viejos). Windows queda fuera (TODO.md: sin validación de
+# nombres Windows aún). Los builds llevan FILETHING_DEFAULT_CONVEX_URL horneada
+# (ver github-build-setup + apps/cli/src/env.rs).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# Path that installers should place binaries in (end users don't have Rust, so
+# not CARGO_HOME; the installer adds it to PATH via the shell profile).
+install-path = "~/.local/bin"
+# Steps injected into every build job: bakes the managed Coordinator URL.
+github-build-setup = "release-build-setup.yml"
+# Whether to install an updater program
+install-updater = false

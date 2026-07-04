@@ -11,6 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1079.0",
+    "@aws-sdk/s3-request-presigner": "^3.1079.0",
     "@convex-dev/better-auth": "^0.12.5",
     "better-auth": "~1.6.15",
     "convex": "^1.27.0"

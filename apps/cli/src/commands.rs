@@ -183,8 +183,7 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     });
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let coordinator = env::connect(&url, Some(&creds)).await?;
+    let (coordinator, vault) = env::connect_and_vault(&url, Some(&creds)).await?;
 
     // Generate this Space's escrow key and turn on `alg=1`: `init_space` sends the
     // key to `spaces:create` and encrypts the first Revision. `dedup_secret` is
@@ -250,8 +249,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
     }
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, Some(&creds)).await?;
+    let (mut coordinator, vault) = env::connect_and_vault(&url, Some(&creds)).await?;
 
     // Cache the Space's escrow key locally (0600) before materializing, so later
     // commands open it offline. `clone_space` uses it + dedup_secret to decrypt
@@ -314,7 +312,15 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
+
+    // Best-effort connection: `status` must work offline, and scanning never
+    // touches the Vault — so a failed connect degrades to an [`UnavailableVault`]
+    // placeholder (mount requires one) plus "remote head: unavailable" below.
+    let client = env::connect_client(&url, creds.as_ref()).await;
+    let vault = match env::build_vault(client.as_ref().ok().cloned()).await {
+        Ok(v) => v,
+        Err(_) => Box::new(env::UnavailableVault),
+    };
 
     // Mount for scanning only (no Coordinator needed to detect LOCAL changes).
     let mut ctx = SpaceContext::mount(
@@ -354,8 +360,8 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     println!("  tracked paths: {}", scan.entries.len());
 
     // Best-effort remote head check (does not fail status if the Coordinator is
-    // unreachable — status must work offline).
-    match env::connect(&url, creds.as_ref()).await {
+    // unreachable — status must work offline). Reuses the connection from above.
+    match client.map(ft_engine::Coordinator::from_client) {
         Ok(mut coordinator) => match coordinator.get_space(&space_id).await {
             Ok(space) => match space.head_revision_id {
                 Some(head) => {
@@ -419,8 +425,7 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+    let (mut coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
     // Recover the escrow key into the cache if it is missing, so encryption is
     // attached correctly below (a commit on an `alg=1` Space MUST encrypt).
     let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
@@ -488,10 +493,9 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         let root = normalize_abs(&dir);
         let space_id = env::space_id_at(&root)?;
         let index = env::open_index(&root)?;
-        let vault = env::build_vault().await?;
         // The JWT is re-minted on every connect and reconnect (set_auth_callback,
         // see env::connect) so the daemon outlives the ~15-min token expiry.
-        let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+        let (mut coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
         let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
         let mut ctx = SpaceContext::open(
             index,
@@ -537,10 +541,11 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
     // GC walks cleartext Manifests + meta blobs and deletes Vault objects (sidecars
     // included); it never decrypts Block content, so no crypto is attached here.
-    let coordinator = env::connect(&url, creds.as_ref()).await?;
+    // Its sweep needs `list`/`delete`, which the signed data plane cannot offer:
+    // gc is operator-only, run it with the direct `S3_*` env vars set.
+    let (coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
         .context("opening Space")?;
 

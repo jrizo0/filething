@@ -15,6 +15,7 @@ mod config;
 mod credentials;
 mod env;
 mod service;
+mod signed_vault;
 
 use std::path::PathBuf;
 

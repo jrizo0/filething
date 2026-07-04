@@ -27,6 +27,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# SignedVault implements the ft-vault Vault trait against presigned URLs.
+async-trait = { workspace = true }
 # To read the single space_state row out of a Space's local index when resolving
 # a dir to its Space id (ft-index keys space_state by id, no "only row" getter).
 rusqlite = { workspace = true }

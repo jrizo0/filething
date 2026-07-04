@@ -1,15 +1,21 @@
 //! `service` — install / uninstall / status of the filething daemon as an OS
-//! service (`TODO.md` Fase B, "daemon como servicio").
+//! service (`TODO.md` Fase B, "daemon como servicio"; Fase 6, "daemon por
+//! defecto").
 //!
 //! macOS → a launchd LaunchAgent (`~/Library/LaunchAgents/com.filething.daemon.plist`).
 //! Linux → a systemd **user** unit (`~/.config/systemd/user/filething.service`).
 //!
-//! Both run `filething daemon <root…>` over every Space mapped in `config.json`,
-//! restart on crash, and log to `<config_dir>/daemon.log`. The daemon needs the
-//! Convex + `S3_*` credentials in its environment; `install` captures the ones
-//! currently set into a 0600 `<config_dir>/service.env` that the service loads
-//! (systemd `EnvironmentFile`; launchd via a `/bin/sh` wrapper that sources it),
-//! so secrets live in ONE private file, never in the unit/plist or the config.
+//! Both run `filething daemon` with NO folder arguments: the daemon resolves its
+//! Space list fresh from `config.json` on every start, so a Space added later
+//! (another `init`/`clone`) only needs a restart — the unit/plist never has to be
+//! rewritten to add it (see [`crate::commands`]'s `ensure_background_daemon`,
+//! which installs/restarts this service automatically after `init`/`clone`/
+//! `sync`). Both restart on crash and log to `<config_dir>/daemon.log`. The
+//! daemon needs the Convex + `S3_*` credentials in its environment; `install`
+//! captures the ones currently set into a 0600 `<config_dir>/service.env` that
+//! the service loads (systemd `EnvironmentFile`; launchd via a `/bin/sh` wrapper
+//! that sources it), so secrets live in ONE private file, never in the
+//! unit/plist or the config.
 //!
 //! The content generators are pure and unit-tested; the install/uninstall/status
 //! entry points shell out to `launchctl` / `systemctl --user` and degrade to
@@ -104,17 +110,15 @@ fn env_file_body(vars: &[(String, String)]) -> String {
 }
 
 /// The launchd plist body. Runs a `/bin/sh -c` wrapper that sources the env file
-/// (auto-exporting via `set -a`) then execs the daemon over `roots`.
-fn plist_body(exe: &str, roots: &[String], env_file: &str, log_file: &str) -> String {
-    let mut cmd = format!(
+/// (auto-exporting via `set -a`) then execs `filething daemon` with no folder
+/// arguments — it resolves every Space mapped in `config.json` at startup, so
+/// this body never needs rewriting when a Space is added.
+fn plist_body(exe: &str, env_file: &str, log_file: &str) -> String {
+    let cmd = format!(
         "set -a; . {}; set +a; exec {} daemon",
         sh_quote(env_file),
         sh_quote(exe)
     );
-    for root in roots {
-        cmd.push(' ');
-        cmd.push_str(&sh_quote(root));
-    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -157,14 +161,11 @@ fn systemd_arg(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// The systemd user-unit body. Loads the env file, runs the daemon over `roots`,
-/// restarts on failure.
-fn systemd_unit_body(exe: &str, roots: &[String], env_file: &str) -> String {
-    let mut exec = format!("{} daemon", systemd_arg(exe));
-    for root in roots {
-        exec.push(' ');
-        exec.push_str(&systemd_arg(root));
-    }
+/// The systemd user-unit body. Loads the env file, runs `filething daemon` with
+/// no folder arguments (resolves every mapped Space at startup — see
+/// [`plist_body`]), restarts on failure.
+fn systemd_unit_body(exe: &str, env_file: &str) -> String {
+    let exec = format!("{} daemon", systemd_arg(exe));
     format!(
         "[Unit]\n\
          Description=filething continuous sync daemon\n\
@@ -193,20 +194,74 @@ fn current_exe() -> anyhow::Result<String> {
     Ok(exe.to_string_lossy().into_owned())
 }
 
-/// The Space roots to sync, from `config.json`. Errors if none are mapped yet.
-fn configured_roots() -> anyhow::Result<Vec<String>> {
-    let cfg = Config::load()?;
-    let roots: Vec<String> = cfg.spaces.iter().map(|m| m.local_root.clone()).collect();
-    if roots.is_empty() {
-        bail!("no Spaces mapped yet — run `filething init` or `filething clone` first");
-    }
-    Ok(roots)
+/// How many Spaces `config.json` currently maps, for the informational line
+/// `install()` prints (the service itself takes no roots — see the module docs).
+fn configured_space_count() -> usize {
+    Config::load().map(|c| c.spaces.len()).unwrap_or(0)
 }
 
 fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
+}
+
+/// The OS-specific service descriptor path (the launchd plist on macOS, the
+/// systemd user unit on Linux). Its existence is the source of truth for
+/// "installed" — used by [`is_installed`] and by `install`/`uninstall`.
+fn service_file_path() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Ok(home_dir()?
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist")))
+    } else if cfg!(target_os = "linux") {
+        Ok(home_dir()?.join(".config/systemd/user").join(SYSTEMD_UNIT))
+    } else {
+        bail!("`service` supports macOS (launchd) and Linux (systemd) only")
+    }
+}
+
+/// Whether the service is installed (its unit/plist file exists on disk). Used
+/// by `commands::ensure_background_daemon` to decide install vs. restart/start.
+pub(crate) fn is_installed() -> bool {
+    service_file_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Whether the service is currently active. macOS: `launchctl list <label>`
+/// exits 0 only while the job is loaded; since the plist sets `KeepAlive`, loaded
+/// and running coincide in practice. Linux: `systemctl --user is-active` prints
+/// `active` exactly while the unit is running.
+pub(crate) fn is_running() -> bool {
+    if cfg!(target_os = "macos") {
+        run_cmd_output("launchctl", &["list", LABEL]).is_ok()
+    } else if cfg!(target_os = "linux") {
+        run_cmd_output("systemctl", &["--user", "is-active", SYSTEMD_UNIT])
+            .map(|out| out.trim() == "active")
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// Restarts the already-installed service in place — does not touch the
+/// unit/plist or env file (use `install()` to regenerate those). Also used to
+/// start it when [`is_running`] is false.
+///
+/// macOS has no portable single-command restart for a plist-based LaunchAgent
+/// across OS versions (`kickstart` targets the modern service domain and isn't
+/// always available/permitted for LaunchAgents), so this does the same
+/// unload-then-load `install()` uses to (re)start it.
+pub(crate) fn restart() -> anyhow::Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist = service_file_path()?;
+        let plist_s = plist.to_string_lossy().into_owned();
+        let _ = run_cmd("launchctl", &["unload", &plist_s]);
+        run_cmd("launchctl", &["load", "-w", &plist_s])
+    } else if cfg!(target_os = "linux") {
+        run_cmd("systemctl", &["--user", "restart", SYSTEMD_UNIT])
+    } else {
+        bail!("`service` supports macOS (launchd) and Linux (systemd) only")
+    }
 }
 
 /// Writes the captured-env file and returns its path. The file holds
@@ -244,22 +299,22 @@ fn write_env_file() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-fn install() -> anyhow::Result<()> {
+/// Writes the unit/plist + env file and loads the service. Public to
+/// `crate::commands`'s `ensure_background_daemon`, which calls this the first
+/// time `init`/`clone`/`sync` succeeds with no service installed yet.
+pub(crate) fn install() -> anyhow::Result<()> {
     let exe = current_exe()?;
-    let roots = configured_roots()?;
     let env_file = write_env_file()?;
     let log_file = Config::config_dir().join(LOG_FILE);
     let env_file_s = env_file.to_string_lossy().into_owned();
     let log_file_s = log_file.to_string_lossy().into_owned();
+    let path = service_file_path()?;
 
     if cfg!(target_os = "macos") {
-        let plist = home_dir()?
-            .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"));
-        write_file(&plist, &plist_body(&exe, &roots, &env_file_s, &log_file_s))?;
-        println!("Wrote launchd agent: {}", plist.display());
+        write_file(&path, &plist_body(&exe, &env_file_s, &log_file_s))?;
+        println!("Wrote launchd agent: {}", path.display());
         // Reload: unload first (ignore errors), then load.
-        let plist_s = plist.to_string_lossy().into_owned();
+        let plist_s = path.to_string_lossy().into_owned();
         let _ = run_cmd("launchctl", &["unload", &plist_s]);
         match run_cmd("launchctl", &["load", "-w", &plist_s]) {
             Ok(()) => println!("Loaded and started the launchd agent."),
@@ -268,9 +323,8 @@ fn install() -> anyhow::Result<()> {
             ),
         }
     } else if cfg!(target_os = "linux") {
-        let unit = home_dir()?.join(".config/systemd/user").join(SYSTEMD_UNIT);
-        write_file(&unit, &systemd_unit_body(&exe, &roots, &env_file_s))?;
-        println!("Wrote systemd user unit: {}", unit.display());
+        write_file(&path, &systemd_unit_body(&exe, &env_file_s))?;
+        println!("Wrote systemd user unit: {}", path.display());
         let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
         match run_cmd("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT]) {
             Ok(()) => println!("Enabled and started {SYSTEMD_UNIT} (systemctl --user)."),
@@ -285,25 +339,23 @@ fn install() -> anyhow::Result<()> {
     }
 
     println!(
-        "Syncing {} Space(s); logs at {}",
-        roots.len(),
+        "Syncing {} Space(s) mapped in config.json (it re-reads the mapping on every \
+         restart, so a later `init`/`clone` just needs a restart); logs at {}",
+        configured_space_count(),
         log_file.display()
     );
     Ok(())
 }
 
 fn uninstall() -> anyhow::Result<()> {
+    let path = service_file_path()?;
     if cfg!(target_os = "macos") {
-        let plist = home_dir()?
-            .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"));
-        let plist_s = plist.to_string_lossy().into_owned();
+        let plist_s = path.to_string_lossy().into_owned();
         let _ = run_cmd("launchctl", &["unload", &plist_s]);
-        remove_if_present(&plist)?;
+        remove_if_present(&path)?;
     } else if cfg!(target_os = "linux") {
         let _ = run_cmd("systemctl", &["--user", "disable", "--now", SYSTEMD_UNIT]);
-        let unit = home_dir()?.join(".config/systemd/user").join(SYSTEMD_UNIT);
-        remove_if_present(&unit)?;
+        remove_if_present(&path)?;
         let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
     } else {
         bail!("`service` supports macOS (launchd) and Linux (systemd) only");
@@ -414,18 +466,19 @@ mod tests {
     }
 
     #[test]
-    fn plist_embeds_wrapper_and_roots() {
+    fn plist_embeds_wrapper_and_no_roots() {
         let p = plist_body(
             "/usr/local/bin/filething",
-            &["/home/u/proj".to_string(), "/home/u/notes".to_string()],
             "/cfg/service.env",
             "/cfg/daemon.log",
         );
         assert!(p.contains("<string>com.filething.daemon</string>"));
         assert!(p.contains("/bin/sh"));
-        // The wrapper sources the env file then execs the daemon over both roots.
-        assert!(p.contains("set -a; . &apos;/cfg/service.env&apos;; set +a; exec"));
-        assert!(p.contains("daemon &apos;/home/u/proj&apos; &apos;/home/u/notes&apos;"));
+        // The wrapper sources the env file then execs the daemon with NO folder
+        // args — it resolves every mapped Space itself at startup.
+        assert!(p.contains(
+            "set -a; . &apos;/cfg/service.env&apos;; set +a; exec &apos;/usr/local/bin/filething&apos; daemon"
+        ));
         assert!(p.contains("<string>/cfg/daemon.log</string>"));
     }
 
@@ -437,14 +490,11 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_has_envfile_and_execstart() {
-        let u = systemd_unit_body(
-            "/usr/local/bin/filething",
-            &["/home/u/proj".to_string()],
-            "/cfg/service.env",
-        );
+    fn systemd_unit_has_envfile_and_execstart_with_no_roots() {
+        let u = systemd_unit_body("/usr/local/bin/filething", "/cfg/service.env");
         assert!(u.contains("EnvironmentFile=/cfg/service.env"));
-        assert!(u.contains("ExecStart=\"/usr/local/bin/filething\" daemon \"/home/u/proj\""));
+        // No folder args — the daemon resolves every mapped Space itself.
+        assert!(u.contains("ExecStart=\"/usr/local/bin/filething\" daemon\n"));
         assert!(u.contains("Restart=always"));
         assert!(u.contains("WantedBy=default.target"));
     }

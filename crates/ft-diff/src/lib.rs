@@ -651,6 +651,13 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 /// `crypto` is forwarded to [`materialize`] for every Added/Modified change so an
 /// `alg=1` Block can be decrypted; `None` keeps the cleartext path (see
 /// [`materialize`]).
+///
+/// The changes run CONCURRENTLY (`buffer_unordered`, bounded to 8 in flight):
+/// `changes` comes from a single [`diff`] call, whose merge-join emits at most one
+/// `Change` per [`CasefoldKey`](ft_core::CasefoldKey) — every change here targets
+/// a DIFFERENT path, so materializing/removing them in parallel touches disjoint
+/// files and is safe. Aborts on the first error (a later change may still be
+/// in flight when that happens; `apply` is not resumable mid-batch either way).
 pub async fn apply(
     vault: &dyn Vault,
     fs: &dyn OsFs,
@@ -658,17 +665,44 @@ pub async fn apply(
     changes: &[Change],
     crypto: Option<&SpaceCrypto>,
 ) -> Result<()> {
-    for change in changes {
-        match change {
-            Change::Added(entry) | Change::Modified { new: entry, .. } => {
-                materialize(vault, fs, space_root, entry, crypto).await?;
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let total = changes.len();
+    tracing::info!(total, "applying changes");
+    let started = Instant::now();
+    let completed = AtomicUsize::new(0);
+
+    stream::iter(changes.iter())
+        .map(|change| {
+            let completed = &completed;
+            async move {
+                match change {
+                    Change::Added(entry) | Change::Modified { new: entry, .. } => {
+                        materialize(vault, fs, space_root, entry, crypto).await?;
+                    }
+                    Change::Deleted(entry) => {
+                        let dest = join_canonical(space_root, entry);
+                        remove_path(&dest)?;
+                    }
+                }
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(25) {
+                    tracing::info!(completed = n, total, "applying changes");
+                }
+                Result::Ok(())
             }
-            Change::Deleted(entry) => {
-                let dest = join_canonical(space_root, entry);
-                remove_path(&dest)?;
-            }
-        }
-    }
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<()>>()
+        .await?;
+
+    tracing::info!(
+        total,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "changes applied"
+    );
     Ok(())
 }
 

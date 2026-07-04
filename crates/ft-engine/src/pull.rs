@@ -212,7 +212,19 @@ impl SpaceContext {
     /// marking each materialized file for echo suppression and updating the local
     /// index. Returns the number of changes applied.
     async fn fast_forward(&self, base_root: &Cid, head_root: &Cid) -> Result<usize> {
+        let started = std::time::Instant::now();
         let changes = diff(self.vault.as_ref(), base_root, head_root).await?;
+
+        // Pre-sign every GET the upcoming `apply` will issue, in one batch
+        // (`Vault::warm`, ADR 0016) — best effort, never blocks the apply.
+        let warm_ops = self.read_warm_ops(changes.iter().filter_map(|c| match c {
+            Change::Added(entry) | Change::Modified { new: entry, .. } => Some(entry),
+            Change::Deleted(_) => None,
+        }));
+        self.warm_reads(warm_ops, "fast_forward").await;
+
+        let total = changes.len();
+        tracing::info!(total, "fast-forwarding changes");
         // Apply to disk (materialize adds/mods, remove deletes) then mark echoes +
         // update the index per change.
         apply(
@@ -226,7 +238,61 @@ impl SpaceContext {
         for change in &changes {
             self.record_applied_change(change)?;
         }
+        tracing::info!(
+            total,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "fast-forward applied"
+        );
         Ok(changes.len())
+    }
+
+    /// Builds the [`ft_vault::WarmOp`]s that materializing `entries` will issue: a
+    /// `Get` of the externalized blocklist (`bk_ref`) when set, otherwise a `Get`
+    /// per inline Block id (`entry.bk`), plus the matching
+    /// `keys/<space_id>/<cid>` sidecar `Get` for each Block when encryption is on
+    /// (mirrors exactly what [`materialize`] reads, `ft_diff::materialize`). A
+    /// pure hint: including an entry that ends up not being materialized (e.g. a
+    /// reconcile loser) is harmless — over-warming is cheap.
+    fn read_warm_ops<'a>(
+        &self,
+        entries: impl IntoIterator<Item = &'a FileEntry>,
+    ) -> Vec<ft_vault::WarmOp> {
+        use ft_vault::{WarmMethod, WarmOp};
+        let mut ops = Vec::new();
+        for entry in entries {
+            if let Some(bk_ref) = entry.bk_ref {
+                ops.push(WarmOp {
+                    key: ft_hash::blocklist_key(&bk_ref),
+                    method: WarmMethod::Get,
+                });
+            }
+            for cid in &entry.bk {
+                ops.push(WarmOp {
+                    key: ft_hash::block_key(cid),
+                    method: WarmMethod::Get,
+                });
+                if let Some(crypto) = self.crypto.as_ref() {
+                    ops.push(WarmOp {
+                        key: ft_diff::keys_key(&crypto.space_id, cid),
+                        method: WarmMethod::Get,
+                    });
+                }
+            }
+        }
+        ops
+    }
+
+    /// Announces `ops` to the Vault (`Vault::warm`, ADR 0016) and swallows any
+    /// error: warming is a pure hint, so a failure here must never block the read
+    /// path — the real `get` still reports any genuine failure. `label` names the
+    /// caller for the debug log.
+    async fn warm_reads(&self, ops: Vec<ft_vault::WarmOp>, label: &str) {
+        if ops.is_empty() {
+            return;
+        }
+        if let Err(e) = self.vault.warm(&ops).await {
+            tracing::debug!(error = %e, label, "vault warm failed; continuing without it");
+        }
     }
 
     /// Updates the local index and the echo-suppression marks for one applied
@@ -353,6 +419,13 @@ impl SpaceContext {
         let base = self.read_manifest_entries(base_root).await?;
         let remote = self.read_manifest_entries(head_root).await?;
         let local: HashMap<CasefoldKey, FileEntry> = scan_entries.iter().cloned().collect();
+
+        // Pre-sign every GET a materialize of a `remote` entry might issue, before
+        // the per-path resolution loop below. Over-warming the whole `remote` map
+        // is cheap and simpler than predicting which entries the resolver below
+        // will actually pick as winners.
+        let warm_ops = self.read_warm_ops(remote.values());
+        self.warm_reads(warm_ops, "reconcile").await;
 
         // The union of every key seen on any side, in a stable order.
         let mut keys: BTreeSet<CasefoldKey> = BTreeSet::new();

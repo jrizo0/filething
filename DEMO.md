@@ -39,8 +39,11 @@ filething clone <space_id> <dir>                  # traer un Space existente a u
 filething status [<dir>]                          # base sincronizada + cambios locales
 filething ls     [<dir>]                          # listar rutas del Space
 filething sync   <dir>                            # one-shot: pull + commit (para scripts)
-filething daemon <dir>...                         # sync continuo en foreground (Ctrl-C para parar)
+filething daemon [<dir>...]                       # sync continuo en foreground; sin dirs = todos los Spaces
 ```
+Desde Fase 6, `init`/`clone`/`sync` dejan el daemon corriendo en background como servicio
+del SO automáticamente (opt-out: `--no-daemon` o `FILETHING_NO_AUTO_DAEMON=1` — los scripts
+de gates/smoke lo setean para no instalar servicios en la máquina que los corre).
 Config/identidad por Device en `$FILETHING_HOME` (o `~/.config/filething/config.json`).
 El índice local de cada Space vive en `<dir>/.filething/index.db`. Credenciales del
 Vault/Coordinator se leen del entorno (`S3_*`, `CONVEX_SELF_HOSTED_*`).

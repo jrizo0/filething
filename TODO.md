@@ -169,9 +169,14 @@ Entró en la tanda del 2026-07-03 ("Fase 3"): auth real + cifrado en runtime.
   macOS, systemd `--user` en Linux; env file 0600 con las credenciales + logs en
   `<config_dir>/daemon.log`, reinicio al fallar. `apps/cli/src/service.rs` (generadores puros
   testeados; carga/descarga vía launchctl/systemctl).
-- [ ] **Binarios por SO** (cargo-dist o similar) + firma/notarización en macOS. El build de
-  distribución debe fijar `FILETHING_DEFAULT_CONVEX_URL` (default horneado del Coordinator,
-  `apps/cli/src/env.rs`; 2026-07-04) — sin ella el binario cae a localhost como en dev.
+- [x] **Binarios por SO** (Fase 5, 2026-07-04): `dist` (cargo-dist 0.32) con installer shell
+  (`curl | sh` desde GitHub Releases) para Mac arm64/x86_64 + Linux musl x86_64/arm64
+  (estático, sin glibc del host); stack TLS migrado a rustls (fuera OpenSSL) para el
+  cross-build musl; el workflow de release hornea `FILETHING_DEFAULT_CONVEX_URL`
+  (`.github/workflows/release-build-setup.yml` → `apps/cli/src/env.rs`) — sin ella el
+  binario cae a localhost como en dev. Repo público + licencia MIT. **Reservado**:
+  firma/notarización macOS (solo hace falta para Homebrew cask/GUI; `curl` no pone el
+  atributo de cuarentena de Gatekeeper), dominio propio para el installer (redirect).
 - [~] **GC/retención** (`filething gc`, dry-run por defecto): mark-and-sweep **account-wide de
   huérfanos** (retiene TODO el historial; borra solo objetos que ninguna Revision referencia) +
   grace-period + guard de concurrencia. Validado en vivo (demo-gates gate g). ADR 0012. La

@@ -129,6 +129,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 needs ONE process-level CryptoProvider, and this binary links
+    // two candidates (reqwest brings `ring`, the convex websocket stack brings
+    // `aws-lc-rs`), so auto-detection panics inside the first TLS handshake —
+    // on a tokio worker thread, which dies silently and leaves the websocket
+    // mutation waiting forever. Pin `ring` explicitly before any TLS happens.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
+
     // Logs: default to info, override with RUST_LOG. Written to stderr so command
     // output on stdout stays clean for scripting.
     tracing_subscriber::fmt()

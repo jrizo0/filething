@@ -40,12 +40,15 @@ filething clone <space_id> ~/notes
 
 The password is read from `$FILETHING_PASSWORD` (useful in scripts) or prompted for interactively.
 
-From here you can sync a Space once, or keep it running continuously:
+After a successful `init`, `clone` or `sync`, filething installs and starts the background
+daemon as an OS service automatically (launchd on macOS, systemd --user on Linux), so your
+Spaces keep syncing without any extra step. Opt out with `--no-daemon` on the command, or
+`FILETHING_NO_AUTO_DAEMON=1` in the environment. You can still drive things manually:
 
 ```
 filething sync ~/notes            # one-shot: pull, then commit local changes
-filething daemon ~/notes          # continuous sync in the foreground (Ctrl-C to stop)
-filething service install         # install the daemon as an OS service (launchd / systemd --user)
+filething daemon                  # continuous sync of every mapped Space, in the foreground
+filething service status          # check the background service (install/uninstall also available)
 ```
 
 Check on things with:
@@ -65,8 +68,8 @@ filething metrics                 # sync counters (commits, pulls, conflicts, st
 | `clone <space_id> <dir>` | Materialize an existing Space into a local folder. |
 | `status [dir]` | Show a Space's synced base and whether it has uncommitted local changes. |
 | `ls [dir]` | List a Space's synced paths, from the local index. |
-| `sync <dir>` | One-shot: pull the head, then commit local changes. Does not run the daemon. |
-| `daemon <dir>...` | Run the foreground daemon over one or more Space folders until Ctrl-C. |
+| `sync <dir>` | One-shot: pull the head, then commit local changes. |
+| `daemon [dir]...` | Run the foreground daemon; with no dirs, over every mapped Space (what the OS service runs). |
 | `gc <dir>` | Garbage-collect the account's Vault (dry-run by default; pass `--apply` to delete). |
 | `metrics [dir]` | Show sync metrics for a Space, or every mapped Space. |
 | `service <install\|uninstall\|status>` | Manage the daemon as an OS service (launchd on macOS, systemd --user on Linux). |

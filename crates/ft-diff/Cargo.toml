@@ -14,6 +14,8 @@ ft-vault = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

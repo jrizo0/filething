@@ -7,6 +7,10 @@
 # backend ya desplegado con scripts/cloud-deploy.sh.
 set -euo pipefail
 
+# Este smoke corre sync one-shot contra FILETHING_HOME's de usar y tirar; no debe
+# instalar ningún servicio de daemon en la máquina que lo ejecuta (Fase 6).
+export FILETHING_NO_AUTO_DAEMON=1
+
 # Raíz del repo relativa a este script (funciona desde cualquier cwd y en worktrees).
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO/infra/.env.cloud"

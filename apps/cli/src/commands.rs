@@ -158,7 +158,7 @@ fn require_credentials() -> anyhow::Result<Credentials> {
 
 /// `init <dir>` — make a local folder a fresh Space and commit its first Revision
 /// (`docs/BUILD-PLAN.md §3`).
-pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+pub async fn init(dir: PathBuf, name: Option<String>, no_daemon: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = require_credentials()?;
@@ -228,12 +228,18 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
         ctx.last_synced.seq,
         hex32(ctx.last_synced.root.as_bytes())
     );
+    ensure_background_daemon(true, no_daemon);
     Ok(())
 }
 
 /// `clone <space_id> <dir>` — materialize an existing Space into a local folder
 /// (`docs/BUILD-PLAN.md §3`).
-pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+pub async fn clone(
+    space_id: String,
+    dir: PathBuf,
+    name: Option<String>,
+    no_daemon: bool,
+) -> anyhow::Result<()> {
     let _ = name; // accepted for symmetry with init; clone takes the Space's name.
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
@@ -285,6 +291,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
         hex32(ctx.last_synced.root.as_bytes())
     );
     println!("  {} path(s) materialized", entries.len());
+    ensure_background_daemon(true, no_daemon);
     Ok(())
 }
 
@@ -417,7 +424,7 @@ pub fn ls(dir: Option<PathBuf>) -> anyhow::Result<()> {
 /// `sync <dir>` — a one-shot pull + commit for the Space at `dir`
 /// (`docs/BUILD-PLAN.md §3`). Useful for scripts and the integration gates: it
 /// does NOT run the daemon. Prints both outcomes.
-pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
+pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
@@ -476,15 +483,37 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
             println!("commit: still conflicting after reconcile retries");
         }
     }
+    ensure_background_daemon(false, no_daemon);
     Ok(())
 }
 
-/// `daemon <dir>...` — run the foreground Daemon over the given Space dirs
-/// (`docs/BUILD-PLAN.md §3`). Opens one `SpaceContext` per dir and hands them to
-/// [`ft_daemon::serve`], shutting down on Ctrl-C.
+/// `daemon [<dir>...]` — run the foreground Daemon over the given Space dirs, or
+/// (with none given) every Space mapped in `config.json` (`docs/BUILD-PLAN.md
+/// §3`, "daemon por defecto"). This no-args form is what the background service
+/// invokes, so a Space added later just needs a restart to be picked up. Opens
+/// one `SpaceContext` per dir and hands them to [`ft_daemon::serve`], shutting
+/// down on Ctrl-C.
+///
+/// With zero Spaces mapped (e.g. right after `service install`, before any
+/// `init`/`clone` ran) there is nothing to open yet, and — critically — no
+/// identity to require either: this waits idle forever instead of erroring, so
+/// the OS service supervisor doesn't crash-loop it.
 pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
-    anyhow::ensure!(!dirs.is_empty(), "daemon needs at least one Space dir");
     let config = Config::load()?;
+    let dirs = if dirs.is_empty() {
+        config
+            .spaces
+            .iter()
+            .map(|m| PathBuf::from(&m.local_root))
+            .collect::<Vec<_>>()
+    } else {
+        dirs
+    };
+    if dirs.is_empty() {
+        tracing::info!("no Spaces mapped yet; idle (restart me after init/clone)");
+        std::future::pending::<()>().await;
+    }
+
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = Credentials::load()?;
 
@@ -644,6 +673,58 @@ fn print_ago(label: &str, ts: Option<u64>, now: u64) {
 /// `service <install|uninstall|status>` — manage the daemon as an OS service.
 pub fn service(action: ServiceAction) -> anyhow::Result<()> {
     crate::service::run(action)
+}
+
+/// Makes sure the daemon keeps running in the background after a successful
+/// `init`/`clone`/`sync`, so day-to-day use never needs a separate `filething
+/// service install` step (`TODO.md` Fase 6, "daemon por defecto"). ALWAYS
+/// best-effort: any failure is a `tracing::warn!`, never propagated — the command
+/// that called this already succeeded and must not fail because of it.
+///
+/// Skips entirely when `no_daemon` (the `--no-daemon` flag) is set, or when
+/// `FILETHING_NO_AUTO_DAEMON` is a non-empty env var (the integration scripts set
+/// this — they drive one-shot `sync` in throwaway `FILETHING_HOME`s and must not
+/// install a service on the host running them). Also skips with a warning on any
+/// OS other than macOS/Linux (the only ones `service.rs` supports).
+///
+/// `new_space` marks `init`/`clone` (a Space mapping was just added): if the
+/// service is already installed, it is RESTARTED so the daemon — which resolves
+/// its Space list fresh from `config.json` on every start — picks up the new
+/// mapping. A plain `sync` only starts it when it is not already running.
+fn ensure_background_daemon(new_space: bool, no_daemon: bool) {
+    if no_daemon {
+        return;
+    }
+    if std::env::var("FILETHING_NO_AUTO_DAEMON")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+        tracing::warn!("background daemon auto-start is only supported on macOS/Linux; skipping");
+        return;
+    }
+
+    if !crate::service::is_installed() {
+        match crate::service::install() {
+            Ok(()) => println!("daemon: running in background (service installed)"),
+            Err(e) => tracing::warn!("could not install the background daemon service: {e:#}"),
+        }
+        return;
+    }
+
+    if new_space {
+        match crate::service::restart() {
+            Ok(()) => println!("daemon: restarted to pick up the new Space"),
+            Err(e) => tracing::warn!("could not restart the background daemon service: {e:#}"),
+        }
+    } else if !crate::service::is_running() {
+        match crate::service::restart() {
+            Ok(()) => println!("daemon: running in background (was stopped; restarted)"),
+            Err(e) => tracing::warn!("could not start the background daemon service: {e:#}"),
+        }
+    }
 }
 
 /// Lowercase hex of a 32-byte id, for human-readable output of a `manifestRoot`.

@@ -3,6 +3,10 @@
 # Dos "Devices" = dos FILETHING_HOME + dos carpetas en esta misma maquina Linux.
 set -uo pipefail
 
+# Este gate corre sync one-shot y daemons de usar y tirar en FILETHING_HOME's
+# temporales; no debe instalar ningún servicio de daemon en la máquina (Fase 6).
+export FILETHING_NO_AUTO_DAEMON=1
+
 # Raíz del repo relativa a este script: funciona igual en el checkout original y
 # en un worktree (así el gate corre el binario y el backend de ESTE árbol).
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

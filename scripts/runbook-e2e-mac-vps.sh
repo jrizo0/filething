@@ -22,6 +22,10 @@
 #   g07 subdirs + rename + bit x       (fix de 464496c)
 set -u
 
+# Este runbook corre `daemon`/`sync` a mano bajo control del script; no debe
+# instalar ningún servicio de daemon en la Mac ni en el VPS (Fase 6).
+export FILETHING_NO_AUTO_DAEMON=1
+
 TS=$(date +%Y%m%d-%H%M%S)
 RUN_DIR=$HOME/ft-e2e-$TS
 mkdir -p "$RUN_DIR"
@@ -33,7 +37,7 @@ E2E=e2e-$TS                       # subdir de prueba dentro del Space
 VPS=vpsjr
 CM=$HOME/.ssh/ft-e2e-cm           # ControlMaster: ssh's repetidos rápidos
 SSH="ssh -o ControlMaster=auto -o ControlPath=$CM -o ControlPersist=300 $VPS"
-VPS_ENV='cd ~/repos/filething; set -a; . infra/.env; set +a; export FILETHING_HOME=$HOME/.filething-vps'
+VPS_ENV='cd ~/repos/filething; set -a; . infra/.env; set +a; export FILETHING_HOME=$HOME/.filething-vps; export FILETHING_NO_AUTO_DAEMON=1'
 TUNNEL_PAT='-L 9000:localhost:9000'   # patrón pkill del ssh del túnel (y solo de él)
 
 say()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }

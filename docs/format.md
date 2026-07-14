@@ -6,6 +6,14 @@ Está injertada de tres diseños independientes (`mvp-minimal`, `restic-git`, `c
 
 Convenciones: tamaños binarios (KiB = 2^10, MiB = 2^20). Toda longitud entera en el wire es little-endian salvo que se diga lo contrario. JSON canónico = claves ordenadas lexicográficamente por bytes UTF-8, sin espacios.
 
+> **Estado de implementación (2026-07):** esta spec sigue siendo la biblia normativa y no
+> cambia. Lo que sí cambió es qué está construido: donde el texto dice "MVP = `alg=0` / cifrado
+> OFF" y "`alg=1` = futuro", el cifrado en runtime **`alg=1`** (XChaCha20-Poly1305, data key/nonce
+> deterministas por cuenta, sidecars `keys/*`) ya está **implementado desde la Fase 3** (ADR 0015).
+> Los **Blocks** de contenido se cifran (`alg=1`); los **manifests** siguen en claro (`alg=0`,
+> zero-knowledge diferido). El **Vault mixto** que describe §11 es el estado real: Blocks `alg=0`
+> pre-Fase 3 coexisten con `alg=1`. Lee las columnas "futuro (`alg=1`)" como "vigente", no pendiente.
+
 ---
 
 ## 1. Resumen y principios

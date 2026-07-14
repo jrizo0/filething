@@ -7,7 +7,8 @@ only (see [Going to managed infra](#going-to-managed-infra-r2--convex-cloud)).
 - **Vault** — MinIO (S3-compatible). The data plane that holds `Block`s
   (`blocks/`, `manifest/`, `blocklist/` under one bucket).
 - **Coordinator** — Convex backend self-hosted. The control plane: `Space head`,
-  the `Revision` chain, pairing and the change feed. It never sees file bytes.
+  the `Revision` chain, auth (Better Auth, on the `:3211` HTTP-actions proxy) and
+  the change feed. It never sees file bytes.
 - **Convex dashboard** (optional) — web UI for the local Coordinator.
 
 ## Prerequisites

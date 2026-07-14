@@ -4,8 +4,11 @@
 # Se corre EN LA MAC. Requisitos (una vez, ver docs/MAC-SETUP.md):
 #   - ssh a `vpsjr` sin password
 #   - ~/filething-test-env.sh en la Mac (env S3/Convex/FILETHING_HOME)
-#   - Space ya emparejado y clonado en ~/space-demo de ambos lados
-#   - infra (MinIO+Convex) arriba en el VPS; túnel opcional (si no hay, lo levanta)
+#   - Devices logueados (Better Auth, mismo usuario) y Space clonado en ~/space-demo
+#     de ambos lados (ya no hay pairing codes; ver docs/MAC-SETUP.md §5)
+#   - infra (MinIO+Convex) arriba en el VPS; túnel opcional (si no hay, lo levanta).
+#     El túnel reenvía 9000/3210/3211 — el 3211 (Better Auth) lo necesita el daemon
+#     para re-mintear su JWT (~15 min).
 #
 # Uso:    bash scripts/runbook-e2e-mac-vps.sh
 # Salida: PASS/FAIL por gate + resumen final; logs en ~/ft-e2e-<TS>/
@@ -70,7 +73,7 @@ ensure_tunnel() {
   tunnel_up && return 0
   say "  túnel caído; levantando uno propio"
   ssh -f -N -o ExitOnForwardFailure=yes \
-    -L 9000:localhost:9000 -L 3210:localhost:3210 "$VPS" 2>>"$LOG" || true
+    -L 9000:localhost:9000 -L 3210:localhost:3210 -L 3211:localhost:3211 "$VPS" 2>>"$LOG" || true
   wait_until 15 tunnel_up
 }
 

@@ -2,6 +2,11 @@
 
 **Fecha:** 2026-06-24
 
+> **Nota (2026-07):** documento histórico del handoff inicial del MVP. Describe el estado de
+> junio de 2026 y **no se actualiza**. Desde entonces las Fases 2–3 añadieron auth real (Better
+> Auth, ADR 0014) y cifrado en runtime (`alg=1`, ADR 0015), y el trabajo se mergeó a `main`. Para
+> el estado vivo mira `TODO.md`, `DEMO.md`, `docs/PRODUCTION-SETUP.md` y `docs/MAC-SETUP.md`.
+
 ---
 
 ## ✅ ESTADO 2026-06-25 — MVP IMPLEMENTADO Y VALIDADO END-TO-END

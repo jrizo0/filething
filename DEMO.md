@@ -1,11 +1,15 @@
 # filething — cómo correr el MVP
 
-CLI de sync de carpetas tipo "Dropbox para developers", en Rust. Este MVP corre el bucle
+CLI de sync de carpetas tipo "Dropbox para developers", en Rust. Corre el bucle
 vertical completo entre **dos Devices** (aquí simulados como dos procesos en la misma
-máquina Linux) contra un **Coordinator** (Convex) y un **Vault** (S3/MinIO).
+máquina) contra un **Coordinator** (Convex) y un **Vault** (S3/MinIO local o Cloudflare R2).
 
-Cifrado OFF en el MVP (`alg=0`, `cid==pcid`) con todos los huecos del formato reservados
-(ver `docs/format.md`). Detalle de la arquitectura en `docs/BUILD-PLAN.md`; estado en `TODO.md`.
+**Auth real** (Better Auth, email+password por Device — ADR 0014) y **cifrado en runtime**
+(`alg=1`, XChaCha20-Poly1305 — ADR 0015) están **activos desde la Fase 3**. Los manifests
+siguen en claro (`alg=0`, zero-knowledge diferido) y el Vault mixto está soportado (los
+Blocks en claro de spaces pre-Fase 3 coexisten con los cifrados). Detalle del formato en
+`docs/format.md`; arquitectura en `docs/BUILD-PLAN.md`; estado en `TODO.md`. Para correr
+contra la nube (Convex Cloud + R2), ver `docs/PRODUCTION-SETUP.md`.
 
 ## 0. Requisitos
 - Rust (stable), Bun, Docker. (En este repo ya están instalados.)
@@ -31,17 +35,23 @@ cargo build --release -p filething   # binario en target/release/filething
 
 ## 3. El comando
 ```
-filething login [--code <CODE>] [--name <NAME>]   # emparejar Device (sin --code = primer Device, imprime un código)
-filething init  <dir> [--name <NAME>]             # carpeta -> Space nuevo (primer commit)
-filething clone <space_id> <dir>                  # traer un Space existente a una carpeta
+filething login --email <EMAIL> [--signup] [--name <NAME>]  # Better Auth: --signup crea la cuenta; sin él, login (incl. 2º Device)
+filething init   <dir> [--name <NAME>]            # carpeta -> Space nuevo (primer commit)
+filething clone  <space_id> <dir>                 # traer un Space existente a una carpeta
 filething status [<dir>]                          # base sincronizada + cambios locales
 filething ls     [<dir>]                          # listar rutas del Space
 filething sync   <dir>                            # one-shot: pull + commit (para scripts)
 filething daemon <dir>...                         # sync continuo en foreground (Ctrl-C para parar)
 ```
-Config/identidad por Device en `$FILETHING_HOME` (o `~/.config/filething/config.json`).
-El índice local de cada Space vive en `<dir>/.filething/index.db`. Credenciales del
-Vault/Coordinator se leen del entorno (`S3_*`, `CONVEX_SELF_HOSTED_*`).
+El login usa **Better Auth** (ADR 0014): la contraseña se lee de `$FILETHING_PASSWORD`
+(scripts) o se pide por prompt. Ya no hay pairing codes — vincular un Device nuevo = hacer
+`login` (sin `--signup`) del mismo usuario. El signup viene **cerrado** por defecto en el
+deployment; se abre con `FILETHING_ALLOW_SIGNUP=1` (ver §5 y `docs/PRODUCTION-SETUP.md §4.3`).
+
+Config/identidad por Device en `$FILETHING_HOME` (o `~/.config/filething/config.json`); el
+token de sesión vive en `credentials.json` (`0600`) junto a él. El índice local de cada Space
+vive en `<dir>/.filething/index.db`. Credenciales del Vault/Coordinator se leen del entorno
+(`S3_*`, y `CONVEX_URL` en la nube o `CONVEX_SELF_HOSTED_*` en local).
 
 ## 4. Demo de los criterios de éxito (a–d), automatizado
 ```bash
@@ -57,8 +67,12 @@ Simula dos Devices (dos `FILETHING_HOME`) y valida, contra la infra viva:
 
 ## 5. Demo continua (dos daemons)
 ```bash
-FILETHING_HOME=/tmp/devA filething login --name a            # copia el código
-FILETHING_HOME=/tmp/devB filething login --code <CODE> --name b
+export FILETHING_PASSWORD='una-clave'
+# el signup viene cerrado; ábrelo un momento para crear la cuenta (deployment self-hosted):
+( cd packages/backend && bunx convex env set FILETHING_ALLOW_SIGNUP 1 )
+FILETHING_HOME=/tmp/devA filething login --signup --email you@ex.com --name a
+( cd packages/backend && bunx convex env remove FILETHING_ALLOW_SIGNUP )   # ciérralo de nuevo
+FILETHING_HOME=/tmp/devB filething login --email you@ex.com --name b        # mismo usuario, 2º Device
 mkdir -p /tmp/A /tmp/B; echo hola > /tmp/A/saludo.txt
 FILETHING_HOME=/tmp/devA filething init  /tmp/A --name demo  # imprime <space_id>
 FILETHING_HOME=/tmp/devB filething clone <space_id> /tmp/B
@@ -74,17 +88,26 @@ Convex Cloud + deploy key, rellenar `infra/.env.cloud`, y `scripts/cloud-deploy.
 `scripts/cloud-smoke.sh`). Resumen:
 - **Vault → Cloudflare R2:** apunta `S3_ENDPOINT`/`S3_REGION=auto`/`S3_ACCESS_KEY`/
   `S3_SECRET_KEY`/`S3_BUCKET` a tu bucket R2 (S3-compatible; `ft-vault` ya usa path-style).
-- **Coordinator → Convex Cloud:** `scripts/cloud-deploy.sh` (deploy con `CONVEX_DEPLOY_KEY`);
-  apunta `CONVEX_URL` a `https://<name>.convex.cloud`. El cliente usa el deploy key vía
-  `set_admin_auth`, o conecta sin credencial (funciones públicas) — ver el runbook.
+- **Coordinator → Convex Cloud:** `scripts/cloud-deploy.sh` despliega las funciones con
+  `CONVEX_DEPLOY_KEY`; apunta `CONVEX_URL` a `https://<name>.convex.cloud`. Desde la Fase 3 el
+  cliente **no** autentica con el deploy key: hace `filething login --email` (Better Auth) y las
+  funciones exigen `ctx.auth`; el deploy key queda solo para `convex deploy` y fallback de ops.
+- **Better Auth (una vez en el deployment):** `bunx convex env set BETTER_AUTH_SECRET "$(openssl rand -base64 32)"`
+  y `bunx convex env set SITE_URL https://<name>.convex.site`. El signup viene cerrado
+  (`FILETHING_ALLOW_SIGNUP`). Detalle en `docs/PRODUCTION-SETUP.md §4.3`.
 
 ## 7. Comandos de operación (Fase 2)
-- `filething gc <dir> [--apply] [--keep-all] [--grace-secs N]` — recolector de basura del
-  Vault (account-wide, dry-run por defecto). Ver `docs/adr/0012`.
+- `filething gc <dir> [--apply] [--grace-secs N]` — recolector de basura del Vault
+  (account-wide, dry-run por defecto; solo barre huérfanos). Ver `docs/adr/0012`.
 - `filething metrics [dir]` — métricas de sync del daemon (lee `.filething/metrics.json`).
 - `filething service <install|uninstall|status>` — daemon como servicio del SO.
 
-## Qué NO está en el MVP (huecos reservados en el formato, no construidos)
-Cifrado en runtime, zero-knowledge, serve mode / self-hosted vault, GC/retención,
-Better Auth/OAuth navegador (MVP = pairing por código), billing, dashboard, packing de
-bloques chicos, binarios per-SO, Windows. Ver `TODO.md` (sección Reservado) y `docs/format.md §11`.
+## Qué sigue reservado (no construido)
+Ya construido en fases 2–3: cifrado en runtime (`alg=1`, ADR 0015), auth real (Better Auth,
+ADR 0014), GC de huérfanos (`filething gc`, ADR 0012), métricas y servicio de SO (`metrics`/
+`service`). Sigue **reservado**: zero-knowledge frente al Coordinator (cifrar manifests; hoy
+`alg=1` protege los Blocks pero el escrow server-side ve las claves — ADR 0015), OAuth por
+navegador / device-authorization flow (hoy: email+password headless), serve mode / self-hosted
+vault, poda de historial (retention floor; el GC actual solo barre huérfanos — ADR 0012),
+billing, dashboard, packing de bloques chicos, binarios per-SO, Windows. Ver `TODO.md`
+(sección Reservado) y `docs/format.md §11`.

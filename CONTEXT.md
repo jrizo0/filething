@@ -55,7 +55,7 @@ Running a device (e.g. a VPS or Mac mini) as a self-hosted vault for its owner's
 _Avoid_: self-host, host mode, server mode
 
 **Coordinator**:
-The always-on control-plane service (built on Convex) that handles identity, device pairing, manifests, and the change feed. It never sees file bytes and never holds a self-hosted vault's storage keys; it does see manifest metadata in cleartext (paths, file tree, block references).
+The always-on control-plane service (built on Convex) that handles identity and authentication (Better Auth), manifests, and the change feed. It never sees file bytes and never holds a self-hosted vault's storage keys; it does see manifest metadata in cleartext (paths, file tree, block references).
 _Avoid_: brain, control plane, server, backend, hub
 
 **Change feed**:
@@ -75,7 +75,7 @@ A single person's identity. Owns spaces and devices and carries the subscription
 _Avoid_: user, profile, login, customer
 
 **Pairing**:
-Authorizing a new device onto an account, via browser login or a device code (for headless machines).
+Authorizing a new device onto an account. In v1 this is an account login on that device (Better Auth email+password; the device keeps a session token) — a new device is just the same account logging in elsewhere. Browser OAuth and device-authorization codes are reserved for later.
 _Avoid_: enrollment, registration, linking, onboarding
 
 **Device key**:

@@ -7,14 +7,23 @@ gobierna a cada uno. **Cada agente construye su crate contra este contrato y con
 
 `docs/format.md` v1.0 es la biblia normativa. Este doc NO la repite; la indexa.
 
+> **Estado (2026-07):** este es el contrato ORIGINAL del build del MVP (2026-06-25). El MVP se
+> construyó y validó, y las Fases 2–3 **superaron** dos decisiones de la §0: el auth pasó de
+> pairing por código a **Better Auth real** (email+password por Device, `login --email`, ADR
+> 0014) y el cifrado pasó de OFF a **`alg=1` en runtime** (XChaCha20-Poly1305 + escrow v1 en
+> Convex, ADR 0015). El grafo de crates y las costuras (§1–§3) siguen vigentes **salvo lo de
+> auth**: las mutations de pairing (`mintCode`/`claimCode`, tabla `pairing_codes`) se retiraron
+> y la identidad la lleva Better Auth (`ctx.auth` + ownership). Estado vivo: `TODO.md`, `DEMO.md`
+> y `docs/PRODUCTION-SETUP.md`.
+
 ---
 
 ## 0. Decisiones de este build (cerradas con el fundador, 2026-06-25)
 
 - **Infra de prueba = local en Docker:** almacén S3 = **MinIO**; Coordinator = **Convex self-hosted** (imagen `ghcr.io/get-convex/convex-backend`). Todo corre en este VPS Linux. El código del `Vault` y del `Coordinator` queda detrás de una abstracción para apuntar a Cloudflare R2 / Convex cloud cambiando solo configuración.
 - **Demo = 2 Devices simulados** como dos procesos con dos carpetas en este mismo Linux. El adaptador de FS de macOS se **codifica completo pero no se prueba en runtime** (no hay Mac).
-- **Auth = pairing mínimo por código de dispositivo.** Better Auth / OAuth navegador = hueco reservado (post-MVP).
-- **Cifrado = OFF** (`alg=0`, `nonce`=ceros, `cid == pcid`) pero con TODOS los huecos del formato reservados. `cid` y `pcid` son tipos SEPARADOS desde el día 1.
+- **Auth = pairing mínimo por código de dispositivo.** Better Auth / OAuth navegador = hueco reservado (post-MVP). — *SUPERADO en Fase 3: Better Auth real, `login --email` (ADR 0014); OAuth navegador sigue reservado.*
+- **Cifrado = OFF** (`alg=0`, `nonce`=ceros, `cid == pcid`) pero con TODOS los huecos del formato reservados. `cid` y `pcid` son tipos SEPARADOS desde el día 1. — *SUPERADO en Fase 3: `alg=1` en runtime (ADR 0015); manifests siguen `alg=0`.*
 - **Gestor JS = Bun** (workspaces), no pnpm.
 
 ---
@@ -44,7 +53,7 @@ filething/
 ├── apps/
 │   └── cli/            # binario `filething` (clap): login/init/clone/status/ls/daemon
 ├── packages/
-│   └── backend/        # Convex TS: schema §6.2, mutations §7, queries §8, pairing
+│   └── backend/        # Convex TS: schema §6.2, mutations §7, queries §8, auth (Better Auth)
 ├── infra/
 │   ├── docker-compose.yml   # MinIO + Convex backend + dashboard
 │   └── scripts/             # crear bucket, desplegar funciones, env de ejemplo
@@ -206,7 +215,7 @@ coordinator, watcher, diff, conflict, y `packages/backend`. Son directorios DISJ
 - Protocolo de comandos: status, list spaces, trigger sync. Supervisión por Space.
 
 ### apps/cli — binario `filething` · CONTEXT (CLI estilo git)
-- `clap`. Comandos: `login` (pairing por código), `init <dir>` (carpeta→Space, registra en daemon),
+- `clap`. Comandos: `login --email` (Better Auth desde Fase 3; ya no pairing por código), `init <dir>` (carpeta→Space, registra en daemon),
   `clone <space> <dir>`, `status`, `ls`, `daemon` (corre el daemon en foreground).
 - Habla con el daemon por el socket local.
 

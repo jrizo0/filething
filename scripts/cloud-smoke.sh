@@ -2,7 +2,7 @@
 # filething — smoke test de la infra GESTIONADA (Convex Cloud + Cloudflare R2).
 # Ejercita el bucle vertical entre dos "Devices" (dos FILETHING_HOME + dos carpetas)
 # contra la nube, SIN Docker/MinIO/mc (no existen contra R2/Convex Cloud). Valida:
-#   login (pairing) -> init(+archivo) -> clone -> edición -> sync round-trip.
+#   login (Better Auth: signup+login) -> init(+archivo) -> clone -> edición -> sync round-trip.
 # Prerrequisitos: infra/.env.cloud relleno (guía: docs/PRODUCTION-SETUP.md) y el
 # backend ya desplegado con scripts/cloud-deploy.sh.
 set -euo pipefail

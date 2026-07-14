@@ -12,6 +12,7 @@ import type * as auth from "../auth.js";
 import type * as betterAuth from "../betterAuth.js";
 import type * as devices from "../devices.js";
 import type * as http from "../http.js";
+import type * as migrations from "../migrations.js";
 import type * as revisions from "../revisions.js";
 import type * as spaces from "../spaces.js";
 
@@ -26,6 +27,7 @@ declare const fullApi: ApiFromModules<{
   betterAuth: typeof betterAuth;
   devices: typeof devices;
   http: typeof http;
+  migrations: typeof migrations;
   revisions: typeof revisions;
   spaces: typeof spaces;
 }>;

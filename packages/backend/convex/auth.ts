@@ -16,7 +16,7 @@
 // authenticated Account.
 
 import { v, ConvexError } from "convex/values";
-import { mutation } from "./_generated/server";
+import { internalQuery, mutation } from "./_generated/server";
 import type { QueryCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 
@@ -96,6 +96,49 @@ export async function requireOwnedDevice(
   }
   return device;
 }
+
+// callerAccount / assertOwnedSpaces — internalQuery wrappers around
+// requireAccount / requireOwnedSpace for "use node" actions (vault.ts). Node
+// actions run outside the V8 runtime and have no ctx.db, so they cannot call
+// those helpers directly; they go through ctx.runQuery instead.
+
+// Resolve the caller's Account from ctx.auth (same rules as requireAccount)
+// and hand back just the id — the only thing an action needs to scope its work.
+export const callerAccount = internalQuery({
+  args: {},
+  returns: v.object({ accountId: v.id("accounts") }),
+  handler: async (ctx) => {
+    const account = await requireAccount(ctx);
+    return { accountId: account._id };
+  },
+});
+
+// Assert that every one of `spaceIds` (raw strings pulled out of Vault keys,
+// see vault.ts) both is a real Space id and is owned by `accountId`. Mirrors
+// requireOwnedSpace's checks, but takes the ids as a batch of untrusted
+// strings rather than a single v.id("spaces") arg: a string that fails to
+// normalize is exactly as forbidden as one that normalizes to someone else's
+// Space, so both throw the same "forbidden" — we don't leak which case it was.
+export const assertOwnedSpaces = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    spaceIds: v.array(v.string()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    for (const raw of args.spaceIds) {
+      const spaceId = ctx.db.normalizeId("spaces", raw);
+      const space = spaceId === null ? null : await ctx.db.get(spaceId);
+      if (space === null || space.accountId !== args.accountId) {
+        throw new ConvexError({
+          code: "forbidden",
+          message: "not an owned Space",
+        });
+      }
+    }
+    return null;
+  },
+});
 
 // Pick a human-ish display name for a freshly created Account from the identity,
 // falling back to the device name. Stored as v.bytes() (ciphertext-ready).

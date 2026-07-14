@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 ft-core = { workspace = true }
-convex = "0.10"
+convex = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 

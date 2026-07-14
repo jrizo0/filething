@@ -7,6 +7,10 @@
 # backend ya desplegado con scripts/cloud-deploy.sh.
 set -euo pipefail
 
+# Este smoke corre sync one-shot contra FILETHING_HOME's de usar y tirar; no debe
+# instalar ningún servicio de daemon en la máquina que lo ejecuta (Fase 6).
+export FILETHING_NO_AUTO_DAEMON=1
+
 # Raíz del repo relativa a este script (funciona desde cualquier cwd y en worktrees).
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO/infra/.env.cloud"
@@ -37,9 +41,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Dos Devices = dos FILETHING_HOME distintos sobre el mismo binario.
-a() { FILETHING_HOME="$A_HOME" "$BIN" "$@"; }
-b() { FILETHING_HOME="$B_HOME" "$BIN" "$@"; }
+# Dos Devices = dos FILETHING_HOME distintos sobre el mismo binario. Los Devices
+# corren SIN S3_* (env -u): igual que un usuario final, el plano de datos va por
+# URLs prefirmadas que emite el Coordinator (vault:sign, ADR 0016). Solo el paso
+# de gc (operador) usa las credenciales S3 directas (a_ops).
+NO_S3=(env -u S3_ENDPOINT -u S3_REGION -u S3_ACCESS_KEY -u S3_SECRET_KEY -u S3_BUCKET)
+a() { "${NO_S3[@]}" FILETHING_HOME="$A_HOME" "$BIN" "$@"; }
+b() { "${NO_S3[@]}" FILETHING_HOME="$B_HOME" "$BIN" "$@"; }
+a_ops() { FILETHING_HOME="$A_HOME" "$BIN" "$@"; }
 
 # --- entorno: credenciales de la nube ---
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -104,9 +113,11 @@ else
   bad "B no refleja la edición de hello.txt"
 fi
 
-hr "PASO 4 (sanity) — filething gc (dry-run)"
+hr "PASO 4 (sanity) — filething gc (dry-run, con S3_* directas: gc es de operador)"
 # gc es dry-run por defecto (no borra nada). Best-effort: no tumba el smoke si falla.
-if a gc "$A_DIR"; then
+# gc necesita list/delete del bucket — imposible con URLs prefirmadas — así que corre
+# con las credenciales S3 directas del .env.cloud (a_ops), no como usuario final.
+if a_ops gc "$A_DIR"; then
   ok "gc (dry-run) ejecutó"
 else
   echo "  (aviso) 'filething gc' falló — sanity omitido (no cuenta como fallo)"

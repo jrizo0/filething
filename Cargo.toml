@@ -19,9 +19,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-license = "UNLICENSED"
+license = "MIT"
+repository = "https://github.com/jrizo0/filething"
+
+# Release binaries (dist / GitHub Releases): small and fast over compile time.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [workspace.dependencies]
 # Internal crates (path deps) — declared here so members reference them with { workspace = true }.
@@ -60,7 +72,11 @@ walkdir = "2"                   # ft-fsmap / ft-engine: recorrer el arbol del Sp
 futures = "0.3"                 # ft-coordinator / ft-diff: streams del change feed
 rand = "0.8"                    # generar chunk secret / dedup secret aleatorios
 tempfile = "3"                  # tests (dirs temporales)
-convex = "0.10"                 # ft-coordinator: cliente Convex; apps/cli: admin auth
+# rustls (webpki roots) en vez del default native-tls-vendored: saca OpenSSL del
+# árbol entero, que es lo que permite cross-compilar estático a *-linux-musl en
+# el workflow de release sin toolchain de C extra. Mismo criterio en el reqwest
+# de apps/cli.
+convex = { version = "0.10", default-features = false, features = ["rustls-tls-webpki-roots"] }  # ft-coordinator: cliente Convex; apps/cli: admin auth
 clap = { version = "4", features = ["derive"] }  # apps/cli: parseo de subcomandos
 serde_json = "1"               # apps/cli: store de config (config.json)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # apps/cli: logs

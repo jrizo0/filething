@@ -193,6 +193,25 @@ bunx convex env remove FILETHING_ALLOW_SIGNUP   # vuelve a cerrarlo
 Los Devices siguientes del mismo usuario usan `filething login --email ...` (sin `--signup`,
 sin necesidad de la variable).
 
+### 4.3b Vault firmado (Fase 4, ADR 0016): storage sin credenciales en el cliente
+
+Desde la Fase 4 los Devices tampoco necesitan las `S3_*`: el plano de datos va por URLs S3
+prefirmadas que emite la action autenticada `vault:sign` del Coordinator, y las credenciales
+R2 viven **solo en el deployment**. Configúralo una vez (mismos cinco valores del Paso 1):
+```bash
+cd packages/backend
+bunx convex env set S3_ENDPOINT https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+bunx convex env set S3_REGION auto
+bunx convex env set S3_ACCESS_KEY <R2_ACCESS_KEY_ID>
+bunx convex env set S3_SECRET_KEY <R2_SECRET_ACCESS_KEY>
+bunx convex env set S3_BUCKET <R2_BUCKET_NAME>
+```
+Precedencia en el cliente (`env::build_vault`): si el entorno trae las `S3_*` completas usa
+acceso S3 **directo** (modo ops/self-hosted, igual que siempre); si no, usa el vault firmado
+con la sesión del login. Excepción: **`filething gc` es de operador** — su sweep necesita
+`list`/`delete` del bucket, que no se pueden prefirmar — así que córrelo siempre con las
+`S3_*` cargadas (`set -a; source infra/.env.cloud; set +a`).
+
 ### 4.4 Upgrade desde Fase 2: reclamar Accounts/Spaces pre-existentes
 
 Si ya tenías Accounts/Spaces creados **antes** de este upgrade (era de pairing, `subject`

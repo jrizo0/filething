@@ -177,20 +177,93 @@ impl SpaceContext {
     /// referenced Block to be in the Vault BEFORE the CAS, and the local cache is
     /// not a trustworthy proxy for that once a destructive GC exists. The `HEAD`
     /// per known Block is the price of that safety (commits are human-paced).
+    ///
+    /// The network HEAD/PUT round-trips run CONCURRENTLY (`buffer_unordered`,
+    /// bounded to 16 in flight) since each Block is independent; the local index
+    /// writes (`self.index.put_block`) run AFTERWARDS, sequentially, over the
+    /// collected results — `ft_index` is a local SQLite handle with no benefit
+    /// from concurrency and no need to share it across the fan-out. Before the
+    /// fan-out, `Vault::warm` announces every upcoming HEAD/PUT in one batch so a
+    /// backend with per-operation setup cost can prepare them together (ADR
+    /// 0016); it is a pure hint and its failure never blocks the upload.
     async fn upload_blocks(&self, scan: &ScanResult) -> Result<usize> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
         let space_id = self.space_id.as_str();
-        let mut uploaded = 0usize;
-        for (cid, encoded) in &scan.blocks_to_upload {
+
+        let mut warm_ops =
+            Vec::with_capacity(scan.blocks_to_upload.len() * 2 + scan.sidecars.len() * 2);
+        for (cid, _) in &scan.blocks_to_upload {
             let key = ft_hash::block_key(cid);
-            // HEAD the Vault before PUT (§7 step 2). Present ⇒ record + skip.
-            if self.vault.head(&key).await? {
-                self.index.put_block(space_id, cid)?;
-                continue;
-            }
-            self.vault.put(&key, encoded.clone()).await?;
-            self.index.put_block(space_id, cid)?;
-            uploaded += 1;
+            warm_ops.push(ft_vault::WarmOp {
+                key: key.clone(),
+                method: ft_vault::WarmMethod::Head,
+            });
+            warm_ops.push(ft_vault::WarmOp {
+                key,
+                method: ft_vault::WarmMethod::Put,
+            });
         }
+        for (cid, _) in &scan.sidecars {
+            let key = ft_diff::keys_key(space_id, cid);
+            warm_ops.push(ft_vault::WarmOp {
+                key: key.clone(),
+                method: ft_vault::WarmMethod::Head,
+            });
+            warm_ops.push(ft_vault::WarmOp {
+                key,
+                method: ft_vault::WarmMethod::Put,
+            });
+        }
+        if let Err(e) = self.vault.warm(&warm_ops).await {
+            tracing::debug!(error = %e, "vault warm failed for block upload; continuing without it");
+        }
+
+        let total = scan.blocks_to_upload.len();
+        tracing::info!(total, "uploading blocks");
+        let started = Instant::now();
+        let completed = AtomicUsize::new(0);
+
+        // HEAD, then PUT if absent, for every Block — concurrently.
+        let block_results: Vec<(Cid, bool)> = stream::iter(scan.blocks_to_upload.iter())
+            .map(|(cid, encoded)| {
+                let completed = &completed;
+                async move {
+                    let key = ft_hash::block_key(cid);
+                    let uploaded = if self.vault.head(&key).await? {
+                        false
+                    } else {
+                        self.vault.put(&key, encoded.clone()).await?;
+                        true
+                    };
+                    let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(25) {
+                        tracing::info!(completed = n, total, "uploading blocks");
+                    }
+                    Result::Ok((*cid, uploaded))
+                }
+            })
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+
+        // Sequential local-index writes over the collected network results.
+        let mut uploaded = 0usize;
+        for (cid, was_uploaded) in &block_results {
+            self.index.put_block(space_id, cid)?;
+            if *was_uploaded {
+                uploaded += 1;
+            }
+        }
+        tracing::info!(
+            total,
+            uploaded,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "blocks uploaded"
+        );
+
         // Encryption ON (`alg=1`): each Block has a `keys/<space_id>/<cid>`
         // data-key sidecar to upload alongside it (`§4.5`, ADR 0015 — the sidecar
         // lives and dies with its Block). The key is scoped by THIS Space: the
@@ -198,31 +271,94 @@ impl SpaceContext {
         // Space needs its own sidecar there. Same HEAD-before-PUT skip: the wrap
         // uses a fresh nonce each call so the bytes differ run-to-run, but it
         // unwraps to the same data key, so writing it once is enough. Empty with
-        // encryption off.
-        for (cid, sidecar) in &scan.sidecars {
-            let key = ft_diff::keys_key(space_id, cid);
-            if self.vault.head(&key).await? {
-                continue;
-            }
-            self.vault.put(&key, sidecar.clone()).await?;
-        }
+        // encryption off. No index write here (sidecars are not tracked in the
+        // Block-presence table), so the network fan-out needs no sequential tail.
+        stream::iter(scan.sidecars.iter())
+            .map(|(cid, sidecar)| async move {
+                let key = ft_diff::keys_key(space_id, cid);
+                if !self.vault.head(&key).await? {
+                    self.vault.put(&key, sidecar.clone()).await?;
+                }
+                Result::Ok(())
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<()>>()
+            .await?;
+
         Ok(uploaded)
     }
 
     /// §7 step 3/4: upload every Manifest page and externalized blocklist to the
     /// Vault. The blocklist object is the bare CBOR `ft_manifest` produced (no
     /// header). Each PUT must close OK before the CAS runs.
+    ///
+    /// `Vault::warm` announces every page/blocklist PUT in one batch first (a
+    /// best-effort hint, ADR 0016); the PUTs themselves then run concurrently
+    /// (`buffer_unordered`, bounded to 16) since pages and blocklists are
+    /// independent content-addressed objects with no ordering requirement among
+    /// themselves — only "all of them before the CAS" matters (`§7`).
     async fn upload_manifest(&self, manifest: &ft_manifest::ManifestBuild) -> Result<()> {
-        for (page_cid, page_bytes) in &manifest.pages {
-            self.vault
-                .put(&ft_hash::manifest_key(page_cid), page_bytes.clone())
-                .await?;
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let warm_ops: Vec<ft_vault::WarmOp> = manifest
+            .pages
+            .iter()
+            .map(|(cid, _)| ft_vault::WarmOp {
+                key: ft_hash::manifest_key(cid),
+                method: ft_vault::WarmMethod::Put,
+            })
+            .chain(manifest.blocklists.iter().map(|(cid, _)| ft_vault::WarmOp {
+                key: ft_hash::blocklist_key(cid),
+                method: ft_vault::WarmMethod::Put,
+            }))
+            .collect();
+        if let Err(e) = self.vault.warm(&warm_ops).await {
+            tracing::debug!(error = %e, "vault warm failed for manifest upload; continuing without it");
         }
-        for (bl_cid, bl_bytes) in &manifest.blocklists {
-            self.vault
-                .put(&ft_hash::blocklist_key(bl_cid), bl_bytes.clone())
-                .await?;
-        }
+
+        let total = manifest.pages.len() + manifest.blocklists.len();
+        tracing::info!(total, "uploading manifest pages and blocklists");
+        let started = Instant::now();
+        let completed = AtomicUsize::new(0);
+
+        let objects = manifest
+            .pages
+            .iter()
+            .map(|(cid, bytes)| (ft_hash::manifest_key(cid), bytes))
+            .chain(
+                manifest
+                    .blocklists
+                    .iter()
+                    .map(|(cid, bytes)| (ft_hash::blocklist_key(cid), bytes)),
+            );
+
+        stream::iter(objects)
+            .map(|(key, bytes)| {
+                let completed = &completed;
+                async move {
+                    self.vault.put(&key, bytes.clone()).await?;
+                    let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(25) {
+                        tracing::info!(
+                            completed = n,
+                            total,
+                            "uploading manifest pages and blocklists"
+                        );
+                    }
+                    Result::Ok(())
+                }
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        tracing::info!(
+            total,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "manifest uploaded"
+        );
         Ok(())
     }
 

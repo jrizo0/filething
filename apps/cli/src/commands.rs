@@ -158,7 +158,7 @@ fn require_credentials() -> anyhow::Result<Credentials> {
 
 /// `init <dir>` — make a local folder a fresh Space and commit its first Revision
 /// (`docs/BUILD-PLAN.md §3`).
-pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+pub async fn init(dir: PathBuf, name: Option<String>, no_daemon: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = require_credentials()?;
@@ -183,8 +183,7 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     });
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let coordinator = env::connect(&url, Some(&creds)).await?;
+    let (coordinator, vault) = env::connect_and_vault(&url, Some(&creds)).await?;
 
     // Generate this Space's escrow key and turn on `alg=1`: `init_space` sends the
     // key to `spaces:create` and encrypts the first Revision. `dedup_secret` is
@@ -229,12 +228,18 @@ pub async fn init(dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
         ctx.last_synced.seq,
         hex32(ctx.last_synced.root.as_bytes())
     );
+    ensure_background_daemon(true, no_daemon);
     Ok(())
 }
 
 /// `clone <space_id> <dir>` — materialize an existing Space into a local folder
 /// (`docs/BUILD-PLAN.md §3`).
-pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+pub async fn clone(
+    space_id: String,
+    dir: PathBuf,
+    name: Option<String>,
+    no_daemon: bool,
+) -> anyhow::Result<()> {
     let _ = name; // accepted for symmetry with init; clone takes the Space's name.
     let config = Config::load()?;
     let (url, account_id, device_id) = require_identity(&config)?;
@@ -250,8 +255,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
     }
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, Some(&creds)).await?;
+    let (mut coordinator, vault) = env::connect_and_vault(&url, Some(&creds)).await?;
 
     // Cache the Space's escrow key locally (0600) before materializing, so later
     // commands open it offline. `clone_space` uses it + dedup_secret to decrypt
@@ -287,6 +291,7 @@ pub async fn clone(space_id: String, dir: PathBuf, name: Option<String>) -> anyh
         hex32(ctx.last_synced.root.as_bytes())
     );
     println!("  {} path(s) materialized", entries.len());
+    ensure_background_daemon(true, no_daemon);
     Ok(())
 }
 
@@ -314,7 +319,15 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
+
+    // Best-effort connection: `status` must work offline, and scanning never
+    // touches the Vault — so a failed connect degrades to an [`UnavailableVault`]
+    // placeholder (mount requires one) plus "remote head: unavailable" below.
+    let client = env::connect_client(&url, creds.as_ref()).await;
+    let vault = match env::build_vault(client.as_ref().ok().cloned()).await {
+        Ok(v) => v,
+        Err(_) => Box::new(env::UnavailableVault),
+    };
 
     // Mount for scanning only (no Coordinator needed to detect LOCAL changes).
     let mut ctx = SpaceContext::mount(
@@ -354,8 +367,8 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     println!("  tracked paths: {}", scan.entries.len());
 
     // Best-effort remote head check (does not fail status if the Coordinator is
-    // unreachable — status must work offline).
-    match env::connect(&url, creds.as_ref()).await {
+    // unreachable — status must work offline). Reuses the connection from above.
+    match client.map(ft_engine::Coordinator::from_client) {
         Ok(mut coordinator) => match coordinator.get_space(&space_id).await {
             Ok(space) => match space.head_revision_id {
                 Some(head) => {
@@ -411,7 +424,7 @@ pub fn ls(dir: Option<PathBuf>) -> anyhow::Result<()> {
 /// `sync <dir>` — a one-shot pull + commit for the Space at `dir`
 /// (`docs/BUILD-PLAN.md §3`). Useful for scripts and the integration gates: it
 /// does NOT run the daemon. Prints both outcomes.
-pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
+pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
@@ -419,8 +432,7 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
-    let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+    let (mut coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
     // Recover the escrow key into the cache if it is missing, so encryption is
     // attached correctly below (a commit on an `alg=1` Space MUST encrypt).
     let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
@@ -471,15 +483,37 @@ pub async fn sync(dir: PathBuf) -> anyhow::Result<()> {
             println!("commit: still conflicting after reconcile retries");
         }
     }
+    ensure_background_daemon(false, no_daemon);
     Ok(())
 }
 
-/// `daemon <dir>...` — run the foreground Daemon over the given Space dirs
-/// (`docs/BUILD-PLAN.md §3`). Opens one `SpaceContext` per dir and hands them to
-/// [`ft_daemon::serve`], shutting down on Ctrl-C.
+/// `daemon [<dir>...]` — run the foreground Daemon over the given Space dirs, or
+/// (with none given) every Space mapped in `config.json` (`docs/BUILD-PLAN.md
+/// §3`, "daemon por defecto"). This no-args form is what the background service
+/// invokes, so a Space added later just needs a restart to be picked up. Opens
+/// one `SpaceContext` per dir and hands them to [`ft_daemon::serve`], shutting
+/// down on Ctrl-C.
+///
+/// With zero Spaces mapped (e.g. right after `service install`, before any
+/// `init`/`clone` ran) there is nothing to open yet, and — critically — no
+/// identity to require either: this waits idle forever instead of erroring, so
+/// the OS service supervisor doesn't crash-loop it.
 pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
-    anyhow::ensure!(!dirs.is_empty(), "daemon needs at least one Space dir");
     let config = Config::load()?;
+    let dirs = if dirs.is_empty() {
+        config
+            .spaces
+            .iter()
+            .map(|m| PathBuf::from(&m.local_root))
+            .collect::<Vec<_>>()
+    } else {
+        dirs
+    };
+    if dirs.is_empty() {
+        tracing::info!("no Spaces mapped yet; idle (restart me after init/clone)");
+        std::future::pending::<()>().await;
+    }
+
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = Credentials::load()?;
 
@@ -488,10 +522,9 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         let root = normalize_abs(&dir);
         let space_id = env::space_id_at(&root)?;
         let index = env::open_index(&root)?;
-        let vault = env::build_vault().await?;
         // The JWT is re-minted on every connect and reconnect (set_auth_callback,
         // see env::connect) so the daemon outlives the ~15-min token expiry.
-        let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+        let (mut coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
         let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
         let mut ctx = SpaceContext::open(
             index,
@@ -537,10 +570,11 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     let creds = Credentials::load()?;
 
     let index = env::open_index(&root)?;
-    let vault = env::build_vault().await?;
     // GC walks cleartext Manifests + meta blobs and deletes Vault objects (sidecars
     // included); it never decrypts Block content, so no crypto is attached here.
-    let coordinator = env::connect(&url, creds.as_ref()).await?;
+    // Its sweep needs `list`/`delete`, which the signed data plane cannot offer:
+    // gc is operator-only, run it with the direct `S3_*` env vars set.
+    let (coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
         .context("opening Space")?;
 
@@ -639,6 +673,58 @@ fn print_ago(label: &str, ts: Option<u64>, now: u64) {
 /// `service <install|uninstall|status>` — manage the daemon as an OS service.
 pub fn service(action: ServiceAction) -> anyhow::Result<()> {
     crate::service::run(action)
+}
+
+/// Makes sure the daemon keeps running in the background after a successful
+/// `init`/`clone`/`sync`, so day-to-day use never needs a separate `filething
+/// service install` step (`TODO.md` Fase 6, "daemon por defecto"). ALWAYS
+/// best-effort: any failure is a `tracing::warn!`, never propagated — the command
+/// that called this already succeeded and must not fail because of it.
+///
+/// Skips entirely when `no_daemon` (the `--no-daemon` flag) is set, or when
+/// `FILETHING_NO_AUTO_DAEMON` is a non-empty env var (the integration scripts set
+/// this — they drive one-shot `sync` in throwaway `FILETHING_HOME`s and must not
+/// install a service on the host running them). Also skips with a warning on any
+/// OS other than macOS/Linux (the only ones `service.rs` supports).
+///
+/// `new_space` marks `init`/`clone` (a Space mapping was just added): if the
+/// service is already installed, it is RESTARTED so the daemon — which resolves
+/// its Space list fresh from `config.json` on every start — picks up the new
+/// mapping. A plain `sync` only starts it when it is not already running.
+fn ensure_background_daemon(new_space: bool, no_daemon: bool) {
+    if no_daemon {
+        return;
+    }
+    if std::env::var("FILETHING_NO_AUTO_DAEMON")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+        tracing::warn!("background daemon auto-start is only supported on macOS/Linux; skipping");
+        return;
+    }
+
+    if !crate::service::is_installed() {
+        match crate::service::install() {
+            Ok(()) => println!("daemon: running in background (service installed)"),
+            Err(e) => tracing::warn!("could not install the background daemon service: {e:#}"),
+        }
+        return;
+    }
+
+    if new_space {
+        match crate::service::restart() {
+            Ok(()) => println!("daemon: restarted to pick up the new Space"),
+            Err(e) => tracing::warn!("could not restart the background daemon service: {e:#}"),
+        }
+    } else if !crate::service::is_running() {
+        match crate::service::restart() {
+            Ok(()) => println!("daemon: running in background (was stopped; restarted)"),
+            Err(e) => tracing::warn!("could not start the background daemon service: {e:#}"),
+        }
+    }
 }
 
 /// Lowercase hex of a 32-byte id, for human-readable output of a `manifestRoot`.

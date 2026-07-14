@@ -75,6 +75,30 @@ pub struct VaultObject {
     pub last_modified: Option<SystemTime>,
 }
 
+/// The verb of a [`WarmOp`]: which [`Vault`] operation the caller is about to
+/// perform on the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WarmMethod {
+    /// An upcoming [`Vault::head`].
+    Head,
+    /// An upcoming [`Vault::get`].
+    Get,
+    /// An upcoming [`Vault::put`].
+    Put,
+}
+
+/// One operation the caller is ABOUT to perform, announced via [`Vault::warm`]
+/// so a backend with per-operation setup cost (the CLI's presigned-URL vault,
+/// ADR 0016) can amortize it in batch. Purely a hint: correctness never depends
+/// on having warmed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WarmOp {
+    /// The full fan-out Vault key of the upcoming operation.
+    pub key: String,
+    /// Which operation will run on it.
+    pub method: WarmMethod,
+}
+
 // ---------------------------------------------------------------------------
 // The Vault trait (docs/BUILD-PLAN.md §3, F9)
 // ---------------------------------------------------------------------------
@@ -114,6 +138,18 @@ pub trait Vault: Send + Sync {
     /// another sweep (or a manual cleanup) must not fail on an already-gone
     /// object.
     async fn delete(&self, key: &str) -> VaultResult<()>;
+
+    /// Announces operations the caller is about to perform, so a backend with
+    /// per-operation setup cost can prepare them in batch (the CLI's
+    /// presigned-URL vault pre-signs up to 256 URLs per Coordinator round-trip,
+    /// ADR 0016). A pure HINT with best-effort semantics: backends default to a
+    /// no-op, callers must work identically if it was never called, and a
+    /// failure here should surface only if the underlying transport is truly
+    /// down (callers may also choose to ignore it and let the real operation
+    /// report the error).
+    async fn warm(&self, _ops: &[WarmOp]) -> VaultResult<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import type * as http from "../http.js";
 import type * as migrations from "../migrations.js";
 import type * as revisions from "../revisions.js";
 import type * as spaces from "../spaces.js";
+import type * as vault from "../vault.js";
 
 import type {
   ApiFromModules,
@@ -30,6 +31,7 @@ declare const fullApi: ApiFromModules<{
   migrations: typeof migrations;
   revisions: typeof revisions;
   spaces: typeof spaces;
+  vault: typeof vault;
 }>;
 
 /**

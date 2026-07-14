@@ -134,10 +134,11 @@ Runbook completo: `docs/PRODUCTION-SETUP.md`. ADR: `docs/adr/0013`.
 - [x] **Cloudflare R2**: config-only (`ft-vault` ya habla R2; `S3_REGION=auto`, path-style).
   Plantilla `infra/.env.cloud.example`.
 - [x] **Secretos fuera del repo**: `infra/.env.cloud` (gitignored, en `.gitignore`).
-- [ ] **Provisionar cuentas + validar en vivo** (pendiente de credenciales del usuario):
-  crear R2 bucket + token y proyecto Convex Cloud (guía en el runbook), correr
-  `cloud-deploy.sh` + `cloud-smoke.sh`, y re-correr la prueba Mac↔VPS contra la nube (sin túnel
-  SSH — Mac y VPS hablan directo por HTTPS).
+- [~] **Provisionar cuentas + validar en vivo** (2026-07-04): R2 (`filething-prod`) y Convex
+  Cloud (`knowing-giraffe-699`, prod) provisionados; `cloud-deploy.sh` + `cloud-smoke.sh` en
+  verde (login Better Auth + init/clone 2 devices + round-trip R2 con descifrado `alg=1` + gc
+  dry-run). **Queda**: re-correr la prueba Mac↔VPS contra la nube (sin túnel SSH — Mac y VPS
+  hablan directo por HTTPS); requiere la Mac del usuario.
 
 ### Fase B — Endurecer para usuarios reales (desbloquea cobrar)
 En orden de prioridad; los [R] de abajo guardan los huecos ya cableados en el formato.
@@ -153,14 +154,39 @@ Entró en la tanda del 2026-07-03 ("Fase 3"): auth real + cifrado en runtime.
   key/nonce deterministas (ADR 0003), sidecars `keys/<aa>/<cid>` (ADR 0004), escrow v1 de
   `dedupSecret`/`spaceKey` en Convex, GC barre sidecars junto a sus Blocks. Manifests siguen
   `alg=0` (zero-knowledge diferido). Vault mixto OK; spaces pre-Fase 3 siguen en claro.
-  Validado e2e: blocks en MinIO sin plaintext + clone/descifrado cross-device.
-  **Pendiente**: validar en vivo contra Convex Cloud + R2 (re-correr `cloud-smoke.sh`; setear
+  Validado e2e: blocks en MinIO sin plaintext + clone/descifrado cross-device. Validado en
+  vivo contra Convex Cloud + R2 (2026-07-04, `cloud-smoke.sh` en verde con
   `BETTER_AUTH_SECRET`/`SITE_URL` en el deployment — runbook §4.3).
+- [x] **Vault firmado** (URLs prefirmadas, ADR 0016 — 2026-07-04, "Fase 4"): el Device ya no
+  necesita `S3_*` — action `vault:sign` ("use node", batcheada ≤256, TTL 15 min) con
+  `ctx.auth` + validación estricta de keys + ownership para `keys/<space_id>/…`; cliente
+  `SignedVault` (`apps/cli/src/signed_vault.rs`) ejecuta las URLs con reqwest directo a R2.
+  Precedencia en `build_vault`: `S3_*` en el entorno → acceso directo (ops/self-hosted/gates);
+  si no → firmado. `gc` sigue siendo de operador (list/delete no se prefirman). El smoke corre
+  los devices SIN `S3_*`. **Reservado**: batching desde el engine (hoy 1 action-call por
+  operación) y layout de keys con prefijo por Account.
 - [x] **Daemon como servicio** (`filething service install/uninstall/status`): launchd en
   macOS, systemd `--user` en Linux; env file 0600 con las credenciales + logs en
   `<config_dir>/daemon.log`, reinicio al fallar. `apps/cli/src/service.rs` (generadores puros
   testeados; carga/descarga vía launchctl/systemctl).
-- [ ] **Binarios por SO** (cargo-dist o similar) + firma/notarización en macOS.
+- [x] **Binarios por SO** (Fase 5, 2026-07-04): `dist` (cargo-dist 0.32) con installer shell
+  (`curl | sh` desde GitHub Releases) para Mac arm64/x86_64 + Linux musl x86_64/arm64
+  (estático, sin glibc del host); stack TLS migrado a rustls (fuera OpenSSL) para el
+  cross-build musl; el workflow de release hornea `FILETHING_DEFAULT_CONVEX_URL`
+  (`.github/workflows/release-build-setup.yml` → `apps/cli/src/env.rs`) — sin ella el
+  binario cae a localhost como en dev. Repo público + licencia MIT. **Reservado**:
+  firma/notarización macOS (solo hace falta para Homebrew cask/GUI; `curl` no pone el
+  atributo de cuarentena de Gatekeeper), dominio propio para el installer (redirect).
+- [x] **Performance del vault firmado + daemon por defecto** (Fase 6, 2026-07-04, ADR 0017;
+  motivado por la primera corrida real en Mac: un init de ~100 archivos tardó ~3.5 min en
+  silencio): `Vault::warm` (hint batch, default no-op) + `SignedVault` con firmas por lote
+  (≤256/action) y caché de URLs (TTL 900s−60 de margen); concurrencia `buffer_unordered` en
+  `commit.rs` (16) y `ft-diff::apply` (8); progreso visible por `tracing::info` en
+  subidas/bajadas. `init`/`clone`/`sync` instalan/arrancan/reinician el daemon-servicio en
+  background por defecto (`--no-daemon` / `FILETHING_NO_AUTO_DAEMON=1` para opt-out; los
+  scripts de gates/smoke lo setean); `filething daemon` sin dirs = todos los Spaces mapeados
+  (lo que invoca el unit del servicio; con 0 Spaces queda idle, sin crash-loop). **Reservado**:
+  warm de bloques tras leer una blocklist externalizada (`bk_ref` solo pre-firma la blocklist).
 - [~] **GC/retención** (`filething gc`, dry-run por defecto): mark-and-sweep **account-wide de
   huérfanos** (retiene TODO el historial; borra solo objetos que ninguna Revision referencia) +
   grace-period + guard de concurrencia. Validado en vivo (demo-gates gate g). ADR 0012. La
@@ -179,7 +205,9 @@ Entró en la tanda del 2026-07-03 ("Fase 3"): auth real + cifrado en runtime.
 ## Reservado — NO construir en el MVP (huecos ya cableados en el formato)
 - [R] ~~Cifrado en runtime~~ → construido en Fase 3 (2026-07-03, ADR 0015)
 - [R] Zero-knowledge (cifrar páginas de Manifest, `reach/*` para GC)
-- [R] Serve mode / self-hosted vault + Grants firmados
+- [R] Serve mode / self-hosted vault + Grants firmados — **parcialmente construido en Fase 4**
+  (2026-07-04, ADR 0016): el plano de datos gestionado ya va por URLs prefirmadas del
+  Coordinator; siguen reservados el serve mode P2P y los Grants offline firmados del formato
 - [R] GC / retención (grace-period y retention floor ya reservados en schema)
 - [R] ~~Better Auth~~ → construido en Fase 3 (email+password headless, ADR 0014); OAuth
   navegador + device-authorization para devices headless siguen reservados

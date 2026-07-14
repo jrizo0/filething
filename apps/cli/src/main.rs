@@ -15,6 +15,7 @@ mod config;
 mod credentials;
 mod env;
 mod service;
+mod signed_vault;
 
 use std::path::PathBuf;
 
@@ -57,6 +58,10 @@ enum Command {
         /// A name for the Space (defaults to the folder name).
         #[arg(long)]
         name: Option<String>,
+        /// Don't install/restart the background daemon service after this
+        /// command (also settable via `FILETHING_NO_AUTO_DAEMON`).
+        #[arg(long)]
+        no_daemon: bool,
     },
 
     /// Materialize an existing Space into a local folder.
@@ -68,6 +73,10 @@ enum Command {
         /// Unused for now; the Space carries its own name. Accepted for symmetry.
         #[arg(long)]
         name: Option<String>,
+        /// Don't install/restart the background daemon service after this
+        /// command (also settable via `FILETHING_NO_AUTO_DAEMON`).
+        #[arg(long)]
+        no_daemon: bool,
     },
 
     /// Show a Space's synced base and whether it has uncommitted local changes.
@@ -87,12 +96,18 @@ enum Command {
     Sync {
         /// The Space folder.
         dir: PathBuf,
+        /// Don't install/restart the background daemon service after this
+        /// command (also settable via `FILETHING_NO_AUTO_DAEMON`).
+        #[arg(long)]
+        no_daemon: bool,
     },
 
     /// Run the foreground Daemon over one or more Space folders until Ctrl-C.
+    /// With no folders, syncs every Space mapped in `config.json` — this is what
+    /// the background service invokes, so a newly mapped Space just needs a
+    /// restart to be picked up (`docs/BUILD-PLAN.md §3`, "daemon por defecto").
     Daemon {
-        /// The Space folders to sync continuously.
-        #[arg(required = true)]
+        /// The Space folders to sync continuously (defaults to all mapped Spaces).
         dirs: Vec<PathBuf>,
     },
 
@@ -128,6 +143,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 needs ONE process-level CryptoProvider, and this binary links
+    // two candidates (reqwest brings `ring`, the convex websocket stack brings
+    // `aws-lc-rs`), so auto-detection panics inside the first TLS handshake —
+    // on a tokio worker thread, which dies silently and leaves the websocket
+    // mutation waiting forever. Pin `ring` explicitly before any TLS happens.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
+
     // Logs: default to info, override with RUST_LOG. Written to stderr so command
     // output on stdout stays clean for scripting.
     tracing_subscriber::fmt()
@@ -145,15 +169,20 @@ async fn main() -> anyhow::Result<()> {
             signup,
             name,
         } => commands::login(email, signup, name).await,
-        Command::Init { dir, name } => commands::init(dir, name).await,
+        Command::Init {
+            dir,
+            name,
+            no_daemon,
+        } => commands::init(dir, name, no_daemon).await,
         Command::Clone {
             space_id,
             dir,
             name,
-        } => commands::clone(space_id, dir, name).await,
+            no_daemon,
+        } => commands::clone(space_id, dir, name, no_daemon).await,
         Command::Status { dir } => commands::status(dir).await,
         Command::Ls { dir } => commands::ls(dir),
-        Command::Sync { dir } => commands::sync(dir).await,
+        Command::Sync { dir, no_daemon } => commands::sync(dir, no_daemon).await,
         Command::Daemon { dirs } => commands::daemon(dirs).await,
         Command::Gc {
             dir,
@@ -226,14 +255,20 @@ mod tests {
         assert!(Cli::try_parse_from(["filething", "login"]).is_err());
     }
 
-    /// `init <dir> --name` parses the positional dir and the name flag.
+    /// `init <dir> --name` parses the positional dir and the name flag; `--no-daemon`
+    /// defaults to false.
     #[test]
     fn parse_init_dir_and_name() {
         let cli = Cli::parse_from(["filething", "init", "/home/u/proj", "--name", "proj"]);
         match cli.command {
-            Command::Init { dir, name } => {
+            Command::Init {
+                dir,
+                name,
+                no_daemon,
+            } => {
                 assert_eq!(dir, PathBuf::from("/home/u/proj"));
                 assert_eq!(name.as_deref(), Some("proj"));
+                assert!(!no_daemon);
             }
             other => panic!("expected Init, got {other:?}"),
         }
@@ -248,12 +283,31 @@ mod tests {
                 space_id,
                 dir,
                 name,
+                no_daemon,
             } => {
                 assert_eq!(space_id, "sp_123");
                 assert_eq!(dir, PathBuf::from("/home/u/clone"));
                 assert!(name.is_none());
+                assert!(!no_daemon);
             }
             other => panic!("expected Clone, got {other:?}"),
+        }
+    }
+
+    /// `--no-daemon` parses on `init`, `clone`, and `sync`.
+    #[test]
+    fn parse_no_daemon_flag() {
+        match Cli::parse_from(["filething", "init", "/p", "--no-daemon"]).command {
+            Command::Init { no_daemon, .. } => assert!(no_daemon),
+            other => panic!("expected Init, got {other:?}"),
+        }
+        match Cli::parse_from(["filething", "clone", "sp_1", "/p", "--no-daemon"]).command {
+            Command::Clone { no_daemon, .. } => assert!(no_daemon),
+            other => panic!("expected Clone, got {other:?}"),
+        }
+        match Cli::parse_from(["filething", "sync", "/p", "--no-daemon"]).command {
+            Command::Sync { no_daemon, .. } => assert!(no_daemon),
+            other => panic!("expected Sync, got {other:?}"),
         }
     }
 
@@ -289,11 +343,13 @@ mod tests {
         }
     }
 
-    /// `daemon` with no dir is a parse error (required = true).
+    /// `daemon` with no dir is valid (defaults to every mapped Space at runtime).
     #[test]
-    fn daemon_requires_a_dir() {
-        let r = Cli::try_parse_from(["filething", "daemon"]);
-        assert!(r.is_err(), "daemon with no dir must fail to parse");
+    fn parse_daemon_no_dirs_is_valid() {
+        match Cli::parse_from(["filething", "daemon"]).command {
+            Command::Daemon { dirs } => assert!(dirs.is_empty()),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
     }
 
     /// `gc <dir>` defaults to a dry run; flags flip apply/grace.

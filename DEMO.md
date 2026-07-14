@@ -5,11 +5,13 @@ vertical completo entre **dos Devices** (aquí simulados como dos procesos en la
 máquina) contra un **Coordinator** (Convex) y un **Vault** (S3/MinIO local o Cloudflare R2).
 
 **Auth real** (Better Auth, email+password por Device — ADR 0014) y **cifrado en runtime**
-(`alg=1`, XChaCha20-Poly1305 — ADR 0015) están **activos desde la Fase 3**. Los manifests
-siguen en claro (`alg=0`, zero-knowledge diferido) y el Vault mixto está soportado (los
-Blocks en claro de spaces pre-Fase 3 coexisten con los cifrados). Detalle del formato en
-`docs/format.md`; arquitectura en `docs/BUILD-PLAN.md`; estado en `TODO.md`. Para correr
-contra la nube (Convex Cloud + R2), ver `docs/PRODUCTION-SETUP.md`.
+(`alg=1`, XChaCha20-Poly1305 — ADR 0015) están **activos desde la Fase 3**: `alg=1` es el
+default para Spaces nuevas, con escrow de claves en Convex (`docs/adr/0015`). Los manifests
+siguen en claro (`alg=0`, zero-knowledge diferido) y el Vault mixto está permitido
+indefinidamente (los Blocks en claro de spaces pre-Fase 3, `cid==pcid`, coexisten con los
+cifrados — `docs/format.md §11`). Detalle del formato en `docs/format.md`; arquitectura en
+`docs/BUILD-PLAN.md`; estado en `TODO.md`. Para correr contra la nube (Convex Cloud + R2),
+ver `docs/PRODUCTION-SETUP.md`.
 
 ## 0. Requisitos
 - Rust (stable), Bun, Docker. (En este repo ya están instalados.)
@@ -41,12 +43,16 @@ filething clone  <space_id> <dir>                 # traer un Space existente a u
 filething status [<dir>]                          # base sincronizada + cambios locales
 filething ls     [<dir>]                          # listar rutas del Space
 filething sync   <dir>                            # one-shot: pull + commit (para scripts)
-filething daemon <dir>...                         # sync continuo en foreground (Ctrl-C para parar)
+filething daemon [<dir>...]                       # sync continuo en foreground; sin dirs = todos los Spaces
 ```
 El login usa **Better Auth** (ADR 0014): la contraseña se lee de `$FILETHING_PASSWORD`
 (scripts) o se pide por prompt. Ya no hay pairing codes — vincular un Device nuevo = hacer
 `login` (sin `--signup`) del mismo usuario. El signup viene **cerrado** por defecto en el
 deployment; se abre con `FILETHING_ALLOW_SIGNUP=1` (ver §5 y `docs/PRODUCTION-SETUP.md §4.3`).
+
+Desde Fase 6, `init`/`clone`/`sync` dejan el daemon corriendo en background como servicio
+del SO automáticamente (opt-out: `--no-daemon` o `FILETHING_NO_AUTO_DAEMON=1` — los scripts
+de gates/smoke lo setean para no instalar servicios en la máquina que los corre).
 
 Config/identidad por Device en `$FILETHING_HOME` (o `~/.config/filething/config.json`); el
 token de sesión vive en `credentials.json` (`0600`) junto a él. El índice local de cada Space
@@ -102,12 +108,11 @@ Convex Cloud + deploy key, rellenar `infra/.env.cloud`, y `scripts/cloud-deploy.
 - `filething metrics [dir]` — métricas de sync del daemon (lee `.filething/metrics.json`).
 - `filething service <install|uninstall|status>` — daemon como servicio del SO.
 
-## Qué sigue reservado (no construido)
-Ya construido en fases 2–3: cifrado en runtime (`alg=1`, ADR 0015), auth real (Better Auth,
-ADR 0014), GC de huérfanos (`filething gc`, ADR 0012), métricas y servicio de SO (`metrics`/
-`service`). Sigue **reservado**: zero-knowledge frente al Coordinator (cifrar manifests; hoy
-`alg=1` protege los Blocks pero el escrow server-side ve las claves — ADR 0015), OAuth por
-navegador / device-authorization flow (hoy: email+password headless), serve mode / self-hosted
-vault, poda de historial (retention floor; el GC actual solo barre huérfanos — ADR 0012),
-billing, dashboard, packing de bloques chicos, binarios per-SO, Windows. Ver `TODO.md`
-(sección Reservado) y `docs/format.md §11`.
+## Qué NO está en el MVP (huecos reservados en el formato, no construidos)
+zero-knowledge frente al Coordinator (cifrar manifests; hoy `alg=1` protege los Blocks pero
+el escrow server-side ve las claves — ADR 0015), serve mode / self-hosted vault, poda de
+historial / retention floor (existe `filething gc`: orphan-sweep account-wide, dry-run por
+defecto — retiene TODO el historial; ver `docs/adr/0012`), OAuth por navegador /
+device-authorization flow (hoy: email+password headless), billing, dashboard, packing de
+bloques chicos, Windows. Ver `TODO.md` (sección Reservado) y `docs/format.md §11`. (Los
+binarios per-SO SÍ existen desde Fase 5: installer shell desde GitHub Releases, ver `README.md`.)

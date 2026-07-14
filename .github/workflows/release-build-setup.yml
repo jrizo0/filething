@@ -1,0 +1,8 @@
+# Steps que `dist` inyecta en cada job de build del release (ver
+# dist-workspace.toml `github-build-setup`). Hornea la URL del Coordinator
+# gestionado como default de compile-time del binario: `option_env!` en
+# apps/cli/src/env.rs — las env vars CONVEX_URL/CONVEX_SELF_HOSTED_URL siguen
+# teniendo precedencia en runtime (self-hosting intacto).
+- name: Bake managed Coordinator URL into the release binary
+  shell: bash
+  run: echo "FILETHING_DEFAULT_CONVEX_URL=https://knowing-giraffe-699.convex.cloud" >> "$GITHUB_ENV"

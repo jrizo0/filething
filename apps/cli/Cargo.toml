@@ -3,6 +3,8 @@ name = "filething"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Developer-focused folder sync: encrypted, content-addressed Spaces across your machines"
 
 [[bin]]
 name = "filething"
@@ -27,6 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# SignedVault implements the ft-vault Vault trait against presigned URLs.
+async-trait = { workspace = true }
 # To read the single space_state row out of a Space's local index when resolving
 # a dir to its Space id (ft-index keys space_state by id, no "only row" getter).
 rusqlite = { workspace = true }
@@ -35,9 +39,15 @@ rusqlite = { workspace = true }
 # Coordinator; the admin path remains only as an ops fallback.
 convex = { workspace = true }
 # Real auth: the CLI talks to Better Auth over HTTP (signup / login / mint the
-# Convex-audience JWT). reqwest is async (fits the tokio CLI) and reuses the
-# native-tls stack already compiled for the Convex websocket.
-reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+# Convex-audience JWT). reqwest is async (fits the tokio CLI) and shares the
+# rustls stack already compiled for the Convex websocket (rustls, not
+# native-tls, so *-linux-musl release builds need no OpenSSL cross toolchain).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Direct dep ONLY to pin the process-level CryptoProvider in main(): the binary
+# links BOTH `ring` (via reqwest) and `aws-lc-rs` (via the convex websocket
+# stack), and rustls 0.23 panics at the first TLS handshake instead of picking
+# one. Keep the feature here in sync with the install_default() call in main.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Parse the Convex deployment URL to derive the Better Auth site URL.
 url = "2"
 # CSPRNG for the per-Account dedup_secret + per-Space space_key candidates.

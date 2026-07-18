@@ -1240,6 +1240,7 @@ dependencies = [
  "async-trait",
  "clap",
  "convex",
+ "ft-coordinator",
  "ft-core",
  "ft-daemon",
  "ft-engine",
@@ -1247,6 +1248,7 @@ dependencies = [
  "ft-index",
  "ft-manifest",
  "ft-vault",
+ "futures",
  "hex",
  "rand 0.8.6",
  "reqwest",
@@ -1370,10 +1372,10 @@ dependencies = [
 name = "ft-daemon"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "ft-engine",
  "futures",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
 ]

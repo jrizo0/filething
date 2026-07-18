@@ -11,18 +11,23 @@
 //!
 //! [`materialize`] reconstructs a single [`FileEntry`] onto disk: it resolves the
 //! ordered Block list (inline `bk`, or the externalized `blocklist/<cid>` object
-//! when `bk_ref` is set), downloads each `blocks/<cid>`, VERIFIES wire integrity
-//! (`ft_block::verify`, `§4.3`), decodes and concatenates the payloads IN ORDER,
-//! and writes the bytes through the [`OsFs`] adapter (honoring the executable
-//! bit). Symlinks (`t=1`) are recreated from their literal target `lt`; Derived
-//! entries (`t=2`) materialize no bytes; Dir entries (`t=3`) create the directory
-//! itself so empty directories sync (ADR 0019). [`apply`] drives a slice of
-//! [`Change`]s in FOUR ordered phases (ADR 0019) so a batch mixing type
-//! transitions and deletes converges without a racy `ENOTEMPTY`: (1) non-dir→dir
-//! transitions shallowest-first, (2) the concurrent bulk of adds/mods/non-dir
-//! deletes, (3) dir deletions deepest-first (empty-only, never recursive), then
-//! (4) dir→non-dir transitions — run last so the dir's children are already gone
-//! and its `remove_dir` succeeds. See [`apply`] for the full rationale.
+//! when `bk_ref` is set), then downloads the `blocks/<cid>` objects CONCURRENTLY
+//! (a bounded fan-out, ADR 0017) rather than one strictly-sequential round-trip at
+//! a time — so a large multi-block file is no longer latency-bound. Each fetch
+//! VERIFIES wire integrity (`ft_block::verify`, `§4.3`), decodes, and for `alg=1`
+//! unwraps its data-key sidecar and AEAD-decrypts; the payloads are concatenated
+//! back IN ORDER (`buffered`, not `buffer_unordered`, yields results in input
+//! order with no reordering logic). The bytes are then written through the
+//! [`OsFs`] adapter (honoring the executable bit). Symlinks (`t=1`) are recreated
+//! from their literal target `lt`; Derived entries (`t=2`) materialize no bytes;
+//! Dir entries (`t=3`) create the directory itself so empty directories sync
+//! (ADR 0019). [`apply`] drives a slice of [`Change`]s in FOUR ordered phases
+//! (ADR 0019) so a batch mixing type transitions and deletes converges without a
+//! racy `ENOTEMPTY`: (1) non-dir→dir transitions shallowest-first, (2) the
+//! concurrent bulk of adds/mods/non-dir deletes, (3) dir deletions deepest-first
+//! (empty-only, never recursive), then (4) dir→non-dir transitions — run last so
+//! the dir's children are already gone and its `remove_dir` succeeds. See
+//! [`apply`] for the full rationale.
 
 use std::path::{Path, PathBuf};
 
@@ -470,15 +475,25 @@ fn same_identity(a: &FileEntry, b: &FileEntry) -> bool {
 // materialize
 // ---------------------------------------------------------------------------
 
+/// Max `blocks/<cid>` GETs kept in flight while materializing ONE file's Block
+/// list (`§8.4`). Matches the commit path's upload fan-out (ADR 0017). Because
+/// [`apply`] itself already drives up to 8 changes concurrently, the worst-case
+/// number of in-flight Block GETs across a whole `apply` is `8 * 16 = 128`.
+const BLOCK_DOWNLOAD_CONCURRENCY: usize = 16;
+
 /// Materializes a single [`FileEntry`] onto disk under `space_root` (`§8.4`).
 ///
 /// - **File** (`t=0`): resolves the ordered Block list — the externalized
 ///   `blocklist/<cid>` object when `bk_ref` is set, otherwise the inline `bk` —
-///   then for each `Cid` downloads `blocks/<cid>`, VERIFIES integrity with
-///   [`ft_block::verify`] (`BLAKE3(payload)` vs `cid`, `§4.3`), decodes the
-///   payload, and concatenates IN ORDER. The bytes are written via
+///   then downloads the `blocks/<cid>` objects CONCURRENTLY (a bounded fan-out of
+///   [`BLOCK_DOWNLOAD_CONCURRENCY`], ADR 0017). Each fetch VERIFIES integrity with
+///   [`ft_block::verify`] (`BLAKE3(payload)` vs `cid`, `§4.3`) and decodes the
+///   payload (for `alg=1`, unwrapping the data-key sidecar and AEAD-decrypting);
+///   the decoded chunks are concatenated back IN ORDER (`buffered` yields results
+///   in input order despite out-of-order completion). The bytes are written via
 ///   [`OsFs::write_bytes`] with the entry's executable bit. A single corrupt
-///   object in the Vault aborts with [`Error::Block`].
+///   object in the Vault aborts with [`Error::Block`] (the fan-out stops at the
+///   first error; nothing is written).
 /// - **Symlink** (`t=1`): recreates the symlink at the entry's path pointing at
 ///   its literal target `lt` (no bytes downloaded).
 /// - **Derived** (`t=2`): materializes nothing (its bytes never travel, `§5.1`).
@@ -541,33 +556,75 @@ pub async fn materialize(
             Ok(())
         }
         ft_core::FileType::File => {
+            use futures::stream::{self, StreamExt};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::time::Instant;
+
             let bk = resolve_blocklist(vault, entry).await?;
 
-            // Download, verify and concatenate every Block payload in order.
+            // Download, verify and decode every Block CONCURRENTLY, then
+            // concatenate the plaintext chunks IN ORDER. `buffered` (NOT
+            // `buffer_unordered`) drives up to `BLOCK_DOWNLOAD_CONCURRENCY` futures
+            // at once but yields their results in INPUT order, so the ordered
+            // concatenation below needs no reordering logic — the order of the
+            // Block list IS the file's content (`§4.3`/`§5.3`). The first error
+            // aborts the stream (via `?` below), leaving nothing written.
+            let total = bk.len();
+            let started = Instant::now();
+            let completed = AtomicUsize::new(0);
+
+            let mut stream = stream::iter(bk.iter())
+                .map(|cid| {
+                    let completed = &completed;
+                    async move {
+                        let key = ft_hash::block_key(cid);
+                        let obj = vault.get(&key).await?;
+                        // Wire-integrity check: a corrupt object fails here
+                        // (`§4.3`). It recomputes the addressing hash from the
+                        // object's own bytes and works for BOTH algs with no key,
+                        // so it also guarantees the header's `alg` is 0 or 1 before
+                        // we branch on it below.
+                        ft_block::verify(&obj, cid)?;
+                        let (header, payload) = ft_block::decode(&obj)?;
+                        let chunk = if header.alg == ft_core::ALG_CLEARTEXT {
+                            // Cleartext (`alg=0`): the payload IS the content.
+                            payload
+                        } else {
+                            // Encrypted (`alg=1`): unwrap this Block's data key
+                            // from its `keys/<space_id>/<cid>` sidecar with the
+                            // Space key, then AEAD-decrypt the object
+                            // (`§4.4`/`§4.5`). No key material ⇒ typed error, never
+                            // a panic.
+                            let crypto =
+                                crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
+                            let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
+                            let data_key =
+                                ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
+                            ft_block::decode_encrypted(&obj, &data_key)?
+                        };
+                        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_multiple_of(25) {
+                            tracing::info!(completed = n, total, "downloading blocks");
+                        }
+                        Result::Ok(chunk)
+                    }
+                })
+                .buffered(BLOCK_DOWNLOAD_CONCURRENCY);
+
             let mut contents: Vec<u8> = Vec::with_capacity(entry.sz as usize);
-            for cid in &bk {
-                let key = ft_hash::block_key(cid);
-                let obj = vault.get(&key).await?;
-                // Wire-integrity check: a corrupt object fails here (`§4.3`). It
-                // recomputes the addressing hash from the object's own bytes and
-                // works for BOTH algs with no key, so it also guarantees the
-                // header's `alg` is 0 or 1 before we branch on it below.
-                ft_block::verify(&obj, cid)?;
-                let (header, payload) = ft_block::decode(&obj)?;
-                if header.alg == ft_core::ALG_CLEARTEXT {
-                    // Cleartext (`alg=0`): the payload IS the content (`§4.3`).
-                    contents.extend_from_slice(&payload);
-                } else {
-                    // Encrypted (`alg=1`): unwrap this Block's data key from its
-                    // `keys/<space_id>/<cid>` sidecar with the Space key, then
-                    // AEAD-decrypt the object (`§4.4`/`§4.5`). No key material ⇒
-                    // typed error, never a panic.
-                    let crypto = crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
-                    let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
-                    let data_key = ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
-                    let cleartext = ft_block::decode_encrypted(&obj, &data_key)?;
-                    contents.extend_from_slice(&cleartext);
-                }
+            while let Some(chunk) = stream.next().await {
+                contents.extend_from_slice(&chunk?);
+            }
+
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let bytes = contents.len();
+            // Use `info` for real files so the throughput is visible next to the
+            // commit path's "blocks uploaded" line; keep tiny files at `debug` so a
+            // sync of many small files does not spam the log.
+            if total >= 25 {
+                tracing::info!(total, bytes, elapsed_ms, "blocks downloaded");
+            } else {
+                tracing::debug!(total, bytes, elapsed_ms, "blocks downloaded");
             }
 
             ensure_parent(fs, &dest)?;
@@ -2067,7 +2124,7 @@ mod tests {
 
     #[tokio::test]
     async fn old_manifest_without_dirs_diffs_and_applies_against_a_tree_with_dirs() {
-        // A pre-ADR-0018 manifest holds only file entries (directories implicit).
+        // A pre-ADR-0019 manifest holds only file entries (directories implicit).
         // Diffing it against a new tree that ALSO carries explicit dir entries must
         // surface the dirs as plain Additions; apply then creates them. And a diff
         // of the old tree against itself is empty (absence decodes fine).
@@ -2195,6 +2252,279 @@ mod tests {
             std::fs::read(space_dir.path().join("d").join("new.txt")).unwrap(),
             child_content,
             "the added child must live inside the new directory"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency: materialize downloads a file's Blocks CONCURRENTLY but
+    // concatenates them IN ORDER (ADR 0017). A latency-injecting Vault wrapper
+    // scrambles completion order and records the peak number of in-flight GETs,
+    // so we can assert both (a) byte-identical output and (b) real concurrency.
+    // -----------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`Vault`] that wraps [`FsVault`], sleeps a per-`get` delay before each
+    /// fetch, and tracks how many `get`s are in flight at once (current + peak).
+    ///
+    /// The delay is `base_ms + (hash(key) % (jitter_ms + 1))`: deterministic per
+    /// key but varied across keys, so blocks fetched together finish in a
+    /// SCRAMBLED order — exactly the condition an order-preserving fan-out must
+    /// survive. `jitter_ms == 0` gives a fixed delay (used by the benchmark).
+    struct DelayVault {
+        inner: FsVault,
+        base_ms: u64,
+        jitter_ms: u64,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        gets: AtomicUsize,
+    }
+
+    impl DelayVault {
+        fn new(inner: FsVault, base_ms: u64, jitter_ms: u64) -> Self {
+            Self {
+                inner,
+                base_ms,
+                jitter_ms,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+            }
+        }
+
+        /// Deterministic per-key jitter in `0..=span` (FNV-1a of the key).
+        fn jitter_for(key: &str, span: u64) -> u64 {
+            if span == 0 {
+                return 0;
+            }
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in key.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h % (span + 1)
+        }
+    }
+
+    #[async_trait]
+    impl Vault for DelayVault {
+        async fn head(&self, key: &str) -> ft_vault::VaultResult<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(&self, key: &str) -> ft_vault::VaultResult<Vec<u8>> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            let ms = self.base_ms + Self::jitter_for(key, self.jitter_ms);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            let r = self.inner.get(key).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            r
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>) -> ft_vault::VaultResult<()> {
+            self.inner.put(key, body).await
+        }
+
+        async fn list(&self, prefix: &str) -> ft_vault::VaultResult<Vec<ft_vault::VaultObject>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> ft_vault::VaultResult<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_multiblock_is_order_preserving_under_concurrency() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        // 40 blocks with DISTINCT content per block, so a reordering bug would
+        // corrupt the bytes (identical chunks would dedup to one cid and hide it).
+        let owned: Vec<Vec<u8>> = (0..40)
+            .map(|i| format!("block-{i:04}-distinct-payload-for-ordering-check-{i}").into_bytes())
+            .collect();
+        let chunks: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let (entry, content) = upload_multiblock_file(&vault, "big/multi.bin", &chunks).await;
+
+        // Fetch through the delay vault (5..=15ms per get -> scrambled completion).
+        let delay = DelayVault::new(FsVault::new(vault_dir.path()), 5, 10);
+        materialize(&delay, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read(space_dir.path().join("big").join("multi.bin")).unwrap();
+        assert_eq!(
+            on_disk, content,
+            "reconstructed file must be byte-identical despite out-of-order completion"
+        );
+
+        // The fan-out was actually concurrent: more than one GET was in flight.
+        let peak = delay.max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "expected concurrent block GETs (peak in-flight > 1), got {peak}"
+        );
+        assert_eq!(delay.gets.load(Ordering::SeqCst), 40, "one GET per block");
+    }
+
+    #[tokio::test]
+    async fn materialize_alg1_multiblock_is_order_preserving_under_concurrency() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let owned: Vec<Vec<u8>> = (0..24)
+            .map(|i| format!("SECRET-{i:04}-encrypted-chunk-content-{i}").into_bytes())
+            .collect();
+        let chunks: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let (entry, content) = upload_encrypted_file(&vault, "secret/multi.bin", &chunks).await;
+
+        // Encrypted path adds a per-block sidecar GET inside the same future; the
+        // delay still scrambles completion across the buffered fan-out.
+        let delay = DelayVault::new(FsVault::new(vault_dir.path()), 5, 10);
+        let c = crypto();
+        materialize(&delay, &fs, space_dir.path(), &entry, Some(&c))
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read(space_dir.path().join("secret").join("multi.bin")).unwrap();
+        assert_eq!(
+            on_disk, content,
+            "alg=1 multi-block must round-trip byte-identical under concurrency"
+        );
+        let peak = delay.max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "expected concurrent GETs on the encrypted path, got peak {peak}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_block_still_fails_cleanly_through_the_delay_vault() {
+        // The concurrent path must keep the same integrity semantics: a corrupt
+        // block aborts with Error::Block(CidMismatch) and writes nothing.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        // Several honest blocks plus one corrupt one in the middle.
+        let good: &[u8] = b"good-and-honest-block-payload";
+        for i in 0..5u8 {
+            let mut c = good.to_vec();
+            c.push(i);
+            let cid = ft_block::cid_for(&c);
+            vault
+                .put(&ft_hash::block_key(&cid), ft_block::encode(&c))
+                .await
+                .unwrap();
+        }
+        let payload = vec![7u8; 4096];
+        let corrupt_cid = ft_block::cid_for(&payload);
+        let mut obj = ft_block::encode(&payload);
+        let mid = ft_core::BLOCK_HEADER_LEN + payload.len() / 2;
+        obj[mid] ^= 0x01;
+        vault
+            .put(&ft_hash::block_key(&corrupt_cid), obj)
+            .await
+            .unwrap();
+
+        let mut bk = Vec::new();
+        for i in 0..5u8 {
+            let mut c = good.to_vec();
+            c.push(i);
+            bk.push(ft_block::cid_for(&c));
+        }
+        bk.insert(2, corrupt_cid);
+
+        let entry = FileEntry {
+            p: CanonicalPath("corrupt.bin".to_string()),
+            t: FileType::File,
+            x: false,
+            sz: 4096,
+            pcid: Pcid::new([0u8; 32]),
+            bk,
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+
+        let delay = DelayVault::new(FsVault::new(vault_dir.path()), 3, 6);
+        let err = materialize(&delay, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Block(ft_block::Error::CidMismatch { .. })),
+            "corrupt block must fail wire-integrity, got {err:?}"
+        );
+        assert!(!space_dir.path().join("corrupt.bin").exists());
+    }
+
+    /// A latency-bound benchmark for the concurrent download path. Ignored by
+    /// default (it sleeps for hundreds of ms). Run with:
+    /// `cargo test -p ft-diff -- --ignored bench_materialize`.
+    ///
+    /// 320 blocks x 64 KiB = 20 MiB, each GET delayed a FIXED 25ms. A sequential
+    /// download would take at least `320 * 25ms = 8s`; the `buffered(16)` fan-out
+    /// should finish in ~0.5s. Asserting `< 2s` fails loudly on any regression to
+    /// a strictly-sequential loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_materialize_20mb_with_latency() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        const N: usize = 320;
+        const CHUNK: usize = 64 * 1024;
+        let owned: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                let mut c = vec![0u8; CHUNK];
+                // Distinct first bytes per block so every cid differs (no dedup).
+                c[0] = (i & 0xff) as u8;
+                c[1] = ((i >> 8) & 0xff) as u8;
+                c
+            })
+            .collect();
+        let chunks: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let (entry, content) = upload_multiblock_file(&vault, "bench/big.bin", &chunks).await;
+        assert_eq!(content.len(), N * CHUNK);
+
+        let per_get_ms = 25u64;
+        let delay = DelayVault::new(FsVault::new(vault_dir.path()), per_get_ms, 0);
+
+        let started = std::time::Instant::now();
+        materialize(&delay, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let mib = (N * CHUNK) as f64 / (1024.0 * 1024.0);
+        let mb_per_s = mib / elapsed.as_secs_f64();
+        let sequential_ms = N as u64 * per_get_ms;
+        println!(
+            "bench_materialize_20mb_with_latency: {N} blocks x {CHUNK} B = {mib:.1} MiB, \
+             {per_get_ms}ms/get\n  concurrent elapsed = {:?} ({mb_per_s:.1} MiB/s), \
+             peak in-flight = {}\n  theoretical sequential >= {sequential_ms} ms ({:.1} s)",
+            elapsed,
+            delay.max_in_flight.load(Ordering::SeqCst),
+            sequential_ms as f64 / 1000.0,
+        );
+
+        let on_disk = std::fs::read(space_dir.path().join("bench").join("big.bin")).unwrap();
+        assert_eq!(on_disk.len(), content.len(), "20 MiB round-trip");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "concurrent download must be far faster than the {sequential_ms}ms sequential \
+             floor; got {elapsed:?} (regression to a sequential loop?)"
         );
     }
 }

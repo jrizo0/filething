@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 ft-engine = { workspace = true }
 ft-daemon = { workspace = true }
+# Named directly so the CLI can classify a typed CoordinatorError (surfaced by
+# ft-engine's EngineError::Coordinator) into a human message + next step.
+ft-coordinator = { workspace = true }
 # Foundation crates the CLI touches directly while orchestrating the engine:
 # the FS adapter (status mount), manifest::build (local-change detection),
 # FileType (ls output), and Index (opening a Space's local index).
@@ -25,6 +28,9 @@ ft-vault = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# LocalBoxFuture: the daemon builds one !Send per-Space task future per ft_daemon
+# SpaceSlot (the engine's run loop is !Send, so slots stay on one task).
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

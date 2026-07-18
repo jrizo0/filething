@@ -14,6 +14,7 @@ use ft_core::SpaceCrypto;
 use ft_engine::{
     AccountId, CommitOutcome, DeviceId, GcOptions, PullOutcome, SpaceContext, SpaceId, SyncMetrics,
 };
+use futures::future::LocalBoxFuture;
 
 use crate::config::{normalize_abs, Config};
 use crate::credentials::{self, Credentials};
@@ -384,9 +385,25 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
                 }
                 None => println!("  remote head: none yet"),
             },
-            Err(e) => println!("  remote head: unavailable ({e})"),
+            // A deleted / inaccessible Space here is a typed CoordinatorError;
+            // show its human headline instead of the raw "Server Error" (#11).
+            Err(e) => println!(
+                "  remote head: unavailable ({})",
+                crate::errors::headline(&e)
+            ),
         },
         Err(e) => println!("  remote head: unavailable ({e})"),
+    }
+
+    // If the background daemon has quarantined this Space (issue #8), say so — it
+    // explains why sync appears stuck even though the config looks fine.
+    let m = SyncMetrics::load(&root);
+    if m.quarantined {
+        let err = m
+            .last_quarantine_error
+            .as_deref()
+            .unwrap_or("unknown error");
+        println!("  daemon: Space is QUARANTINED ({err})");
     }
     Ok(())
 }
@@ -491,9 +508,11 @@ pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
 /// `daemon [<dir>...]` — run the foreground Daemon over the given Space dirs, or
 /// (with none given) every Space mapped in `config.json` (`docs/BUILD-PLAN.md
 /// §3`, "daemon por defecto"). This no-args form is what the background service
-/// invokes, so a Space added later just needs a restart to be picked up. Opens
-/// one `SpaceContext` per dir and hands them to [`ft_daemon::serve`], shutting
-/// down on Ctrl-C.
+/// invokes, so a Space added later just needs a restart to be picked up. Builds
+/// one [`ft_daemon::SpaceSlot`] per dir — a factory that mounts and runs the
+/// Space on every (re)try — and hands them to [`ft_daemon::serve`], which
+/// supervises each independently (a failing Space is quarantined and retried, not
+/// fatal to the daemon — issue #8) and shuts down on Ctrl-C.
 ///
 /// With zero Spaces mapped (e.g. right after `service install`, before any
 /// `init`/`clone` ran) there is nothing to open yet, and — critically — no
@@ -515,45 +534,103 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
         std::future::pending::<()>().await;
     }
 
+    // Global preconditions ARE fatal: with no identity/credentials nothing can
+    // sync, and exiting with that error is correct (the OS supervisor's relaunch
+    // won't help, but there is genuinely nothing to do).
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = Credentials::load()?;
 
-    let mut spaces = Vec::with_capacity(dirs.len());
-    for dir in dirs {
-        let root = normalize_abs(&dir);
-        let space_id = env::space_id_at(&root)?;
-        let index = env::open_index(&root)?;
-        // The JWT is re-minted on every connect and reconnect (set_auth_callback,
-        // see env::connect) so the daemon outlives the ~15-min token expiry.
-        let (mut coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
-        let escrow_key = env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
-        let mut ctx = SpaceContext::open(
-            index,
-            vault,
-            coordinator,
-            account_id.clone(),
-            device_id.clone(),
-            space_id.clone(),
-        )
-        .with_context(|| format!("opening Space at {}", root.display()))?;
-        let crypto = env::load_space_crypto(&root, &space_id, creds.as_ref())?;
-        env::assert_crypto_matches_escrow(&space_id, escrow_key, crypto.as_ref())?;
-        if let Some(crypto) = crypto {
-            ctx.attach_crypto(crypto);
-        }
-        tracing::info!(space = %space_id, root = %root.display(), "mounted Space for daemon");
-        spaces.push(ctx);
-    }
+    // Build one supervised slot per Space. Crucially, ALL per-Space work — id
+    // lookup, index open, connect, `space_key` recovery, mount, crypto attach —
+    // lives INSIDE the slot's task closure, not here: [`ft_daemon::serve`] calls
+    // it afresh on every (re)try, so a Space whose setup fails (e.g.
+    // `ensure_space_key_cached` hitting a deleted Space) is QUARANTINED and
+    // retried with backoff instead of aborting the whole daemon and crash-looping
+    // the OS service (issue #8, "un Space roto brickea el daemon entero").
+    let slots = dirs
+        .into_iter()
+        .map(|dir| {
+            let root = normalize_abs(&dir);
+            let label = root.display().to_string();
+            // Each retry is a fresh attempt, so the closure clones this Space's
+            // inputs on every call rather than moving them once.
+            let url = url.clone();
+            let account_id = account_id.clone();
+            let device_id = device_id.clone();
+            let creds = creds.clone();
+            let slot_root = root.clone();
+            let task = move |stop: LocalBoxFuture<'static, ()>| {
+                let url = url.clone();
+                let account_id = account_id.clone();
+                let device_id = device_id.clone();
+                let creds = creds.clone();
+                let root = slot_root.clone();
+                Box::pin(async move {
+                    let space_id = env::space_id_at(&root)?;
+                    let index = env::open_index(&root)?;
+                    // The JWT is re-minted on every connect and reconnect
+                    // (set_auth_callback, see env::connect) so the daemon outlives
+                    // the ~15-min token expiry.
+                    let (mut coordinator, vault) =
+                        env::connect_and_vault(&url, creds.as_ref()).await?;
+                    let escrow_key =
+                        env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
+                    let mut ctx = SpaceContext::open(
+                        index,
+                        vault,
+                        coordinator,
+                        account_id,
+                        device_id,
+                        space_id.clone(),
+                    )
+                    .with_context(|| format!("opening Space at {}", root.display()))?;
+                    let crypto = env::load_space_crypto(&root, &space_id, creds.as_ref())?;
+                    env::assert_crypto_matches_escrow(&space_id, escrow_key, crypto.as_ref())?;
+                    if let Some(crypto) = crypto {
+                        ctx.attach_crypto(crypto);
+                    }
+                    // Mounting succeeded: if this Space was quarantined (issue #8),
+                    // it has recovered — clear the flag NOW, before `run` loads its
+                    // own metrics copy, so `filething metrics`/`status` stop
+                    // reporting it quarantined while it runs healthily. (The
+                    // engine's periodic saves would otherwise keep re-writing the
+                    // stale flag until the next clean shutdown.)
+                    let mut m = SyncMetrics::load(&root);
+                    if m.quarantined {
+                        m.record_quarantine_cleared();
+                        m.save(&root);
+                        tracing::info!(
+                            space = %space_id,
+                            root = %root.display(),
+                            "space recovered from quarantine"
+                        );
+                    }
+                    tracing::info!(
+                        space = %space_id,
+                        root = %root.display(),
+                        "mounted Space for daemon"
+                    );
+                    ctx.run(stop).await?;
+                    Ok(())
+                }) as LocalBoxFuture<'static, anyhow::Result<()>>
+            };
+            ft_daemon::SpaceSlot {
+                label,
+                root,
+                task: Box::new(task),
+            }
+        })
+        .collect::<Vec<_>>();
 
     println!(
         "filething daemon running over {} Space(s); press Ctrl-C to stop.",
-        spaces.len()
+        slots.len()
     );
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("Ctrl-C received; shutting down");
     };
-    ft_daemon::serve(spaces, shutdown)
+    ft_daemon::serve(slots, shutdown)
         .await
         .context("daemon serve")?;
     println!("filething daemon stopped.");
@@ -656,6 +733,20 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
             "  feed errors: {}   stale alerts: {}",
             m.feed_errors, m.stale_alerts
         );
+        // Quarantine (issue #8): surface a Space the daemon is backing off on.
+        if m.quarantines > 0 || m.quarantined {
+            println!("  quarantines: {}", m.quarantines);
+            if m.quarantined {
+                let err = m
+                    .last_quarantine_error
+                    .as_deref()
+                    .unwrap_or("unknown error");
+                match m.last_quarantine {
+                    Some(t) => println!("  QUARANTINED ({}s ago): {err}", now.saturating_sub(t)),
+                    None => println!("  QUARANTINED: {err}"),
+                }
+            }
+        }
         print_ago("  started", m.started_at, now);
         print_ago("  last head seen", m.last_head_seen, now);
         print_ago("  last commit", m.last_commit, now);

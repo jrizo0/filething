@@ -21,7 +21,9 @@
 //! [`commit_and_reconcile`](SpaceContext::commit_and_reconcile)) pushes the
 //! resolution. "Changed" is causal (`pcid`/type identity), never the clock.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ft_conflict::{collision_is_conflict, conflict_copy_name, resolve, Resolution};
 use ft_coordinator::RevisionId;
@@ -306,7 +308,7 @@ impl SpaceContext {
                     FileType::File => self.mark_applied_for(&entry.p, entry.pcid),
                     // A symlink's identity is its target; a dir carries no content
                     // (ADR 0019). Both mark with the same contentless zero pcid the
-                    // scan computes for them, so this path and `materialize_and_record`
+                    // scan computes for them, so this path and `record_materialized`
                     // stay consistent on what a Dir echo looks like.
                     FileType::Symlink | FileType::Dir => {
                         self.mark_applied_for(&entry.p, Pcid::new([0u8; 32]));
@@ -405,16 +407,44 @@ impl SpaceContext {
             .unwrap_or(0)
     }
 
-    /// Three-way reconcile against the common base (`§10`).
+    /// Three-way reconcile against the common base (`§10`), in three phases so the
+    /// (network-bound) materializations run concurrently while everything
+    /// order-sensitive stays sequential (ADR 0018).
     ///
     /// Builds the base/local/remote [`FileEntry`] maps (base + remote from the
-    /// Manifest pages, local from `scan_entries`), then for every key in their
-    /// union calls [`ft_conflict::resolve`] and executes the verdict:
-    /// fast-forward to remote materializes it; a conflict copy keeps BOTH (remote
-    /// at the real path, local content moved aside); a delete-vs-edit keeps the
-    /// edit; deletions are honored. A casefold/NFC collision between a remote and a
-    /// DIFFERENT local path is forced into a conflict copy so the next commit's
-    /// Manifest never sees two entries with one key (`§5.2`).
+    /// Manifest pages, local from `scan_entries`), then:
+    ///
+    /// - **Phase A (sequential):** for every key in `base ∪ local ∪ remote`, in a
+    ///   stable order, call [`ft_conflict::resolve`] / the casefold-collision guard
+    ///   and execute everything that MUST stay ordered or is local-only:
+    ///   [`write_conflict_copy`](Self::write_conflict_copy) for `ConflictCopy`
+    ///   losers (which reads the local bytes at the winner's path — so every copy
+    ///   MUST happen before any winner overwrites it in phase B),
+    ///   [`remote_delete`](Self::remote_delete) for `TakeRemoteDeletion`, and
+    ///   no-ops for the local-wins arms. The remote winners to materialize (the
+    ///   casefold-renamed remote, `FastForwardToRemote`, a surviving-remote
+    ///   `DeleteVsEditKeepEdit`, a `ConflictCopy` winner) are COLLECTED, not
+    ///   materialized here. Conflict-copy paths are pushed into `conflicts` at the
+    ///   same points as before, so the returned order is unchanged.
+    /// - **Phase B (concurrent materialize + incremental record):** fan the
+    ///   collected winners through [`ft_diff::materialize`] with
+    ///   `buffer_unordered(8)` (mirrors `commit::upload_blocks`, ADR 0017/0018),
+    ///   draining the stream sequentially so each winner is recorded in the local
+    ///   index + echo-marked ([`record_materialized`](Self::record_materialized))
+    ///   as ITS download completes — rusqlite writes stay OUT of the concurrent
+    ///   futures (ADR 0017). Concurrency is safe because every collected winner
+    ///   writes a DISTINCT canonical path (union keys are unique; conflict-copy
+    ///   names derive from distinct paths and never equal a winner path); this is
+    ///   asserted up front and a duplicate is a hard error, not a race.
+    ///
+    /// A casefold/NFC collision between a remote and a DIFFERENT local path is
+    /// forced into a conflict copy so the next commit's Manifest never sees two
+    /// entries with one key (`§5.2`). On any error the reconcile aborts: the caller
+    /// does not advance the base (it advances only on `Ok`), and because winners
+    /// are recorded incrementally as they materialize, every winner reached before
+    /// the error is fully consistent (materialized + indexed + echo-marked) while
+    /// the un-reached ones simply never ran. A retry re-resolves against the same
+    /// base and self-heals — a path already materialized resolves to a no-op.
     ///
     /// The per-key loop visits keys in ASCENDING order, which puts a parent dir
     /// before its children. Two verdict classes must NOT run in that order or a
@@ -461,6 +491,9 @@ impl SpaceContext {
         let mut deferred_dir_deletes: Vec<FileEntry> = Vec::new();
         let mut deferred_dir_replacements: Vec<FileEntry> = Vec::new();
 
+        // Phase A: sequential per-key resolution. Local-only / ordered effects run
+        // now; remote winners are collected for the concurrent phase B.
+        let mut to_materialize: Vec<FileEntry> = Vec::new();
         for key in keys {
             let b = base.get(&key);
             let l = local.get(&key);
@@ -482,8 +515,8 @@ impl SpaceContext {
                 if collision_is_conflict(&key, &key, &l.p, &r.p) {
                     let mut renamed = r.clone();
                     renamed.p = conflict_copy_name(&r.p, &device_id, seq);
-                    self.materialize_and_record(&renamed).await?;
                     conflicts.push(renamed.p.as_str().to_string());
+                    to_materialize.push(renamed);
                     continue;
                 }
             }
@@ -496,10 +529,13 @@ impl SpaceContext {
                     // do); leave disk untouched. A later commit pushes local edits.
                 }
                 Resolution::FastForwardToRemote(entry) => {
+                    // A dir→file/symlink replacement is deferred past the dir
+                    // deletions (its `remove_dir` needs the dir empty first);
+                    // everything else is a phase-B winner.
                     if currently_dir && entry.t != FileType::Dir {
                         deferred_dir_replacements.push(entry);
                     } else {
-                        self.materialize_and_record(&entry).await?;
+                        to_materialize.push(entry);
                     }
                 }
                 Resolution::TakeRemoteDeletion => {
@@ -521,7 +557,7 @@ impl SpaceContext {
                         if currently_dir && entry.t != FileType::Dir {
                             deferred_dir_replacements.push(entry);
                         } else {
-                            self.materialize_and_record(&entry).await?;
+                            to_materialize.push(entry);
                         }
                     }
                 }
@@ -529,47 +565,120 @@ impl SpaceContext {
                     // Keep BOTH: remote winner at the real path, local loser moved
                     // aside to its conflict-copy name. The loser's bytes are the
                     // LOCAL ones already on disk at the winner's path, so copy them
-                    // BEFORE overwriting with the winner.
+                    // NOW (phase A) — before any winner overwrites that path in
+                    // phase B.
                     self.write_conflict_copy(l, &loser).await?;
                     conflicts.push(loser.p.as_str().to_string());
                     if currently_dir && winner.t != FileType::Dir {
                         deferred_dir_replacements.push(winner);
                     } else {
-                        self.materialize_and_record(&winner).await?;
+                        to_materialize.push(winner);
                     }
                 }
             }
         }
 
-        // Replay the deferred dir deletions deepest-first: every child (already
-        // deleted in-loop or here) is gone before its parent's `remove_dir`, so a
-        // populated deleted tree never resurrects (BLOCKER 2). remote_delete keeps
-        // its ENOTEMPTY "keep dir + row" semantics for genuine local content.
+        // Phase B: materialize the collected (non-dir-affected) winners
+        // concurrently, RECORDING each one sequentially as it completes.
+        let total = to_materialize.len();
+        if total > 0 {
+            // Distinct-path guard: two winners aimed at the same canonical path
+            // would race two concurrent materializes onto the same `.ft-tmp`
+            // sibling. Well-formed input never produces this (union keys are
+            // unique; conflict-copy names derive from distinct paths and never
+            // equal a winner path), so a duplicate is a hard bug — fail loudly
+            // rather than risk silent on-disk corruption.
+            let mut seen: HashSet<&str> = HashSet::with_capacity(total);
+            for entry in &to_materialize {
+                if !seen.insert(entry.p.as_str()) {
+                    return Err(EngineError::SpaceState(format!(
+                        "reconcile: two winners target the same path {:?}; \
+                         refusing concurrent materialize",
+                        entry.p.as_str()
+                    )));
+                }
+            }
+
+            tracing::info!(total, "reconcile materializing winners");
+            let started = Instant::now();
+            let completed = AtomicUsize::new(0);
+            let mut stream = futures::stream::iter(to_materialize.iter())
+                .map(|entry| {
+                    let completed = &completed;
+                    async move {
+                        materialize(
+                            self.vault.as_ref(),
+                            self.fs.as_ref(),
+                            &self.local_root,
+                            entry,
+                            self.crypto.as_ref(),
+                        )
+                        .await?;
+                        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_multiple_of(25) {
+                            tracing::info!(completed = n, total, "reconcile materializing winners");
+                        }
+                        Result::Ok(entry)
+                    }
+                })
+                .buffer_unordered(8);
+
+            // Drain sequentially: as each winner's download completes, record it
+            // in the local index + echo marks (rusqlite stays OUT of the
+            // concurrent futures, ADR 0017). This keeps up to 8 materializations
+            // in flight while restoring per-path atomicity — a mid-batch error
+            // aborts with every already-completed winner fully recorded, never
+            // written-but-unrecorded.
+            while let Some(res) = stream.next().await {
+                let entry = res?;
+                self.record_materialized(entry)?;
+            }
+
+            tracing::info!(
+                total,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "reconcile materialized"
+            );
+        }
+
+        // Now the deferred directory verdicts, which MUST run after phase B and in
+        // a strict order so a populated deleted tree never resurrects (ADR 0019):
+        //
+        // (1) dir deletions deepest-first — every child (deleted in-loop above, or
+        //     a deeper dir deleted here first) is gone before its parent's
+        //     `remove_dir`, so ENOTEMPTY never resurrects a parent. `remote_delete`
+        //     keeps its "keep dir + row" ENOTEMPTY semantics for genuine local
+        //     unsynced content.
         deferred_dir_deletes.sort_by_key(|e| std::cmp::Reverse(path_depth(&e.p)));
         for entry in &deferred_dir_deletes {
             self.remote_delete(Some(entry))?;
         }
-        // Then the dir→non-dir replacements: the local dir is empty now (its
-        // children were removed above), so materialize's `remove_dir` succeeds. A
-        // dir still holding unsynced local content surfaces materialize's error
-        // rather than being force-deleted.
+        // (2) dir→non-dir replacements: the local dir is empty now (its children
+        //     were removed above), so materialize's `remove_dir` succeeds. A dir
+        //     still holding unsynced local content surfaces materialize's error
+        //     rather than being force-deleted. Sequential is fine — a directory
+        //     replacement downloads at most one small file's blocks, and this keeps
+        //     the rusqlite record path out of any concurrent future (ADR 0017).
         for entry in &deferred_dir_replacements {
-            self.materialize_and_record(entry).await?;
+            materialize(
+                self.vault.as_ref(),
+                self.fs.as_ref(),
+                &self.local_root,
+                entry,
+                self.crypto.as_ref(),
+            )
+            .await?;
+            self.record_materialized(entry)?;
         }
+
         Ok(conflicts)
     }
 
-    /// Materializes a remote [`FileEntry`] to disk, marks it for echo suppression
-    /// and updates the local index (the standard fast-forward of one path).
-    async fn materialize_and_record(&self, entry: &FileEntry) -> Result<()> {
-        materialize(
-            self.vault.as_ref(),
-            self.fs.as_ref(),
-            &self.local_root,
-            entry,
-            self.crypto.as_ref(),
-        )
-        .await?;
+    /// Records a freshly materialized remote [`FileEntry`]: upserts its local-index
+    /// row + Block presence and marks it for echo suppression (`§9`). The sequential
+    /// tail of a materialization — kept out of the concurrent phase B so rusqlite
+    /// writes stay serialized (ADR 0017).
+    fn record_materialized(&self, entry: &FileEntry) -> Result<()> {
         self.index_upsert_materialized(entry)?;
         let pcid = match entry.t {
             FileType::File => entry.pcid,

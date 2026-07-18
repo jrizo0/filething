@@ -635,8 +635,15 @@ fn render_remote_verdict(ctx: &SpaceContext, head: &ft_coordinator::HeadUpdate, 
                     let unit = if n == 1 { "revision" } else { "revisions" };
                     println!("  remote: behind by {n} {unit} (seq {local_seq} → {head_seq})");
                 }
-                // No committed base yet (local_seq < 0), or seqs not strictly
-                // ordered: still behind (roots differ), just without a clean count.
+                // Roots differ but the remote is NOT strictly ahead. With a
+                // committed base at an equal-or-higher seq this is a genuine
+                // DIVERGENCE (both sides advanced to different roots), not "behind"
+                // — saying "behind" here would lie about what a pull can do.
+                Some(head_seq) if local_seq >= 0 => {
+                    println!("  remote: diverged (remote at seq {head_seq})")
+                }
+                // No committed base yet (local_seq < 0): the remote holds the only
+                // revision, so we really are behind it.
                 Some(head_seq) => println!("  remote: behind (remote at seq {head_seq})"),
                 None => println!("  remote: behind (pull pending)"),
             }
@@ -910,12 +917,12 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     // gc is simply not this user's job in a managed deployment (issue #21).
     if !env::direct_s3_configured() {
         println!(
-            "gc: en el deployment gestionado la recolección de basura corre del lado \
-             del operador; no necesitas ejecutarla."
+            "gc: in the managed deployment, garbage collection runs on the operator \
+             side; you don't need to run it."
         );
         println!(
-            "  (gc necesita credenciales de almacenamiento directas S3_* que este Device \
-             no tiene; su plano de datos es el firmado por el Coordinator.)"
+            "  (gc needs direct S3_* storage credentials this Device does not have; its \
+             data plane is the one signed by the Coordinator.)"
         );
         return Ok(());
     }

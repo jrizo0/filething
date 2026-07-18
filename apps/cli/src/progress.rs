@@ -23,11 +23,23 @@ use tracing_subscriber::Layer;
 
 /// The engine's progress "phase" messages. Each appears first as a START event
 /// (only `total`) and then as periodic UPDATE events (`completed` + `total`).
-/// COUPLED to the exact strings in `ft-engine` (`commit.rs`, `pull.rs`).
+/// COUPLED to the exact strings in `ft-engine` (`commit.rs`, `pull.rs`) and
+/// `ft-diff` (`lib.rs`).
+///
+/// "applying changes" comes from `ft_diff::apply`, the body of a fast-forward:
+/// `ft-engine`'s "fast-forwarding changes" only frames the phase (a single start
+/// event, no ticks), so without this entry the clone/fast-forward line stayed
+/// frozen at `0/N` while the download ran (issue #15). Its own periodic ticks give
+/// the only per-file advance on that path. Note the per-block "downloading blocks"
+/// event from `ft-diff` is deliberately NOT a phase: it is emitted per file under
+/// bounded concurrency, so its resetting per-file totals would thrash this single
+/// global line (and fight the working `reconcile materializing winners` phase,
+/// which materializes through the same code).
 const PHASES: &[&str] = &[
     "uploading blocks",
     "uploading manifest pages and blocklists",
     "fast-forwarding changes",
+    "applying changes",
     "reconcile materializing winners",
 ];
 
@@ -155,5 +167,28 @@ impl<S: Subscriber> Layer<S> for ProgressLayer {
                 write_line(&mut state, &format!("{label} {total}/{total}"), true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fast-forward/clone path only advances via `ft_diff`'s "applying
+    /// changes" ticks, so that message must be a recognized phase (issue #15). The
+    /// per-block "downloading blocks" message must NOT be — it is per-file and
+    /// concurrent, and would thrash this single global line.
+    #[test]
+    fn applying_changes_is_a_phase_but_downloading_blocks_is_not() {
+        assert!(PHASES.contains(&"applying changes"));
+        assert!(!PHASES.contains(&"downloading blocks"));
+    }
+
+    /// Every phase's DONE terminator is either its own explicit entry or, for the
+    /// fast-forward body, the engine's "fast-forward applied" (which closes the
+    /// open "applying changes" line). Guards the coupling to the engine strings.
+    #[test]
+    fn fast_forward_done_terminator_is_present() {
+        assert!(DONE.contains(&"fast-forward applied"));
     }
 }

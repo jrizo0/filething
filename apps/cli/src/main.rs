@@ -339,12 +339,13 @@ fn init_tracing(command: &Command, verbose: bool) {
         && std::env::var_os("RUST_LOG").is_none()
         && std::io::stderr().is_terminal();
 
-    // The progress layer sees `ft-engine` events regardless of the fmt layer's
-    // (possibly WARN) filter, because per-layer filters are independent — that is
-    // exactly what lets us hide the raw INFO logs yet still draw the progress line.
+    // The progress layer sees the engine's progress events regardless of the fmt
+    // layer's (possibly WARN) filter, because per-layer filters are independent —
+    // that is exactly what lets us hide the raw INFO logs yet still draw the
+    // progress line.
     let progress_layer = show_progress.then(|| {
         progress::ProgressLayer.with_filter(tracing_subscriber::filter::filter_fn(
-            |meta: &tracing::Metadata<'_>| meta.target().starts_with("ft_engine"),
+            |meta: &tracing::Metadata<'_>| is_progress_target(meta.target()),
         ))
     });
 
@@ -356,6 +357,17 @@ fn init_tracing(command: &Command, verbose: bool) {
         .with(fmt)
         .with(progress_layer)
         .init();
+}
+
+/// Whether a tracing event's `target` (its originating crate/module path) is one
+/// the compact [`progress`] layer should see. The progress events live in TWO
+/// crates: `ft-engine` emits the commit/reconcile phases and the fast-forward
+/// start/finish markers, while `ft-diff` emits the intermediate "applying changes"
+/// ticks that advance the line during a clone/fast-forward (the engine only frames
+/// that phase, it does not tick it — issue #15). Anything else (`convex::*`,
+/// `reqwest`, …) stays out so the line is not disturbed by unrelated INFO.
+fn is_progress_target(target: &str) -> bool {
+    target.starts_with("ft_engine") || target.starts_with("ft_diff")
 }
 
 /// Build the daemon's rotating log writer at `<config_dir>/daemon.log`
@@ -380,6 +392,22 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The progress-layer filter admits BOTH engine crates — including `ft_diff`,
+    /// whose "applying changes" ticks are the only ones that advance the line on a
+    /// clone/fast-forward (issue #15) — and rejects unrelated targets so foreign
+    /// INFO never disturbs the line. Guards against the regression where the
+    /// filter matched `ft_engine` only and the clone line stayed frozen.
+    #[test]
+    fn progress_filter_admits_both_engine_crates() {
+        assert!(is_progress_target("ft_engine"));
+        assert!(is_progress_target("ft_engine::pull"));
+        assert!(is_progress_target("ft_diff"));
+        assert!(is_progress_target("ft_diff::lib"));
+        assert!(!is_progress_target("convex::client"));
+        assert!(!is_progress_target("reqwest"));
+        assert!(!is_progress_target("ft_core"));
     }
 
     /// `login --email` parses to a log-in (no signup, no device name).

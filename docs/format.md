@@ -189,7 +189,7 @@ CBOR canónico (ejemplo en JSON ilustrativo):
 ```jsonc
 {
   "p":   "src/main.rs",   // path canónico (§5.2) — KEY del Manifest
-  "t":   0,               // tipo: 0=file, 1=symlink, 2=derived
+  "t":   0,               // tipo: 0=file, 1=symlink, 2=derived, 3=dir
   "x":   false,           // bit ejecutable (solo t=0)
   "sz":  12873,           // size en bytes del contenido en claro (solo t=0)
   "pcid":"<32B>",         // hash del claro del archivo COMPLETO (diff + conflicto + eco)
@@ -203,6 +203,7 @@ Variantes por `t`:
 - **`0` file:** usa `x`, `sz`, `pcid`, `bk`. El archivo = concat de los payloads (descifrados) de `bk` en orden. El orden ES el contenido; no se ordena por hash. Finales de línea **intactos** (el chunking opera sobre bytes crudos; nada normaliza CRLF/LF).
 - **`1` symlink:** `lt` = target literal. Solo se preservan symlinks **relativos que no salen del Space**; absolutos o que escapan ⇒ NO entran al Manifest (el Device los materializa o los deja local-only, marcado en el índice local). `bk`/`sz`/`pcid` ausentes.
 - **`2` derived:** **[DECISIÓN]** marca un path regenerable (`node_modules/`, `target/`, `.next/`, `venv/`). `bk` SIEMPRE vacío/ausente — derived no viaja byte-a-byte. El Manifest solo registra que el path existe y es derived, para que el otro Device no lo trate como borrado ni espere contenido; la regeneración la dispara la fuente sincronizada (p.ej. `package-lock.json` es una FileEntry `t=0` normal). Así el GC nunca razona sobre Blocks de derived. En el MVP (Space de juguete de archivos normales) `t=2` es estructuralmente soportado pero no ejercitado.
+- **`3` dir:** **[DECISIÓN, ADR 0019]** un directorio plano trackeado como entrada de primera clase para que los **directorios vacíos** sincronicen. Solo `p` y `t` son significativos: `sz=0`, `pcid` en cero, `x=false`, `bk` vacío/ausente, sin `bk_ref` ni `lt`; NO se trackean modo/permisos. Se trackean TODOS los directorios (no solo los vacíos), así el conjunto de entradas es estable: un directorio está en el Manifest exactamente cuando existe en disco. El root del Space nunca es una entrada. Al materializar se crea el directorio (idempotente); el borrado es por AUSENCIA y se aplica con `remove_dir` (nunca recursivo) del más profundo al menos profundo — un directorio con contenido local aún no sincronizado se MANTIENE (nunca se fuerza el borrado). El chequeo derived gana antes que el de dir, así un `node_modules/` sigue siendo `t=2`.
 
 ### 5.2 Path canónico (constraint 5)
 

@@ -304,13 +304,17 @@ impl SpaceContext {
         match change {
             Change::Added(entry) | Change::Modified { new: entry, .. } => {
                 self.index_upsert_materialized(entry)?;
-                if entry.t == FileType::File {
-                    self.mark_applied_for(&entry.p, entry.pcid);
-                } else if entry.t == FileType::Symlink {
-                    // A symlink's identity is its target; mark with the same
-                    // contentless pcid the scan would compute for it.
-                    let pcid = Pcid::new([0u8; 32]);
-                    self.mark_applied_for(&entry.p, pcid);
+                match entry.t {
+                    FileType::File => self.mark_applied_for(&entry.p, entry.pcid),
+                    // A symlink's identity is its target; a dir carries no content
+                    // (ADR 0019). Both mark with the same contentless zero pcid the
+                    // scan computes for them, so this path and `record_materialized`
+                    // stay consistent on what a Dir echo looks like.
+                    FileType::Symlink | FileType::Dir => {
+                        self.mark_applied_for(&entry.p, Pcid::new([0u8; 32]));
+                    }
+                    // Derived bytes never travel: nothing to echo-suppress.
+                    FileType::Derived => {}
                 }
             }
             Change::Deleted(entry) => {
@@ -364,11 +368,14 @@ impl SpaceContext {
             })
             .collect();
         let mtime = self.real_mtime_secs(&entry.p);
+        // A dir (like a file/symlink) syncs, so it is NOT local_only; only derived
+        // paths are (their bytes never travel). ADR 0019.
         let local_only = entry.t == FileType::Derived;
         let pcid = match entry.t {
             FileType::File => Some(entry.pcid),
             FileType::Symlink => entry.lt.as_ref().map(|t| ft_hash::pcid_of(t.as_bytes())),
-            FileType::Derived => None,
+            // Derived and dir entries carry no whole-file pcid.
+            FileType::Derived | FileType::Dir => None,
         };
         self.index.upsert_entry(
             space_id,
@@ -439,6 +446,17 @@ impl SpaceContext {
     /// the un-reached ones simply never ran. A retry re-resolves against the same
     /// base and self-heals — a path already materialized resolves to a no-op.
     ///
+    /// The per-key loop visits keys in ASCENDING order, which puts a parent dir
+    /// before its children. Two verdict classes must NOT run in that order or a
+    /// populated deleted tree resurrects (a parent `remove_dir` hits `ENOTEMPTY`,
+    /// keeps the dir + its index row, and the next commit re-publishes it):
+    /// - a `TakeRemoteDeletion` of a `Dir` is DEFERRED and replayed deepest-first
+    ///   AFTER the loop, so every child is gone before its parent is removed;
+    /// - a materialization whose target path currently holds a local/base `Dir`
+    ///   while the incoming entry is NOT a dir (a dir→file/symlink replacement) is
+    ///   DEFERRED and replayed after the deferred deletions, so the dir is empty
+    ///   before `materialize`'s `remove_dir` runs.
+    ///
     /// Returns the conflict-copy paths written.
     async fn reconcile(
         &self,
@@ -466,6 +484,12 @@ impl SpaceContext {
         let device_id = self.device_id.as_str().to_string();
         let seq = self.last_synced.seq.max(0) as u64;
         let mut conflicts: Vec<String> = Vec::new();
+        // Verdicts that must not run in the ascending-key loop (see fn docs):
+        // Dir deletions (replayed deepest-first) and dir→non-dir replacements
+        // (replayed after those deletions), so a populated deleted tree never
+        // resurrects via a parent `remove_dir` ENOTEMPTY.
+        let mut deferred_dir_deletes: Vec<FileEntry> = Vec::new();
+        let mut deferred_dir_replacements: Vec<FileEntry> = Vec::new();
 
         // Phase A: sequential per-key resolution. Local-only / ordered effects run
         // now; remote winners are collected for the concurrent phase B.
@@ -474,6 +498,13 @@ impl SpaceContext {
             let b = base.get(&key);
             let l = local.get(&key);
             let r = remote.get(&key);
+
+            // Does the target path currently hold a directory on the local/base
+            // side? A materialization of a NON-dir incoming entry onto it is a
+            // dir→file/symlink replacement whose `remove_dir` needs the dir empty
+            // first, so it is deferred past the dir deletions.
+            let currently_dir = l.map(|e| e.t == FileType::Dir).unwrap_or(false)
+                || b.map(|e| e.t == FileType::Dir).unwrap_or(false);
 
             // Guard against a casefold/NFC collision bringing a remote path that
             // collides with a DIFFERENT local path (§5.2): same casefold key, but
@@ -498,10 +529,24 @@ impl SpaceContext {
                     // do); leave disk untouched. A later commit pushes local edits.
                 }
                 Resolution::FastForwardToRemote(entry) => {
-                    to_materialize.push(entry);
+                    // A dir→file/symlink replacement is deferred past the dir
+                    // deletions (its `remove_dir` needs the dir empty first);
+                    // everything else is a phase-B winner.
+                    if currently_dir && entry.t != FileType::Dir {
+                        deferred_dir_replacements.push(entry);
+                    } else {
+                        to_materialize.push(entry);
+                    }
                 }
                 Resolution::TakeRemoteDeletion => {
-                    self.remote_delete(b.or(l))?;
+                    let target = b.or(l);
+                    if let Some(dir) = target.filter(|e| e.t == FileType::Dir) {
+                        // Defer: a populated dir must have its children deleted
+                        // first, else `remove_dir` ENOTEMPTY resurrects it.
+                        deferred_dir_deletes.push(dir.clone());
+                    } else {
+                        self.remote_delete(target)?;
+                    }
                 }
                 Resolution::DeleteVsEditKeepEdit(entry) => {
                     // The edit wins. If the surviving edit is the REMOTE side
@@ -509,7 +554,11 @@ impl SpaceContext {
                     // side (remote deleted, local edited), the bytes are already on
                     // disk — leave them and do NOT apply the deletion.
                     if r.is_some() {
-                        to_materialize.push(entry);
+                        if currently_dir && entry.t != FileType::Dir {
+                            deferred_dir_replacements.push(entry);
+                        } else {
+                            to_materialize.push(entry);
+                        }
                     }
                 }
                 Resolution::ConflictCopy { winner, loser } => {
@@ -520,13 +569,17 @@ impl SpaceContext {
                     // phase B.
                     self.write_conflict_copy(l, &loser).await?;
                     conflicts.push(loser.p.as_str().to_string());
-                    to_materialize.push(winner);
+                    if currently_dir && winner.t != FileType::Dir {
+                        deferred_dir_replacements.push(winner);
+                    } else {
+                        to_materialize.push(winner);
+                    }
                 }
             }
         }
 
-        // Phase B: materialize the collected winners concurrently, RECORDING each
-        // one sequentially as it completes.
+        // Phase B: materialize the collected (non-dir-affected) winners
+        // concurrently, RECORDING each one sequentially as it completes.
         let total = to_materialize.len();
         if total > 0 {
             // Distinct-path guard: two winners aimed at the same canonical path
@@ -588,6 +641,36 @@ impl SpaceContext {
             );
         }
 
+        // Now the deferred directory verdicts, which MUST run after phase B and in
+        // a strict order so a populated deleted tree never resurrects (ADR 0019):
+        //
+        // (1) dir deletions deepest-first — every child (deleted in-loop above, or
+        //     a deeper dir deleted here first) is gone before its parent's
+        //     `remove_dir`, so ENOTEMPTY never resurrects a parent. `remote_delete`
+        //     keeps its "keep dir + row" ENOTEMPTY semantics for genuine local
+        //     unsynced content.
+        deferred_dir_deletes.sort_by_key(|e| std::cmp::Reverse(path_depth(&e.p)));
+        for entry in &deferred_dir_deletes {
+            self.remote_delete(Some(entry))?;
+        }
+        // (2) dir→non-dir replacements: the local dir is empty now (its children
+        //     were removed above), so materialize's `remove_dir` succeeds. A dir
+        //     still holding unsynced local content surfaces materialize's error
+        //     rather than being force-deleted. Sequential is fine — a directory
+        //     replacement downloads at most one small file's blocks, and this keeps
+        //     the rusqlite record path out of any concurrent future (ADR 0017).
+        for entry in &deferred_dir_replacements {
+            materialize(
+                self.vault.as_ref(),
+                self.fs.as_ref(),
+                &self.local_root,
+                entry,
+                self.crypto.as_ref(),
+            )
+            .await?;
+            self.record_materialized(entry)?;
+        }
+
         Ok(conflicts)
     }
 
@@ -605,17 +688,38 @@ impl SpaceContext {
         Ok(())
     }
 
-    /// Applies a remote deletion: removes the file from disk (idempotent) and drops
+    /// Applies a remote deletion: removes the path from disk (idempotent) and drops
     /// its local-index row. `entry` is the base/local entry naming the path.
+    ///
+    /// A directory deletion uses `remove_dir` (never recursive, ADR 0019): a dir
+    /// that still holds local (unsynced) content is a SILENT keep — it is never
+    /// force-deleted, and its index row is left in place so the next scan/commit
+    /// re-adds the still-present path cleanly instead of publishing a Manifest that
+    /// drops it. NotFound (already gone) drops the row like a real deletion. A
+    /// file/symlink deletion is unchanged (`remove_file`).
     fn remote_delete(&self, entry: Option<&FileEntry>) -> Result<()> {
         if let Some(entry) = entry {
             let abs = join_canonical(&self.local_root, &entry.p);
-            match std::fs::remove_file(&abs) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(EngineError::Io(e)),
+            if entry.t == FileType::Dir {
+                match std::fs::remove_dir(&abs) {
+                    Ok(()) => {
+                        self.index.delete_entry(self.space_id.as_str(), &entry.p)?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.index.delete_entry(self.space_id.as_str(), &entry.p)?;
+                    }
+                    // Still-populated dir: keep it AND its index row (do not error).
+                    Err(e) if dir_not_empty(&e) => {}
+                    Err(e) => return Err(EngineError::Io(e)),
+                }
+            } else {
+                match std::fs::remove_file(&abs) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(EngineError::Io(e)),
+                }
+                self.index.delete_entry(self.space_id.as_str(), &entry.p)?;
             }
-            self.index.delete_entry(self.space_id.as_str(), &entry.p)?;
         }
         Ok(())
     }
@@ -654,6 +758,11 @@ impl SpaceContext {
                 self.fs.create_symlink(&target, &dest)?;
             }
             FileType::Derived => { /* derived bytes never travel */ }
+            FileType::Dir => {
+                // A dir loser: create the directory at the conflict-copy name so
+                // the (empty) directory is preserved aside (ADR 0019). No bytes.
+                std::fs::create_dir_all(&dest).map_err(EngineError::Io)?;
+            }
             FileType::File => {
                 match std::fs::read(&original) {
                     Ok(bytes) => {
@@ -717,4 +826,20 @@ impl SpaceContext {
             "commit_and_reconcile did not converge after {MAX_COMMIT_RETRIES} retries"
         )))
     }
+}
+
+/// True if `e` reports a non-empty directory from `remove_dir` (ADR 0019): the
+/// portable `ErrorKind::DirectoryNotEmpty`, or the raw `ENOTEMPTY` as a fallback
+/// for toolchains that still map it to `ErrorKind::Other` — `39` on Linux, `66` on
+/// macOS/BSD.
+fn dir_not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || matches!(e.raw_os_error(), Some(39) | Some(66))
+}
+
+/// Number of path components in a canonical path — its directory depth. Used to
+/// order deferred `Dir` deletions deepest-first so a parent is removed only after
+/// its children (BLOCKER 2).
+fn path_depth(p: &CanonicalPath) -> usize {
+    p.as_str().split('/').filter(|s| !s.is_empty()).count()
 }

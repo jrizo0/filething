@@ -28,6 +28,9 @@ ft-vault = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# LocalBoxFuture: the daemon builds one !Send per-Space task future per ft_daemon
+# SpaceSlot (the engine's run loop is !Send, so slots stay on one task).
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

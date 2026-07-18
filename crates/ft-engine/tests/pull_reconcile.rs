@@ -327,6 +327,89 @@ async fn reconcile_one_sided_local_edit_keeps_local_no_conflict() {
     assert_eq!(read(bdir.path(), "b.txt"), b"B1");
 }
 
+// Multiple remote winners in one reconcile: the concurrent-materialize phase
+// drains its stream sequentially, RECORDING each winner as it completes (ADR
+// 0018). This checks all winners are both materialized to disk AND recorded
+// (echo-marked) — i.e. the drain loop records every entry, not just one.
+#[tokio::test]
+async fn reconcile_multiple_remote_winners_all_materialized_and_recorded() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    // base = local content for w1..w3 + local.txt. remote edited w1..w3 (three
+    // FastForwardToRemote winners); local edited ONLY local.txt (one-sided, so
+    // the reconcile path runs but produces no conflict copies).
+    let base = build_and_upload(
+        &vault,
+        vec![
+            file_entry_uploaded(&vault, "w1.txt", b"W1_0", false).await,
+            file_entry_uploaded(&vault, "w2.txt", b"W2_0", false).await,
+            file_entry_uploaded(&vault, "w3.txt", b"W3_0", false).await,
+            file_entry_uploaded(&vault, "local.txt", b"L0", false).await,
+        ],
+    )
+    .await;
+    let remote = build_and_upload(
+        &vault,
+        vec![
+            file_entry_uploaded(&vault, "w1.txt", b"W1_REMOTE", false).await,
+            file_entry_uploaded(&vault, "w2.txt", b"W2_REMOTE", false).await,
+            file_entry_uploaded(&vault, "w3.txt", b"W3_REMOTE", false).await,
+            file_entry_uploaded(&vault, "local.txt", b"L0", false).await,
+        ],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    write(bdir.path(), "w1.txt", b"W1_0");
+    write(bdir.path(), "w2.txt", b"W2_0");
+    write(bdir.path(), "w3.txt", b"W3_0");
+    write(bdir.path(), "local.txt", b"L0");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-multi";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    let applied = Arc::new(AppliedState::new());
+    ctx.attach_applied_state(Arc::clone(&applied));
+    ctx.scan().unwrap();
+
+    // The one-sided local edit that forces the reconcile path.
+    write(bdir.path(), "local.txt", b"L_LOCAL");
+
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    match outcome {
+        PullOutcome::Reconciled { conflicts } => {
+            assert!(conflicts.is_empty(), "no path changed on both sides");
+        }
+        other => panic!("expected Reconciled, got {other:?}"),
+    }
+
+    // Every remote winner was materialized to disk, and the local edit survived.
+    for (rel, want) in [
+        ("w1.txt", b"W1_REMOTE".as_slice()),
+        ("w2.txt", b"W2_REMOTE".as_slice()),
+        ("w3.txt", b"W3_REMOTE".as_slice()),
+    ] {
+        assert_eq!(read(bdir.path(), rel), want, "{rel} materialized to remote");
+        // And RECORDED: the drain echo-marked each winner (record_materialized).
+        let abs = bdir.path().join(rel);
+        let mtime = std::fs::symlink_metadata(&abs)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let pcid = ft_hash::pcid_of(&std::fs::read(&abs).unwrap());
+        assert!(
+            is_echo(&applied, &CanonicalPath(rel.to_string()), mtime, &pcid),
+            "{rel} winner must be echo-marked (recorded by the drain)"
+        );
+    }
+    assert_eq!(read(bdir.path(), "local.txt"), b"L_LOCAL");
+    assert_eq!(ctx.last_synced.root, remote);
+}
+
 #[tokio::test]
 async fn reconcile_delete_vs_remote_edit_keeps_the_remote_edit() {
     let vdir = tempfile::tempdir().unwrap();

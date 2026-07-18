@@ -32,7 +32,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::context::{join_canonical, SpaceContext};
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::metrics::SyncMetrics;
 use crate::{CommitOutcome, PullOutcome};
 
@@ -164,17 +164,37 @@ impl SpaceContext {
                     // A parse error on one pushed value is logged, not fatal.
                     match update {
                         Ok(_) => {
-                            // The feed is alive: the head is confirmed regardless of
-                            // whether the pull changes anything.
-                            last_head_seen = Instant::now();
-                            stale_alerted = false;
-                            metrics.record_head_seen();
-                            let outcome = self.pull().await?;
-                            record_pull_outcome(outcome, &mut metrics);
+                            // The feed-triggered pull is NOT fatal on error, for
+                            // the same reason as the backstop below: a transient
+                            // fault (e.g. a Coordinator round-trip that lands mid
+                            // auth-refresh/reconnect, issue #12) must not kill the
+                            // daemon. Log with the cause, count it, and let the
+                            // next feed item or backstop tick retry.
+                            //
+                            // The head is only confirmed AFTER a successful pull:
+                            // a pull that fails permanently (Space deleted, auth
+                            // revoked) must keep the staleness watchdog armed —
+                            // a live feed alone must not mask it forever.
+                            match self.pull().await {
+                                Ok(outcome) => {
+                                    last_head_seen = Instant::now();
+                                    stale_alerted = false;
+                                    metrics.record_head_seen();
+                                    record_pull_outcome(outcome, &mut metrics);
+                                }
+                                Err(e) => {
+                                    log_pull_error(&e, "feed_pull");
+                                    metrics.record_feed_error();
+                                }
+                            }
                             metrics.save(&self.local_root);
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "head feed parse error");
+                            tracing::warn!(
+                                cause = "head_feed_parse",
+                                error = %e,
+                                "feed error: a pushed head value did not parse"
+                            );
                             metrics.record_feed_error();
                             metrics.save(&self.local_root);
                         }
@@ -200,7 +220,7 @@ impl SpaceContext {
                             metrics.save(&self.local_root);
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "backstop pull failed; retrying next interval");
+                            log_pull_error(&e, "backstop_pull");
                         }
                     }
                 }
@@ -219,9 +239,12 @@ impl SpaceContext {
                 _ = watchdog.tick() => {
                     if last_head_seen.elapsed() > STALE_HEAD_THRESHOLD && !stale_alerted {
                         tracing::warn!(
+                            cause = "head_unseen",
                             space = %self.space_id,
                             unseen_secs = last_head_seen.elapsed().as_secs(),
-                            "head not confirmed past staleness threshold"
+                            "stale alert: head not confirmed past staleness threshold — no feed \
+                             update and no successful backstop pull (feed silent, or the \
+                             connection is down / re-authenticating)"
                         );
                         metrics.record_stale();
                         stale_alerted = true;
@@ -328,6 +351,44 @@ impl SpaceContext {
     }
 }
 
+/// True when a pull failure is permanent — the Coordinator answered with a
+/// typed "this will never work" code (issue #11): the Space is gone, this
+/// Account does not own it, or the Device's auth is no good. Retrying cannot
+/// fix these; everything else (transport, Vault hiccups, unknown codes) is
+/// treated as transient and retried by the next feed item / backstop tick.
+fn is_permanent_pull_error(e: &EngineError) -> bool {
+    matches!(
+        e,
+        EngineError::Coordinator(
+            ft_coordinator::CoordinatorError::SpaceNotFound { .. }
+                | ft_coordinator::CoordinatorError::NotAuthorized { .. }
+                | ft_coordinator::CoordinatorError::NotAuthenticated { .. }
+        )
+    )
+}
+
+/// Logs a non-fatal pull failure with a machine-stable `cause` so a bump of
+/// `feed_errors` in the metrics line is correlatable with WHY (issue #12).
+/// Permanent faults escalate to ERROR with a `<cause>_permanent` cause; they
+/// will re-fire every feed item / backstop tick until an operator acts.
+fn log_pull_error(e: &EngineError, cause: &'static str) {
+    if is_permanent_pull_error(e) {
+        tracing::error!(
+            cause = format!("{cause}_permanent").as_str(),
+            error = %e,
+            "pull failed with a permanent fault (Space deleted, access revoked, or \
+             session invalid); retries cannot fix this — re-check the Space and \
+             `filething login`"
+        );
+    } else {
+        tracing::warn!(
+            cause = cause,
+            error = %e,
+            "pull failed (transient); retrying on the next feed item or backstop tick"
+        );
+    }
+}
+
 /// Folds a [`PullOutcome`] into the [`SyncMetrics`] counters: an applied
 /// fast-forward or reconcile bumps `pulls_applied` (and adds any conflict
 /// copies); an up-to-date pull is not counted.
@@ -337,5 +398,43 @@ fn record_pull_outcome(outcome: PullOutcome, metrics: &mut SyncMetrics) {
         PullOutcome::FastForwarded { applied } if applied > 0 => metrics.record_pull_applied(0),
         PullOutcome::FastForwarded { .. } => {}
         PullOutcome::Reconciled { conflicts } => metrics.record_pull_applied(conflicts.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permanent_pull_errors_are_the_typed_never_recoverable_codes() {
+        for e in [
+            ft_coordinator::CoordinatorError::SpaceNotFound {
+                message: "gone".into(),
+            },
+            ft_coordinator::CoordinatorError::NotAuthorized {
+                message: "not yours".into(),
+            },
+            ft_coordinator::CoordinatorError::NotAuthenticated {
+                message: "expired".into(),
+            },
+        ] {
+            assert!(is_permanent_pull_error(&EngineError::Coordinator(e)));
+        }
+    }
+
+    #[test]
+    fn transient_pull_errors_stay_transient() {
+        // Transport blips, Vault hiccups and unknown codes must keep the
+        // warn-and-retry path (issue #12: an auth refresh mid-flight looks
+        // like transport, and MUST not be treated as fatal or permanent).
+        for e in [
+            ft_coordinator::CoordinatorError::Transport("ws closed".into()),
+            ft_coordinator::CoordinatorError::VaultUnavailable {
+                message: "sign failed".into(),
+            },
+            ft_coordinator::CoordinatorError::Function("Server Error".into()),
+        ] {
+            assert!(!is_permanent_pull_error(&EngineError::Coordinator(e)));
+        }
     }
 }

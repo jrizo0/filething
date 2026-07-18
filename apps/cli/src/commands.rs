@@ -678,6 +678,25 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
 /// (`docs/format.md §6.3`, `docs/adr/0007`). Requires a Coordinator (retained
 /// roots + retention floor). Pass `--apply` to actually delete.
 pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::Result<()> {
+    // In the managed deployment this Device holds no direct storage credentials
+    // (S3_*); its data plane is the presigned SignedVault, which cannot `list`
+    // or `delete` across the bucket, so gc is operator-side only there. Detect
+    // that mode UP FRONT — before requiring a login, opening the index, or
+    // spending ~5s minting `vault:sign` URLs only to fail on the first `list()`
+    // with a duplicated operator-only error — and stop with a friendly note:
+    // gc is simply not this user's job in a managed deployment (issue #21).
+    if !env::direct_s3_configured() {
+        println!(
+            "gc: en el deployment gestionado la recolección de basura corre del lado \
+             del operador; no necesitas ejecutarla."
+        );
+        println!(
+            "  (gc necesita credenciales de almacenamiento directas S3_* que este Device \
+             no tiene; su plano de datos es el firmado por el Coordinator.)"
+        );
+        return Ok(());
+    }
+
     let config = Config::load()?;
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
@@ -738,7 +757,7 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
 
 /// `metrics [<dir>]` — print the persisted sync counters for a Space (or every
 /// mapped Space). Reads `<root>/.filething/metrics.json` locally; no network.
-pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn metrics(dir: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     let roots: Vec<PathBuf> = match dir {
         Some(d) => vec![normalize_abs(&d)],
         None => Config::load()?
@@ -747,14 +766,25 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
             .map(|m| PathBuf::from(&m.local_root))
             .collect(),
     };
-    if roots.is_empty() {
-        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
-        return Ok(());
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    if json {
+        // A JSON array of raw values (durations in whole seconds), stable for
+        // monitoring — the humanized text below is for people (issue #18). An
+        // empty array when no Spaces are mapped, so a monitor always parses.
+        let items: Vec<serde_json::Value> = roots.iter().map(|r| metrics_json(r, now)).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&items).context("serializing metrics as JSON")?
+        );
+        return Ok(());
+    }
+    if roots.is_empty() {
+        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
+        return Ok(());
+    }
     for root in roots {
         let m = SyncMetrics::load(&root);
         println!("Space at {}", root.display());
@@ -779,7 +809,12 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
                     .as_deref()
                     .unwrap_or("unknown error");
                 match m.last_quarantine {
-                    Some(t) => println!("  QUARANTINED ({}s ago): {err}", now.saturating_sub(t)),
+                    Some(t) => {
+                        println!(
+                            "  QUARANTINED ({} ago): {err}",
+                            humanize_secs(now.saturating_sub(t))
+                        )
+                    }
                     None => println!("  QUARANTINED: {err}"),
                 }
             }
@@ -791,12 +826,77 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints a unix-seconds timestamp as "<n>s ago", or "never" when absent.
+/// Prints a unix-seconds timestamp as its age in natural units ("16s ago",
+/// "4h 23m ago", "5d 22h ago"), or "never" when absent (issue #18).
 fn print_ago(label: &str, ts: Option<u64>, now: u64) {
     match ts {
-        Some(t) => println!("{label}: {}s ago", now.saturating_sub(t)),
+        Some(t) => println!("{label}: {} ago", humanize_secs(now.saturating_sub(t))),
         None => println!("{label}: never"),
     }
+}
+
+/// Formats a duration in whole seconds as its two largest natural units:
+/// `16s`, `1m 15s`, `4h 23m`, `5d 22h`. Below a minute it is a single unit; a
+/// zero lower unit is dropped (`1m`, `1h`, `1d`). For humans only — the `--json`
+/// output keeps the raw seconds (issue #18).
+fn humanize_secs(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MIN {
+        format!("{secs}s")
+    } else if secs < HOUR {
+        let (m, s) = (secs / MIN, secs % MIN);
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    } else if secs < DAY {
+        let (h, m) = (secs / HOUR, (secs % HOUR) / MIN);
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        }
+    } else {
+        let (d, h) = (secs / DAY, (secs % DAY) / HOUR);
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d {h}h")
+        }
+    }
+}
+
+/// The `--json` view of one Space's metrics: every counter plus, for each
+/// timestamp, both the raw unix seconds (`*_at`, stable across calls) and the
+/// age in whole seconds at call time (`*_secs_ago`, what the text report
+/// humanizes). Absent timestamps serialize as `null`. `has_metrics` is false
+/// when no daemon has written a snapshot yet (issue #18).
+fn metrics_json(root: &std::path::Path, now: u64) -> serde_json::Value {
+    let m = SyncMetrics::load(root);
+    let secs_ago = |ts: Option<u64>| ts.map(|t| now.saturating_sub(t));
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "has_metrics": m != SyncMetrics::default(),
+        "commits": m.commits,
+        "pulls_applied": m.pulls_applied,
+        "conflicts": m.conflicts,
+        "feed_errors": m.feed_errors,
+        "stale_alerts": m.stale_alerts,
+        "quarantines": m.quarantines,
+        "quarantined": m.quarantined,
+        "last_quarantine_error": m.last_quarantine_error,
+        "started_at": m.started_at,
+        "started_secs_ago": secs_ago(m.started_at),
+        "last_head_seen_at": m.last_head_seen,
+        "last_head_seen_secs_ago": secs_ago(m.last_head_seen),
+        "last_commit_at": m.last_commit,
+        "last_commit_secs_ago": secs_ago(m.last_commit),
+        "last_quarantine_at": m.last_quarantine,
+        "last_quarantine_secs_ago": secs_ago(m.last_quarantine),
+    })
 }
 
 /// `service <install|uninstall|status>` — manage the daemon as an OS service.
@@ -863,4 +963,52 @@ fn hex32(bytes: &[u8; 32]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples from issue #18 plus the unit boundaries: below a minute is a
+    /// single unit, otherwise the two largest units, dropping a zero lower unit.
+    #[test]
+    fn humanize_secs_formats_natural_units() {
+        assert_eq!(humanize_secs(0), "0s");
+        assert_eq!(humanize_secs(16), "16s");
+        assert_eq!(humanize_secs(59), "59s");
+        assert_eq!(humanize_secs(60), "1m");
+        assert_eq!(humanize_secs(75), "1m 15s");
+        assert_eq!(humanize_secs(3600), "1h");
+        assert_eq!(humanize_secs(15_780), "4h 23m"); // 4*3600 + 23*60
+        assert_eq!(humanize_secs(86_400), "1d");
+        assert_eq!(humanize_secs(514_483), "5d 22h"); // the issue's «514483s ago»
+    }
+
+    /// The JSON view carries raw seconds: both the absolute unix timestamp and
+    /// the age, and `has_metrics` reflects whether a snapshot exists. A default
+    /// (never-run) Space reports nulls and `has_metrics: false`.
+    #[test]
+    fn metrics_json_exposes_raw_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000u64;
+
+        // No snapshot yet: has_metrics false, timestamps null.
+        let v = metrics_json(dir.path(), now);
+        assert_eq!(v["has_metrics"], serde_json::json!(false));
+        assert_eq!(v["started_at"], serde_json::Value::Null);
+        assert_eq!(v["started_secs_ago"], serde_json::Value::Null);
+
+        // With a snapshot, secs_ago is the raw difference (parseable, not "5d").
+        let m = SyncMetrics {
+            commits: 3,
+            started_at: Some(now - 514_483),
+            ..Default::default()
+        };
+        m.save(dir.path());
+        let v = metrics_json(dir.path(), now);
+        assert_eq!(v["has_metrics"], serde_json::json!(true));
+        assert_eq!(v["commits"], serde_json::json!(3));
+        assert_eq!(v["started_at"], serde_json::json!(now - 514_483));
+        assert_eq!(v["started_secs_ago"], serde_json::json!(514_483));
+    }
 }

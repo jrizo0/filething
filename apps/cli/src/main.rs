@@ -14,6 +14,7 @@ mod commands;
 mod config;
 mod credentials;
 mod env;
+mod errors;
 mod service;
 mod signed_vault;
 
@@ -163,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Login {
             email,
             signup,
@@ -191,7 +192,26 @@ async fn main() -> anyhow::Result<()> {
         } => commands::gc(dir, apply, grace_secs).await,
         Command::Metrics { dir } => commands::metrics(dir),
         Command::Service { action } => commands::service(action),
+    };
+
+    // Render a failure ourselves so a typed Coordinator error becomes a human
+    // message + next step (issue #11) instead of anyhow's raw Debug chain. The
+    // raw detail (and the Convex Request ID) is shown only when RUST_LOG asks
+    // for debug/trace — the CLI's existing verbosity signal (there is no
+    // -v/--verbose flag). A plain `RUST_LOG=error` must NOT flip us verbose:
+    // that user asked for LESS noise, not more. We still exit non-zero so
+    // scripts and the integration gates see the failure.
+    if let Err(err) = result {
+        let verbose = std::env::var("RUST_LOG")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("debug") || v.contains("trace")
+            })
+            .unwrap_or(false);
+        errors::report(&err, verbose);
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 #[cfg(test)]

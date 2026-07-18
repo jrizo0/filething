@@ -31,7 +31,10 @@ pub struct SyncMetrics {
     pub pulls_applied: u64,
     /// Conflict copies written across all reconciles.
     pub conflicts: u64,
-    /// Change-feed parse errors observed.
+    /// Change-feed errors observed: a pushed head value that failed to parse, or
+    /// a feed-triggered pull that failed (a transient fault, e.g. mid
+    /// auth-refresh/reconnect — issue #12). The `run` loop logs a `cause` field
+    /// alongside each increment so the journal explains why the counter moved.
     pub feed_errors: u64,
     /// Times the head went unseen past the staleness threshold.
     pub stale_alerts: u64,
@@ -100,7 +103,8 @@ impl SyncMetrics {
         self.conflicts += conflicts as u64;
     }
 
-    /// Records a change-feed parse error.
+    /// Records a change-feed error (a parse failure or a feed-triggered pull
+    /// failure); the caller logs the specific `cause`.
     pub fn record_feed_error(&mut self) {
         self.feed_errors += 1;
     }

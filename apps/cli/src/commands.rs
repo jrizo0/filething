@@ -384,7 +384,12 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
                 }
                 None => println!("  remote head: none yet"),
             },
-            Err(e) => println!("  remote head: unavailable ({e})"),
+            // A deleted / inaccessible Space here is a typed CoordinatorError;
+            // show its human headline instead of the raw "Server Error" (#11).
+            Err(e) => println!(
+                "  remote head: unavailable ({})",
+                crate::errors::headline(&e)
+            ),
         },
         Err(e) => println!("  remote head: unavailable ({e})"),
     }

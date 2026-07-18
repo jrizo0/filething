@@ -158,17 +158,34 @@ export const sign = action({
 
     const { client, bucket } = s3ClientFromEnv();
 
+    // The AWS SDK (command construction + getSignedUrl) can throw plain Errors:
+    // an unreachable/misconfigured endpoint, a signing/credential fault, clock
+    // skew, etc. Convex redacts any non-ConvexError to an opaque "Server Error"
+    // on the client, which is exactly the unactionable message the Rust client
+    // used to surface. Wrap them into a typed ConvexError so the client maps it
+    // to CoordinatorError::VaultUnavailable (a real ConvexError is re-thrown
+    // untouched so its own code survives).
     const results = [];
-    for (const op of parsed) {
-      const commandInput = { Bucket: bucket, Key: op.key };
-      const command =
-        op.method === "HEAD"
-          ? new HeadObjectCommand(commandInput)
-          : op.method === "GET"
-            ? new GetObjectCommand(commandInput)
-            : new PutObjectCommand(commandInput);
-      const url = await getSignedUrl(client, command, { expiresIn: URL_TTL_SECONDS });
-      results.push({ key: op.key, method: op.method, url });
+    try {
+      for (const op of parsed) {
+        const commandInput = { Bucket: bucket, Key: op.key };
+        const command =
+          op.method === "HEAD"
+            ? new HeadObjectCommand(commandInput)
+            : op.method === "GET"
+              ? new GetObjectCommand(commandInput)
+              : new PutObjectCommand(commandInput);
+        const url = await getSignedUrl(client, command, { expiresIn: URL_TTL_SECONDS });
+        results.push({ key: op.key, method: op.method, url });
+      }
+    } catch (err) {
+      if (err instanceof ConvexError) throw err;
+      throw new ConvexError({
+        code: "vault_unavailable",
+        message: `failed to pre-sign a Vault URL: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      });
     }
     return results;
   },

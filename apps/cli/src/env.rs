@@ -5,14 +5,14 @@
 //! environment; the per-Device identity (the Better Auth session) comes from the
 //! Device's [`Credentials`]. The normal path is authenticated: the CLI trades the
 //! session for a Convex JWT and attaches it to the websocket via
-//! [`ConvexClient::set_auth_callback`], which re-mints the JWT on every connect
-//! and reconnect. This applies to one-shot commands too, not just the daemon: the
-//! convex client's `set_auth` wraps a STATIC token in a fetcher that keeps
-//! returning the same (now-expired) token forever, so a one-shot command whose
-//! work outlives the ~15-min JWT expiry (e.g. a large `sync` upload) would
-//! otherwise hang in an infinite AuthError/reconnect loop on its next mutation.
-//! The deployment admin/deploy key is now ONLY an ops fallback for when there is
-//! no session (see [`connect`]).
+//! [`ConvexClient::set_auth_callback`] with a caching fetcher, re-minting on every
+//! connect/reconnect AND proactively on a background timer BEFORE the ~15-min JWT
+//! expires (issue #12 — see [`connect_authed`]). Proactive refresh matters because
+//! the `convex` client only re-mints reactively (on reconnect) otherwise, so a
+//! token that expires mid-connection triggers an AuthError/reconnect storm; it
+//! also covers one-shot commands whose work outlives the JWT (e.g. a large `sync`
+//! upload). The deployment admin/deploy key is now ONLY an ops fallback for when
+//! there is no session (see [`connect`]).
 //!
 //! Deployments (`docs/PRODUCTION-SETUP.md`): local Docker infra
 //! (`CONVEX_SELF_HOSTED_URL`) or managed cloud (`CONVEX_URL`); the URL selects
@@ -24,14 +24,23 @@
 //! same way.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use convex::{AuthTokenFetcher, AuthenticationToken, ConvexClient};
 use ft_core::SpaceCrypto;
 use ft_engine::{Coordinator, SpaceId, Vault};
 
-use crate::auth;
+use crate::auth::{self, CachedJwt};
 use crate::credentials::{self, Credentials};
+
+/// The proactively-refreshed Convex JWT, shared between the caching
+/// [`AuthTokenFetcher`] (which the `convex` client calls on connect/reconnect)
+/// and the background timer (which re-mints before expiry). `None` until the
+/// first mint. `std::sync::Mutex` is only ever held briefly around a clone/store,
+/// never across the `await` that mints — so it can't block the async runtime.
+type SharedJwt = Arc<Mutex<Option<CachedJwt>>>;
 
 /// Cloud-neutral Convex deployment URL (Convex Cloud `https://<name>.convex.cloud`).
 /// Preferred; falls back to [`ENV_URL_SELF_HOSTED`].
@@ -83,11 +92,11 @@ fn resolve_coordinator_url(env_url: Option<String>, baked_default: Option<&str>)
 /// Builds a [`Coordinator`] connected to `url`, authenticated as this Device.
 ///
 /// - With a Better Auth session (`creds`): trade it for a Convex JWT and attach
-///   it via [`ConvexClient::set_auth_callback`], which re-mints the JWT (calling
-///   `auth::convex_token` again) on every websocket connect and reconnect —
-///   surviving the ~15-min expiry with no operator action, for one-shot commands
-///   and the daemon alike (see the module doc comment for why one-shot commands
-///   need this too).
+///   it via [`connect_authed`], which caches the JWT, re-mints it on every
+///   websocket connect/reconnect, AND re-mints proactively before the ~15-min
+///   expiry — surviving expiry with no operator action and no reactive
+///   AuthError/reconnect storm (issue #12), for one-shot commands and the daemon
+///   alike.
 /// - Without a session: fall back to the deployment admin/deploy key
 ///   ([`connect_ops_fallback`]) — an OPS escape hatch, no longer the normal flow.
 pub async fn connect(url: &str, creds: Option<&Credentials>) -> anyhow::Result<Coordinator> {
@@ -110,9 +119,22 @@ pub async fn connect_client(
     }
 }
 
-/// Connects with the per-Device Better Auth session attached as a Convex JWT,
-/// re-minted on every connect/reconnect via [`ConvexClient::set_auth_callback`]
-/// (see [`connect`]'s doc comment).
+/// Connects with the per-Device Better Auth session attached as a Convex JWT and
+/// keeps that JWT fresh (issue #12).
+///
+/// Two layers, both fed by a [`SharedJwt`] cache:
+/// - a caching [`AuthTokenFetcher`] the `convex` client invokes on connect and on
+///   every reconnect. It reuses the cached JWT until it is within
+///   [`auth::JWT_REFRESH_MARGIN`] of expiry (or `force_refresh` is set, as on a
+///   reconnect), then re-mints — so a reconnect always presents a live token;
+/// - a background timer ([`spawn_jwt_refresh`]) that re-mints and re-attaches the
+///   JWT over the LIVE websocket *before* it expires. Without it the token would
+///   silently expire mid-connection and the client would only re-auth reactively
+///   after the server rejects a call — the AuthError/reconnect storm of #12.
+///   `convex` 0.10.4 has no proactive-refresh hook of its own (its fetcher fires
+///   only on connect/reconnect), but `set_auth_callback` pushes a fresh
+///   `Authenticate` over the existing socket with no reconnect, which is what the
+///   timer drives.
 async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<ConvexClient> {
     let base = auth::auth_base_url(url)?;
     let mut client = ConvexClient::new(url)
@@ -120,19 +142,89 @@ async fn connect_authed(url: &str, session_token: &str) -> anyhow::Result<Convex
         .with_context(|| format!("connecting to the Coordinator at {url}"))?;
 
     let token = session_token.to_string();
-    let fetcher: AuthTokenFetcher = Box::new(move |_force_refresh: bool| {
+    let cache: SharedJwt = Arc::new(Mutex::new(None));
+
+    client
+        .set_auth_callback(Some(make_auth_fetcher(
+            base.clone(),
+            token.clone(),
+            cache.clone(),
+        )))
+        .await;
+    spawn_jwt_refresh(client.clone(), base, token, cache);
+    Ok(client)
+}
+
+/// Current unix time in whole seconds (0 before the epoch, which never happens).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Builds the caching [`AuthTokenFetcher`]. On `force_refresh` (a reconnect) it
+/// always re-mints; otherwise it returns the cached JWT while it is still outside
+/// the refresh margin, re-minting only when due. Every mint updates `cache` so
+/// the timer sees the new expiry. Rebuilt cheaply on each timer tick since the
+/// closure only captures three cloneable handles.
+fn make_auth_fetcher(base: String, token: String, cache: SharedJwt) -> AuthTokenFetcher {
+    Box::new(move |force_refresh: bool| {
         let base = base.clone();
         let token = token.clone();
+        let cache = cache.clone();
         Box::pin(async move {
+            if !force_refresh {
+                let fresh = cache
+                    .lock()
+                    .expect("jwt cache mutex poisoned")
+                    .clone()
+                    .filter(|c| !c.refresh_due(now_secs(), auth::JWT_REFRESH_MARGIN));
+                if let Some(c) = fresh {
+                    return Ok(AuthenticationToken::User(c.jwt));
+                }
+            }
             let jwt = auth::convex_token(&base, &token).await?;
+            *cache.lock().expect("jwt cache mutex poisoned") =
+                Some(CachedJwt::new(jwt.clone(), now_secs()));
             Ok(AuthenticationToken::User(jwt))
         })
             as std::pin::Pin<
                 Box<dyn std::future::Future<Output = anyhow::Result<AuthenticationToken>> + Send>,
             >
+    })
+}
+
+/// Spawns the proactive refresh timer (issue #12). It sleeps until the cached
+/// JWT is within [`auth::JWT_REFRESH_MARGIN`] of expiry, then re-attaches the
+/// caching fetcher via `set_auth_callback`; that call re-invokes the fetcher
+/// (now past the refresh point, so it re-mints) and pushes a fresh `Authenticate`
+/// over the live socket — no reconnect, no reactive AuthError storm. A failed
+/// re-mint leaves the cache stale, so the next sleep is floored to
+/// [`auth::JWT_MIN_REFRESH_SLEEP`] and the timer retries on that cadence.
+///
+/// The task holds a clone of the client (which multiplexes the one websocket) and
+/// runs for the connection's lifetime; it is aborted when the tokio runtime is
+/// dropped at process exit. It is spawned for one-shot commands too, which is
+/// harmless (they exit long before the first tick) and covers a long upload whose
+/// work outlives the ~15-min JWT.
+fn spawn_jwt_refresh(mut client: ConvexClient, base: String, token: String, cache: SharedJwt) {
+    tokio::spawn(async move {
+        loop {
+            let sleep_secs = match cache.lock().expect("jwt cache mutex poisoned").clone() {
+                Some(c) => c.secs_until_refresh(now_secs(), auth::JWT_REFRESH_MARGIN),
+                None => auth::JWT_MIN_REFRESH_SLEEP.as_secs(),
+            };
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            client
+                .set_auth_callback(Some(make_auth_fetcher(
+                    base.clone(),
+                    token.clone(),
+                    cache.clone(),
+                )))
+                .await;
+        }
     });
-    client.set_auth_callback(Some(fetcher)).await;
-    Ok(client)
 }
 
 /// Ops fallback: connect with the deployment admin/deploy key when there is no

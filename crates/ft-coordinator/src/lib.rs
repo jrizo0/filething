@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use convex::{ConvexClient, FunctionResult, Value};
+use convex::{ConvexClient, ConvexError, FunctionResult, Value};
 use ft_core::{Cid, Pcid};
 use futures::{Stream, StreamExt};
 use thiserror::Error;
@@ -49,8 +49,55 @@ pub enum CoordinatorError {
     #[error("convex transport error: {0}")]
     Transport(String),
 
+    /// The referenced Space does not exist. Backend code `space_not_found`.
+    /// Folded together with [`Self::NotAuthorized`] by the CLI into one "not
+    /// found or no access" message, so the backend never leaks which Spaces
+    /// exist — but kept distinct here so logs/verbose output (`RUST_LOG=debug`) stay precise.
+    #[error("space not found: {message}")]
+    SpaceNotFound {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// The caller is authenticated but does not own the Space/Device it named.
+    /// Backend code `forbidden`.
+    #[error("not authorized: {message}")]
+    NotAuthorized {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// No authenticated identity, or an authenticated identity with no Account
+    /// yet. Backend codes `unauthenticated` / `no_account`.
+    #[error("not authenticated: {message}")]
+    NotAuthenticated {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// The Vault (object store) is unreachable or misconfigured on the
+    /// Coordinator. Backend codes `vault_unavailable` / `storage_unconfigured`.
+    /// (Malformed-request codes like `bad_key`/`bad_request` are client bugs
+    /// and stay on the [`CoordinatorError::Function`] fallback.)
+    #[error("vault unavailable: {message}")]
+    VaultUnavailable {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// A commit CAS conflict (`§7`): the Space head moved under the expected
+    /// base. Backend code `conflict`. Callers usually branch on this via
+    /// [`CommitError::Conflict`]; the variant exists so the classifier is total.
+    #[error("commit conflict: {message}")]
+    Conflict {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
     /// A Convex function returned an application error (a thrown `Error` or a
-    /// `ConvexError`) that is NOT the recognized commit-conflict marker.
+    /// `ConvexError`) whose `code` is not one this client maps to a typed
+    /// variant above. Carries the raw message (and, in prod, the Request ID) so
+    /// verbose output (`RUST_LOG=debug`)/logs still shows the full detail.
     #[error("convex function error: {0}")]
     Function(String),
 
@@ -748,30 +795,67 @@ fn parse_retention_floor(v: &Value) -> Result<RetentionFloor> {
 // FunctionResult interpretation
 // ---------------------------------------------------------------------------
 
+/// Reads the stable `code` string out of a `ConvexError`'s `data` payload
+/// (`{ code, message, ... }`, the shape every backend throw uses). `None` when
+/// `data` is not an object or carries no string `code` — e.g. a bare thrown
+/// `Error` Convex redacted to a "Server Error" message with no structured data.
+fn convex_error_code(e: &ConvexError) -> Option<&str> {
+    match &e.data {
+        Value::Object(data) => match data.get("code") {
+            Some(Value::String(code)) => Some(code.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Maps a `ConvexError` to a typed [`CoordinatorError`] by its `data.code`, the
+/// contract the backend and this client share (`packages/backend/convex/*.ts`).
+/// An unrecognized (or absent) code falls back to [`CoordinatorError::Function`]
+/// carrying the raw message, so nothing is lost for verbose output (`RUST_LOG=debug`)/logs.
+fn classify_convex_error(e: &ConvexError) -> CoordinatorError {
+    let message = e.message.clone();
+    // Codes are matched case-insensitively (the pre-typed conflict detection
+    // used `eq_ignore_ascii_case`; keep that tolerance for the whole contract).
+    let code = convex_error_code(e).map(str::to_ascii_lowercase);
+    match code.as_deref() {
+        Some(CONFLICT_CODE) => CoordinatorError::Conflict { message },
+        Some("space_not_found") => CoordinatorError::SpaceNotFound { message },
+        Some("forbidden") => CoordinatorError::NotAuthorized { message },
+        Some("unauthenticated") | Some("no_account") => {
+            CoordinatorError::NotAuthenticated { message }
+        }
+        // NOTE: `bad_key`/`bad_request` (malformed Vault requests — client
+        // bugs, not outages) deliberately fall through to `Function`: the
+        // "retry in a few seconds" advice would mislead for a deterministic
+        // failure.
+        Some("vault_unavailable") | Some("storage_unconfigured") => {
+            CoordinatorError::VaultUnavailable { message }
+        }
+        _ => CoordinatorError::Function(message),
+    }
+}
+
 /// Unwraps a [`FunctionResult`] to its success [`Value`], mapping application
-/// errors to [`CoordinatorError::Function`].
+/// errors to a typed [`CoordinatorError`] (via [`classify_convex_error`] for a
+/// `ConvexError`, or [`CoordinatorError::Function`] for a redacted message).
 fn unwrap_value(result: FunctionResult) -> Result<Value> {
     match result {
         FunctionResult::Value(v) => Ok(v),
         FunctionResult::ErrorMessage(msg) => Err(CoordinatorError::Function(msg)),
-        FunctionResult::ConvexError(e) => Err(CoordinatorError::Function(e.message)),
+        FunctionResult::ConvexError(e) => Err(classify_convex_error(&e)),
     }
 }
 
 /// True if a [`FunctionResult`] is the recognized commit-conflict signal: a
-/// `ConvexError` whose `data` is `{ "code": "conflict" }` (preferred,
-/// machine-stable), or an error whose message contains `"conflict"` (fallback).
+/// `ConvexError` classified as [`CoordinatorError::Conflict`] (the preferred,
+/// machine-stable `data.code == "conflict"` path), or any error whose message
+/// contains `"conflict"` (fallback for a backend that only set the message).
 fn is_conflict(result: &FunctionResult) -> bool {
     match result {
         FunctionResult::ConvexError(e) => {
-            if let Value::Object(data) = &e.data {
-                if let Some(Value::String(code)) = data.get("code") {
-                    if code.eq_ignore_ascii_case(CONFLICT_CODE) {
-                        return true;
-                    }
-                }
-            }
-            e.message.to_ascii_lowercase().contains(CONFLICT_CODE)
+            matches!(classify_convex_error(e), CoordinatorError::Conflict { .. })
+                || e.message.to_ascii_lowercase().contains(CONFLICT_CODE)
         }
         FunctionResult::ErrorMessage(msg) => msg.to_ascii_lowercase().contains(CONFLICT_CODE),
         FunctionResult::Value(_) => false,
@@ -1483,6 +1567,113 @@ mod tests {
                 seq: 1,
             }
         );
+    }
+
+    // ----- typed ConvexError.data.code -> CoordinatorError mapping -----
+
+    /// Builds a `ConvexError` with a `{ code, message }` data payload, the shape
+    /// every backend throw uses (`packages/backend/convex/*.ts`).
+    fn convex_err(code: &str, message: &str) -> ConvexError {
+        let data = Value::Object(
+            [("code".to_string(), Value::String(code.into()))]
+                .into_iter()
+                .collect(),
+        );
+        ConvexError {
+            message: message.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn classify_maps_each_known_code_to_its_typed_variant() {
+        assert!(matches!(
+            classify_convex_error(&convex_err("space_not_found", "no such Space")),
+            CoordinatorError::SpaceNotFound { message } if message == "no such Space"
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("forbidden", "another Account")),
+            CoordinatorError::NotAuthorized { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("unauthenticated", "no identity")),
+            CoordinatorError::NotAuthenticated { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("no_account", "call ensureDevice")),
+            CoordinatorError::NotAuthenticated { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("vault_unavailable", "sign failed")),
+            CoordinatorError::VaultUnavailable { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("storage_unconfigured", "no S3 env")),
+            CoordinatorError::VaultUnavailable { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("conflict", "head moved")),
+            CoordinatorError::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_matches_codes_case_insensitively() {
+        // The pre-typed conflict detection used eq_ignore_ascii_case; the
+        // classifier keeps that tolerance for the whole contract.
+        assert!(matches!(
+            classify_convex_error(&convex_err("Conflict", "head moved")),
+            CoordinatorError::Conflict { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err("SPACE_NOT_FOUND", "no such Space")),
+            CoordinatorError::SpaceNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_malformed_request_codes_fall_back_to_function() {
+        // bad_key/bad_request are deterministic client bugs, not Vault outages:
+        // they must NOT get VaultUnavailable's "retry in a few seconds" advice.
+        for code in ["bad_key", "bad_request"] {
+            assert!(matches!(
+                classify_convex_error(&convex_err(code, "malformed")),
+                CoordinatorError::Function(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn classify_unknown_code_falls_back_to_function_with_message() {
+        // A code this client does not map (e.g. bad_dedup_secret) keeps the raw
+        // message so verbose output (RUST_LOG=debug)/logs still surfaces the detail.
+        match classify_convex_error(&convex_err("bad_dedup_secret", "must be 32 bytes")) {
+            CoordinatorError::Function(m) => assert_eq!(m, "must be 32 bytes"),
+            other => panic!("expected Function fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_convex_error_without_data_code_is_function() {
+        // A bare thrown Error (Convex redacts it to a message with no structured
+        // data) must not misclassify; it falls back to Function.
+        let e = ConvexError {
+            message: "Server Error".into(),
+            data: Value::Null,
+        };
+        assert!(matches!(
+            classify_convex_error(&e),
+            CoordinatorError::Function(m) if m == "Server Error"
+        ));
+    }
+
+    #[test]
+    fn unwrap_value_maps_convex_error_to_typed_variant() {
+        let r = unwrap_value(FunctionResult::ConvexError(convex_err(
+            "space_not_found",
+            "no such Space",
+        )));
+        assert!(matches!(r, Err(CoordinatorError::SpaceNotFound { .. })));
     }
 
     // ----- id newtype ergonomics -----

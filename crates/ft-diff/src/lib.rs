@@ -556,76 +556,12 @@ pub async fn materialize(
             Ok(())
         }
         ft_core::FileType::File => {
-            use futures::stream::{self, StreamExt};
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            use std::time::Instant;
-
-            let bk = resolve_blocklist(vault, entry).await?;
-
-            // Download, verify and decode every Block CONCURRENTLY, then
-            // concatenate the plaintext chunks IN ORDER. `buffered` (NOT
-            // `buffer_unordered`) drives up to `BLOCK_DOWNLOAD_CONCURRENCY` futures
-            // at once but yields their results in INPUT order, so the ordered
-            // concatenation below needs no reordering logic — the order of the
-            // Block list IS the file's content (`§4.3`/`§5.3`). The first error
-            // aborts the stream (via `?` below), leaving nothing written.
-            let total = bk.len();
-            let started = Instant::now();
-            let completed = AtomicUsize::new(0);
-
-            let mut stream = stream::iter(bk.iter())
-                .map(|cid| {
-                    let completed = &completed;
-                    async move {
-                        let key = ft_hash::block_key(cid);
-                        let obj = vault.get(&key).await?;
-                        // Wire-integrity check: a corrupt object fails here
-                        // (`§4.3`). It recomputes the addressing hash from the
-                        // object's own bytes and works for BOTH algs with no key,
-                        // so it also guarantees the header's `alg` is 0 or 1 before
-                        // we branch on it below.
-                        ft_block::verify(&obj, cid)?;
-                        let (header, payload) = ft_block::decode(&obj)?;
-                        let chunk = if header.alg == ft_core::ALG_CLEARTEXT {
-                            // Cleartext (`alg=0`): the payload IS the content.
-                            payload
-                        } else {
-                            // Encrypted (`alg=1`): unwrap this Block's data key
-                            // from its `keys/<space_id>/<cid>` sidecar with the
-                            // Space key, then AEAD-decrypt the object
-                            // (`§4.4`/`§4.5`). No key material ⇒ typed error, never
-                            // a panic.
-                            let crypto =
-                                crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
-                            let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
-                            let data_key =
-                                ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
-                            ft_block::decode_encrypted(&obj, &data_key)?
-                        };
-                        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_multiple_of(25) {
-                            tracing::info!(completed = n, total, "downloading blocks");
-                        }
-                        Result::Ok(chunk)
-                    }
-                })
-                .buffered(BLOCK_DOWNLOAD_CONCURRENCY);
-
-            let mut contents: Vec<u8> = Vec::with_capacity(entry.sz as usize);
-            while let Some(chunk) = stream.next().await {
-                contents.extend_from_slice(&chunk?);
-            }
-
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            let bytes = contents.len();
-            // Use `info` for real files so the throughput is visible next to the
-            // commit path's "blocks uploaded" line; keep tiny files at `debug` so a
-            // sync of many small files does not spam the log.
-            if total >= 25 {
-                tracing::info!(total, bytes, elapsed_ms, "blocks downloaded");
-            } else {
-                tracing::debug!(total, bytes, elapsed_ms, "blocks downloaded");
-            }
+            // Download + verify + decode + concatenate the file's Blocks into its
+            // plaintext bytes (no fs touched), then publish them atomically. The
+            // pure-bytes step is factored into [`fetch_file_bytes`] so callers that
+            // need the content in memory (e.g. a 3-way merge) can reuse it without
+            // re-implementing the download/verify/decrypt loop.
+            let contents = fetch_file_bytes(vault, entry, crypto).await?;
 
             ensure_parent(fs, &dest)?;
             // Write through a sibling tmp + atomic rename so a stale SYMLINK at
@@ -640,6 +576,99 @@ pub async fn materialize(
             Ok(())
         }
     }
+}
+
+/// Fetches a File [`FileEntry`]'s plaintext bytes from the Vault WITHOUT touching
+/// the filesystem: resolve the Block list, download every Block CONCURRENTLY
+/// (bounded fan-out of [`BLOCK_DOWNLOAD_CONCURRENCY`], ADR 0017), verify each
+/// object's wire integrity ([`ft_block::verify`], `§4.3`), decode/decrypt it, and
+/// concatenate the chunks IN ORDER.
+///
+/// This is the in-memory core of [`materialize`]'s File arm; `materialize` calls
+/// it and then writes the returned bytes atomically. Reuse it whenever the file's
+/// content is needed in memory (e.g. reading the base/remote sides for a 3-way
+/// merge) so the download/verify/decrypt semantics stay identical everywhere.
+///
+/// `crypto` carries the Space key material for `alg=1` Blocks; an `alg=1` object
+/// with `crypto == None` fails with [`Error::EncryptedBlockWithoutKey`] rather
+/// than panicking. A single corrupt object aborts the fan-out at the first error
+/// with [`Error::Block`], returning nothing.
+///
+/// Only meaningful for [`ft_core::FileType::File`] entries — symlinks/derived
+/// carry no Blocks; called on such an entry it returns an empty `Vec` (their `bk`
+/// is empty).
+pub async fn fetch_file_bytes(
+    vault: &dyn Vault,
+    entry: &FileEntry,
+    crypto: Option<&SpaceCrypto>,
+) -> Result<Vec<u8>> {
+    use futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let bk = resolve_blocklist(vault, entry).await?;
+
+    // Download, verify and decode every Block CONCURRENTLY, then concatenate the
+    // plaintext chunks IN ORDER. `buffered` (NOT `buffer_unordered`) drives up to
+    // `BLOCK_DOWNLOAD_CONCURRENCY` futures at once but yields their results in
+    // INPUT order, so the ordered concatenation below needs no reordering logic —
+    // the order of the Block list IS the file's content (`§4.3`/`§5.3`). The first
+    // error aborts the stream (via `?` below).
+    let total = bk.len();
+    let started = Instant::now();
+    let completed = AtomicUsize::new(0);
+
+    let mut stream = stream::iter(bk.iter())
+        .map(|cid| {
+            let completed = &completed;
+            async move {
+                let key = ft_hash::block_key(cid);
+                let obj = vault.get(&key).await?;
+                // Wire-integrity check: a corrupt object fails here (`§4.3`). It
+                // recomputes the addressing hash from the object's own bytes and
+                // works for BOTH algs with no key, so it also guarantees the
+                // header's `alg` is 0 or 1 before we branch on it below.
+                ft_block::verify(&obj, cid)?;
+                let (header, payload) = ft_block::decode(&obj)?;
+                let chunk = if header.alg == ft_core::ALG_CLEARTEXT {
+                    // Cleartext (`alg=0`): the payload IS the content.
+                    payload
+                } else {
+                    // Encrypted (`alg=1`): unwrap this Block's data key from its
+                    // `keys/<space_id>/<cid>` sidecar with the Space key, then
+                    // AEAD-decrypt the object (`§4.4`/`§4.5`). No key material ⇒
+                    // typed error, never a panic.
+                    let crypto = crypto.ok_or(Error::EncryptedBlockWithoutKey { cid: *cid })?;
+                    let sidecar = vault.get(&keys_key(&crypto.space_id, cid)).await?;
+                    let data_key = ft_block::sidecar::unwrap_data_key(&sidecar, &crypto.space_key)?;
+                    ft_block::decode_encrypted(&obj, &data_key)?
+                };
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(25) {
+                    tracing::info!(completed = n, total, "downloading blocks");
+                }
+                Result::Ok(chunk)
+            }
+        })
+        .buffered(BLOCK_DOWNLOAD_CONCURRENCY);
+
+    let mut contents: Vec<u8> = Vec::with_capacity(entry.sz as usize);
+    while let Some(chunk) = stream.next().await {
+        contents.extend_from_slice(&chunk?);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let bytes = contents.len();
+    // Use `info` for real files so the throughput is visible next to the commit
+    // path's "blocks uploaded" line; keep tiny files at `debug` so a sync of many
+    // small files does not spam the log.
+    if total >= 25 {
+        tracing::info!(total, bytes, elapsed_ms, "blocks downloaded");
+    } else {
+        tracing::debug!(total, bytes, elapsed_ms, "blocks downloaded");
+    }
+
+    Ok(contents)
 }
 
 /// Writes `bytes` to `dest` via a sibling temporary file + atomic `rename`, so a

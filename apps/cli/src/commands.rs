@@ -86,6 +86,7 @@ pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow:
         &url,
         ensured.account_id.as_str(),
         ensured.device_id.as_str(),
+        &device_name,
     );
     config.save()?;
     Credentials {
@@ -367,6 +368,29 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
     }
     println!("  tracked paths: {}", scan.entries.len());
 
+    // Unresolved conflict copies still on disk (issue #14). Recognize BOTH the
+    // current and legacy name formats; match on the basename so a parent dir
+    // never trips the check. A separate, minimal block — a later issue redesigns
+    // `status` output wholesale.
+    let mut conflict_paths: Vec<&str> = scan
+        .entries
+        .iter()
+        .map(|(_, entry)| entry.p.as_str())
+        .filter(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p);
+            ft_engine::is_conflict_copy_name(name)
+        })
+        .collect();
+    conflict_paths.sort_unstable();
+    if conflict_paths.is_empty() {
+        println!("  conflicts: none");
+    } else {
+        println!("  conflicts: {}", conflict_paths.len());
+        for p in &conflict_paths {
+            println!("    {p}");
+        }
+    }
+
     // Best-effort remote head check (does not fail status if the Coordinator is
     // unreachable — status must work offline). Reuses the connection from above.
     match client.map(ft_engine::Coordinator::from_client) {
@@ -471,6 +495,8 @@ pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
     if let Some(crypto) = crypto {
         ctx.attach_crypto(crypto);
     }
+    // Label conflict copies with this Device's human name (issue #14).
+    ctx.set_device_display_name(config.device_name.clone());
 
     // Pull first (catch up to the head), then push local changes.
     let pulled = ctx.pull().await.context("pull")?;
@@ -487,7 +513,7 @@ pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
         }
     }
 
-    let committed = ctx.commit_and_reconcile().await.context("commit")?;
+    let (committed, retry_conflicts) = ctx.commit_and_reconcile().await.context("commit")?;
     match &committed {
         CommitOutcome::NoChange => println!("commit: no local changes"),
         CommitOutcome::Committed { seq, root } => {
@@ -500,6 +526,12 @@ pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
             // commit_and_reconcile only returns Conflict if it exhausted retries.
             println!("commit: still conflicting after reconcile retries");
         }
+    }
+    // Conflict copies written while clearing a CAS conflict between our pull above
+    // and the commit (a peer committed in that window). The pull's own conflicts
+    // were already printed; surface these too so no divergence is silent.
+    for c in &retry_conflicts {
+        println!("  conflict copy: {c}");
     }
     ensure_background_daemon(false, no_daemon);
     Ok(())
@@ -558,12 +590,15 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
             let account_id = account_id.clone();
             let device_id = device_id.clone();
             let creds = creds.clone();
+            // This Device's human name, to label conflict copies (issue #14).
+            let device_name = config.device_name.clone();
             let slot_root = root.clone();
             let task = move |stop: LocalBoxFuture<'static, ()>| {
                 let url = url.clone();
                 let account_id = account_id.clone();
                 let device_id = device_id.clone();
                 let creds = creds.clone();
+                let device_name = device_name.clone();
                 let root = slot_root.clone();
                 Box::pin(async move {
                     let space_id = env::space_id_at(&root)?;
@@ -589,6 +624,8 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
                     if let Some(crypto) = crypto {
                         ctx.attach_crypto(crypto);
                     }
+                    // Label conflict copies with this Device's human name (issue #14).
+                    ctx.set_device_display_name(device_name.clone());
                     // Mounting succeeded: if this Space was quarantined (issue #8),
                     // it has recovered — clear the flag NOW, before `run` loads its
                     // own metrics copy, so `filething metrics`/`status` stop

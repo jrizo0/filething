@@ -130,7 +130,7 @@ async fn two_devices_end_to_end() {
 
     // A edits one file and commits.
     write(&dir_a, "hello.txt", b"hello from A, EDITED\n", false);
-    match ctx_a.commit_and_reconcile().await.expect("A commit edit") {
+    match ctx_a.commit_and_reconcile().await.expect("A commit edit").0 {
         CommitOutcome::Committed { .. } => {}
         other => panic!("expected A's edit to commit, got {other:?}"),
     }
@@ -149,7 +149,7 @@ async fn two_devices_end_to_end() {
         b"pub fn x() { /* from B */ }\n",
         false,
     );
-    match ctx_b.commit_and_reconcile().await.expect("B commit edit") {
+    match ctx_b.commit_and_reconcile().await.expect("B commit edit").0 {
         CommitOutcome::Committed { .. } => {}
         other => panic!("expected B's edit to commit, got {other:?}"),
     }
@@ -163,6 +163,119 @@ async fn two_devices_end_to_end() {
     let count_conflicts = |dir: &Path| -> usize { walkdir_count(dir, "(conflicto ") };
     assert_eq!(count_conflicts(&dir_a), 0, "A has no false conflict copies");
     assert_eq!(count_conflicts(&dir_b), 0, "B has no false conflict copies");
+}
+
+/// Regression for issue #9: a divergent edit that surfaces only as a CAS conflict
+/// on commit (the common case — B never pulled A's edit) must have its
+/// conflict copy COUNTED. `commit_and_reconcile` runs the reconciling pull
+/// internally, so before the fix the returned outcome (and thus the daemon's
+/// `conflicts` metric) hid it. Here we assert `commit_and_reconcile` surfaces the
+/// conflict copies its retry pull wrote, and that a copy landed on disk.
+///
+/// Needs the same live infra as `two_devices_end_to_end` (see its docs).
+#[tokio::test]
+#[ignore = "requires a live self-hosted Convex backend + a user JWT (FILETHING_TEST_JWT)"]
+async fn commit_retry_reconcile_conflicts_are_counted() {
+    use convex::ConvexClient;
+    use ft_core::SpaceCrypto;
+    use ft_engine::Coordinator;
+
+    let url = std::env::var("CONVEX_SELF_HOSTED_URL")
+        .unwrap_or_else(|_| "http://localhost:3210".to_string());
+    let jwt = std::env::var("FILETHING_TEST_JWT")
+        .expect("FILETHING_TEST_JWT (a Better Auth Convex-audience JWT) must be set");
+
+    let connect = || async {
+        let mut client = ConvexClient::new(&url).await.expect("connect to Convex");
+        client.set_auth(Some(jwt.clone())).await;
+        Coordinator::from_client(client)
+    };
+
+    let work = tempfile::tempdir().unwrap();
+    let vault_dir = work.path().join("vault");
+    let dir_a = work.path().join("device-a");
+    let dir_b = work.path().join("device-b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+
+    let mut coord_a = connect().await;
+    let ensured = coord_a
+        .ensure_device("device-a", &[9u8; 32])
+        .await
+        .expect("ensure_device");
+
+    // A starts a Space with one shared file; both Devices converge on seq 0.
+    write(&dir_a, "shared.txt", b"base\n", false);
+    let crypto = SpaceCrypto {
+        dedup_secret: ensured.dedup_secret,
+        space_key: [24u8; 32],
+        space_id: String::new(),
+    };
+    let index_a = Index::open_in_memory().unwrap();
+    let vault_a: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
+    let mut ctx_a = SpaceContext::init_space(
+        index_a,
+        vault_a,
+        coord_a.clone(),
+        ensured.account_id.clone(),
+        ensured.device_id.clone(),
+        b"conflict-count-space",
+        &dir_a,
+        crypto,
+    )
+    .await
+    .expect("A init_space");
+    let space_id = ctx_a.space_id.clone();
+
+    let index_b = Index::open_in_memory().unwrap();
+    let vault_b: Box<dyn Vault> = Box::new(FsVault::new(&vault_dir));
+    let mut ctx_b = SpaceContext::clone_space(
+        index_b,
+        vault_b,
+        coord_a.clone(),
+        ensured.account_id.clone(),
+        ensured.device_id.clone(),
+        space_id.clone(),
+        &dir_b,
+        ensured.dedup_secret,
+    )
+    .await
+    .expect("B clone_space");
+
+    // A edits the shared file and commits: the head advances to seq 1.
+    write(&dir_a, "shared.txt", b"edited by A\n", false);
+    match ctx_a.commit_and_reconcile().await.expect("A commit").0 {
+        CommitOutcome::Committed { .. } => {}
+        other => panic!("expected A to commit, got {other:?}"),
+    }
+
+    // B edits the SAME file WITHOUT pulling A's change, then commits. B's base is
+    // still seq 0, so the commit CAS-conflicts; commit_and_reconcile pulls (which
+    // reconciles B's edit against A's, writing a conflict copy) and retries.
+    write(&dir_b, "shared.txt", b"edited by B\n", false);
+    let (outcome, conflicts) = ctx_b.commit_and_reconcile().await.expect("B commit");
+    match outcome {
+        CommitOutcome::Committed { .. } => {}
+        other => panic!("expected B to converge after the retry, got {other:?}"),
+    }
+
+    // The crux: the retry pull's conflict copy is surfaced (not discarded), so the
+    // daemon can count it. Before the fix this vec was unreachable and `conflicts`
+    // stayed 0.
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the CAS-conflict retry reconcile must surface its one conflict copy"
+    );
+    assert_eq!(
+        walkdir_count(&dir_b, "(conflicto "),
+        1,
+        "the conflict copy must exist on B's disk"
+    );
+    assert_eq!(
+        read(&dir_b, &conflicts[0]),
+        b"edited by B\n",
+        "B's losing edit is preserved in the conflict copy"
+    );
 }
 
 /// Counts files under `dir` whose name contains `needle` (used to assert there

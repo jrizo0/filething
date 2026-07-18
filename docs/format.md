@@ -465,7 +465,7 @@ Detección **causal, nunca por reloj** (decisión del proyecto; `mtime` solo ace
 **Nivel 2 — conflicto real por archivo:** para cada path se comparan TRES estados — `base` (Revision base común, vía `base_seq` del índice local), `local` (estado en disco) y `remoto` (la nueva Revision). La identidad "cambió" se decide por **`pcid`** (hash del claro del archivo), no por mtime:
 
 - **Cambió en UN solo lado respecto a base** ⇒ **fast-forward** (se toma ese lado).
-- **Cambió en AMBOS respecto a base** (los `pcid` de local y remoto difieren entre sí y de base) ⇒ **copia de conflicto**: se conservan ambos; el perdedor se renombra `nombre (conflicto <deviceId> <seq>).ext`.
+- **Cambió en AMBOS respecto a base** (los `pcid` de local y remoto difieren entre sí y de base) ⇒ **copia de conflicto**: se conservan ambos; el perdedor se renombra `nombre (conflicto <label>, seq <seq>).ext`, donde `<label>` es el nombre legible del Device que reconcilia (`filething login --name`) o, si no está en caché, su `deviceId` opaco. El `<label>` se sanea (`/`, `(`, `)` → `_`) para seguir siendo un único componente de path válido.
 - **Delete-vs-edit** ⇒ **gana la edición** (se restaura el archivo editado; el delete no se aplica).
 - **Colisión de solo-mayúsculas o de NFC** (§5.2) ⇒ **conflicto**, nunca sobre-escribir.
 

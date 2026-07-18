@@ -198,7 +198,7 @@ coordinator, watcher, diff, conflict, y `packages/backend`. Son directorios DISJ
 ### ft-conflict — conflictos a 3 vías por archivo · §10
 - `pub fn resolve(base: Option<FileEntry>, local: Option<FileEntry>, remote: Option<FileEntry>) -> Resolution`
   decidiendo "cambió" por **`pcid`** (nunca mtime): cambió en un lado → fast-forward;
-  en ambos → copia de conflicto (`nombre (conflicto <deviceId> <seq>).ext`); delete-vs-edit → gana edición;
+  en ambos → copia de conflicto (`nombre (conflicto <label>, seq <seq>).ext`, con `<label>` = nombre legible del Device o su `deviceId` de fallback); delete-vs-edit → gana edición;
   colisión casefold/NFC → conflicto.
 - **Tests:** los 4 casos; nombre de copia de conflicto determinista.
 

@@ -268,7 +268,7 @@ async fn reconcile_divergent_edit_keeps_both_with_conflict_copy() {
     assert_eq!(conflicts.len(), 1, "exactly one conflict copy");
     let copy = &conflicts[0];
     assert!(
-        copy.starts_with("notes (conflicto devB ") && copy.ends_with(").txt"),
+        copy.starts_with("notes (conflicto devB, seq ") && copy.ends_with(").txt"),
         "unexpected conflict-copy name: {copy}"
     );
     assert_eq!(read(bdir.path(), copy), b"LOCAL", "local edit preserved");
@@ -870,5 +870,168 @@ async fn fast_forward_dir_gains_then_loses_content() {
     assert!(
         bdir.path().join("d").is_dir(),
         "the now-empty dir must remain (only the file was deleted)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AUTO-MERGE (issue #14 point 4): a divergent edit over the SAME text file may
+// be fused when the two sides do not overlap; otherwise (overlap or binary) it
+// falls back to a conflict copy exactly as before.
+// ---------------------------------------------------------------------------
+
+// base F; local and remote edit the SAME text file in DISJOINT regions (append
+// at opposite ends) -> 3-way content merge, NO conflict copy, the fused bytes on
+// disk, and uploaded by the next stage (no phantom block).
+#[tokio::test]
+async fn reconcile_non_overlapping_text_edits_auto_merge_no_conflict_copy() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    // base: notes.txt = "l1\nl2\n". remote APPENDED a trailing line; local
+    // PREPENDED a heading — disjoint edits over the same file.
+    let base = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"l1\nl2\n", false).await],
+    )
+    .await;
+    let remote = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"l1\nl2\nREMOTE\n", false).await],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    write(bdir.path(), "notes.txt", b"l1\nl2\n");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-merge-ok";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap();
+
+    // The local divergent (but disjoint) edit.
+    write(bdir.path(), "notes.txt", b"HEAD\nl1\nl2\n");
+
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    match outcome {
+        PullOutcome::Reconciled { conflicts } => {
+            assert!(
+                conflicts.is_empty(),
+                "a clean auto-merge must not write a conflict copy: {conflicts:?}"
+            );
+        }
+        other => panic!("expected Reconciled, got {other:?}"),
+    }
+
+    // The real path now holds the FUSED content (both edits) ...
+    assert_eq!(read(bdir.path(), "notes.txt"), b"HEAD\nl1\nl2\nREMOTE\n");
+
+    // ... and staging for the next commit uploads the merged Block, so it is in
+    // the Vault (a Manifest referencing a missing Block would poison peers).
+    let staged = ctx.stage_to_vault().await.unwrap();
+    let merged_cid = ft_block::cid_for(b"HEAD\nl1\nl2\nREMOTE\n");
+    assert!(
+        vault.head(&ft_hash::block_key(&merged_cid)).await.unwrap(),
+        "the auto-merged Block must be uploaded by the next stage (no phantom block)"
+    );
+    // The staged root differs from remote — it carries the merge.
+    assert_ne!(staged.root, remote);
+}
+
+// OVERLAP: local and remote edit the SAME line differently -> no merge,
+// conflict copy exactly as before (auto-merge declines on overlap).
+#[tokio::test]
+async fn reconcile_overlapping_text_edits_fall_back_to_conflict_copy() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    let base = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"a\nb\nc\n", false).await],
+    )
+    .await;
+    let remote = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "notes.txt", b"a\nREMOTE\nc\n", false).await],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    write(bdir.path(), "notes.txt", b"a\nb\nc\n");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-merge-overlap";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap();
+
+    // Local edits the SAME middle line differently -> overlapping change.
+    write(bdir.path(), "notes.txt", b"a\nLOCAL\nc\n");
+
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    let conflicts = match outcome {
+        PullOutcome::Reconciled { conflicts } => conflicts,
+        other => panic!("expected Reconciled, got {other:?}"),
+    };
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "overlap must keep both via a conflict copy"
+    );
+    let copy = &conflicts[0];
+    assert_eq!(read(bdir.path(), "notes.txt"), b"a\nREMOTE\nc\n");
+    assert_eq!(
+        read(bdir.path(), copy),
+        b"a\nLOCAL\nc\n",
+        "local edit preserved"
+    );
+}
+
+// BINARY: a divergent NON-text file never auto-merges -> conflict copy.
+#[tokio::test]
+async fn reconcile_binary_divergent_falls_back_to_conflict_copy() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    // Content with an embedded NUL byte => detected as binary by merge3.
+    let base_bytes: &[u8] = b"\x00\x01\x02BASE\x00";
+    let remote_bytes: &[u8] = b"\x00\x01\x02REMOTE\x00\xff";
+    let local_bytes: &[u8] = b"\x00\x01\x02LOCAL\x00\xfe";
+
+    let base = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "blob.bin", base_bytes, false).await],
+    )
+    .await;
+    let remote = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "blob.bin", remote_bytes, false).await],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    write(bdir.path(), "blob.bin", base_bytes);
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-merge-binary";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap();
+
+    write(bdir.path(), "blob.bin", local_bytes);
+
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    let conflicts = match outcome {
+        PullOutcome::Reconciled { conflicts } => conflicts,
+        other => panic!("expected Reconciled, got {other:?}"),
+    };
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "a binary file must never be textually merged"
+    );
+    let copy = &conflicts[0];
+    assert_eq!(read(bdir.path(), "blob.bin"), remote_bytes);
+    assert_eq!(
+        read(bdir.path(), copy),
+        local_bytes,
+        "local binary preserved"
     );
 }

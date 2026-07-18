@@ -60,3 +60,6 @@ pub use ft_coordinator::{AccountId, CommitError, Coordinator, DeviceId, Revision
 // (e.g. the daemon's status / change-feed view).
 pub use ft_vault::Vault;
 pub use ft_watcher::{AppliedState, ChangeEvent, ChangeKind};
+// The conflict-copy name recognizer, so the CLI's `status` can flag unresolved
+// conflict copies without depending on ft-conflict directly (issue #14).
+pub use ft_conflict::is_conflict_copy_name;

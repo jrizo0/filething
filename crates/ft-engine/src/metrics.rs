@@ -116,6 +116,20 @@ impl SyncMetrics {
     /// Records an applied pull and any conflict copies it produced.
     pub fn record_pull_applied(&mut self, conflicts: usize) {
         self.pulls_applied += 1;
+        self.record_conflicts(conflicts);
+    }
+
+    /// Records conflict copies WITHOUT counting a pull (issue #9).
+    ///
+    /// For reconciles that happen inside a path already accounted for by another
+    /// counter: the reconciling pulls hidden in `commit_and_reconcile`'s
+    /// CAS-conflict retries (the enclosing commit is what `record_commit` counts)
+    /// and the `startup_sync` catch-up. Those conflict copies MUST still reach
+    /// `conflicts` — before this the counter sat at 0 whenever the only reconciles
+    /// were the ones a commit triggered — but they are deliberately not counted as
+    /// `pulls_applied`, which stays "pulls the run loop's feed/backstop branches
+    /// applied".
+    pub fn record_conflicts(&mut self, conflicts: usize) {
         self.conflicts += conflicts as u64;
     }
 

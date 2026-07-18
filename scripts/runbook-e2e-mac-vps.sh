@@ -316,10 +316,12 @@ if grep -q 'pull: up to date' <<<"$MAC_SYNC" && grep -q 'commit: no local change
 else ko "g13 sync one-shot" "mac: [$MAC_SYNC] vps: [$VPS_SYNC]"; fi
 
 # ==== g14: roots idénticos + status limpio (fix 464496c) + listado idéntico ====
-MAC_STATUS=$("$BIN" status "$MAC_SPACE" 2>&1)
-VPS_STATUS=$($SSH "set -e; $VPS_ENV; target/debug/filething status ~/space-demo" 2>&1)
-MAC_ROOT=$(sed -n 's/.*last synced: seq [0-9]* root //p' <<<"$MAC_STATUS")
-VPS_ROOT=$(sed -n 's/.*last synced: seq [0-9]* root //p' <<<"$VPS_STATUS")
+# -v prints the synced base's raw root hash ("synced: seq N root <hex>"); without
+# it the CLI shows only "synced: seq N" and this gate has no root to compare.
+MAC_STATUS=$("$BIN" status "$MAC_SPACE" -v 2>&1)
+VPS_STATUS=$($SSH "set -e; $VPS_ENV; target/debug/filething status ~/space-demo -v" 2>&1)
+MAC_ROOT=$(sed -n 's/.*synced: seq [0-9]* root //p' <<<"$MAC_STATUS")
+VPS_ROOT=$(sed -n 's/.*synced: seq [0-9]* root //p' <<<"$VPS_STATUS")
 if [ -n "$MAC_ROOT" ] && [ "$MAC_ROOT" = "$VPS_ROOT" ]; then
   ok "g14 root hash idéntico en ambos lados ($MAC_ROOT)"
 else ko "g14 root hash" "mac=$MAC_ROOT vps=$VPS_ROOT"; fi

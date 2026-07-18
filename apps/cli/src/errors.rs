@@ -5,9 +5,9 @@
 //! still reads like plumbing ("space not found: [Request ID …] …"), so here we
 //! turn the machine-typed variant into a one-line message plus a concrete next
 //! step. The raw detail (message + the Convex Request ID it embeds) is shown
-//! only in verbose mode — gated on `RUST_LOG` requesting `debug`/`trace`, the
-//! same signal the rest of the CLI uses to decide how chatty to be (there is
-//! no `-v/--verbose` flag; `RUST_LOG=error` asks for less noise, not more).
+//! only in verbose mode — the `-v/--verbose` flag OR `RUST_LOG` requesting
+//! `debug`/`trace` (`main` computes the signal; `RUST_LOG=error` asks for less
+//! noise, not more).
 //!
 //! A Coordinator error usually reaches `main` wrapped: `ft-engine` folds it into
 //! `EngineError::Coordinator(..)` and the command adds `anyhow` context on top.
@@ -64,9 +64,9 @@ pub fn headline(err: &CoordinatorError) -> String {
 
 /// Render a top-level command error for the user on stderr. When a typed
 /// Coordinator error is found in the chain, prints the human message + next
-/// step; otherwise prints `anyhow`'s own chain. `verbose` (RUST_LOG at
-/// debug/trace) appends the raw cause chain, which carries the Convex Request
-/// ID for support.
+/// step; otherwise prints `anyhow`'s own chain (de-duplicated). `verbose` (the
+/// `-v` flag or RUST_LOG at debug/trace) appends the raw cause chain, which
+/// carries the Convex Request ID for support.
 pub fn report(err: &Error, verbose: bool) {
     if let Some(ce) = find_coordinator_error(err) {
         if let Some((msg, hint)) = explain(ce) {
@@ -74,17 +74,37 @@ pub fn report(err: &Error, verbose: bool) {
             eprintln!("  \u{2192} {hint}");
             if verbose {
                 eprintln!("\ndetalle técnico:");
-                for cause in err.chain() {
+                for cause in dedup_chain(err) {
                     eprintln!("  - {cause}");
                 }
             } else {
-                eprintln!("  (define RUST_LOG=debug para ver el detalle técnico y el Request ID)");
+                eprintln!(
+                    "  (usa -v o RUST_LOG=debug para ver el detalle técnico y el Request ID)"
+                );
             }
             return;
         }
     }
-    // No typed mapping: anyhow's full alternate-formatted chain.
-    eprintln!("error: {err:#}");
+    // No typed mapping: anyhow's chain, de-duplicated (see [`dedup_chain`]).
+    eprintln!("error: {}", dedup_chain(err).join(": "));
+}
+
+/// The `anyhow` cause chain as strings, dropping any cause whose text is already
+/// contained in the previously kept one. A `thiserror` variant that interpolates
+/// its `#[source]` inline — e.g. `EngineError`'s `#[error("vault: {0}")]` — makes
+/// anyhow print the wrapper (which already embeds the source message) AND then
+/// the source again verbatim; that redundant second line is what this collapses
+/// (issue #21).
+fn dedup_chain(err: &Error) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let s = cause.to_string();
+        if out.last().is_some_and(|prev| prev.contains(&s)) {
+            continue;
+        }
+        out.push(s);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -149,5 +169,39 @@ mod tests {
     fn find_coordinator_error_returns_none_when_absent() {
         let err = anyhow::anyhow!("some unrelated failure").context("doing a thing");
         assert!(find_coordinator_error(&err).is_none());
+    }
+
+    #[test]
+    fn dedup_chain_drops_a_cause_contained_in_its_wrapper() {
+        // Mirrors the real gc failure (issue #21): the inner VaultError, then a
+        // wrapper whose Display inlines it ("vault: {0}"), then a command context.
+        let inner = anyhow::anyhow!("s3 vault error at blocks/: signed vault cannot list");
+        let err = inner
+            .context("vault: s3 vault error at blocks/: signed vault cannot list")
+            .context("gc");
+        let chain = dedup_chain(&err);
+        // The verbatim-duplicated inner line is collapsed: "gc" + the wrapper only.
+        assert_eq!(
+            chain,
+            vec![
+                "gc".to_string(),
+                "vault: s3 vault error at blocks/: signed vault cannot list".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedup_chain_keeps_distinct_causes() {
+        let err = anyhow::anyhow!("root cause")
+            .context("middle layer")
+            .context("top");
+        assert_eq!(
+            dedup_chain(&err),
+            vec![
+                "top".to_string(),
+                "middle layer".to_string(),
+                "root cause".to_string(),
+            ]
+        );
     }
 }

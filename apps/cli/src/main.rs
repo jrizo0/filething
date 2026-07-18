@@ -16,6 +16,7 @@ mod credentials;
 mod env;
 mod errors;
 mod logrotate;
+mod progress;
 mod service;
 mod signed_vault;
 
@@ -30,6 +31,12 @@ use crate::service::ServiceAction;
 #[derive(Debug, Parser)]
 #[command(name = "filething", version, about, long_about = None)]
 struct Cli {
+    /// Show the internal debug logging that one-shot commands hide by default
+    /// (equivalent to `RUST_LOG=info`) and the full technical detail of an error.
+    /// An explicit `RUST_LOG` always takes precedence over this flag.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -53,6 +60,16 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// Show who this Device is logged in as: the account email (when known) and
+    /// id, this Device's name and id, and the Coordinator URL. Reads the local
+    /// config only — no network.
+    Whoami,
+
+    /// List the Spaces owned by the logged-in account, marking which are mapped
+    /// to a local folder on THIS Device (and where). Handy before `clone` from a
+    /// second Device, so the Space id no longer has to be copied by hand.
+    Spaces,
 
     /// Make a local folder a new Space and commit its first Revision.
     Init {
@@ -82,7 +99,17 @@ enum Command {
         no_daemon: bool,
     },
 
+    /// Stop syncing a Space on this Device: KEEP the local files, remove its
+    /// mapping from `config.json`, and restart the background daemon (if
+    /// installed as a service) so it drops the Space. The Space and its history
+    /// stay on the Coordinator and on your other Devices.
+    Unmap {
+        /// The mapped Space folder to unmap.
+        dir: PathBuf,
+    },
+
     /// Show a Space's synced base and whether it has uncommitted local changes.
+    /// With no dir, outside a Space, reports every mapped Space (like `metrics`).
     Status {
         /// The Space folder (defaults to the current directory).
         dir: Option<PathBuf>,
@@ -134,6 +161,10 @@ enum Command {
     Metrics {
         /// The Space folder (defaults to all mapped Spaces).
         dir: Option<PathBuf>,
+        /// Emit the raw values as JSON (durations in whole seconds), stable for
+        /// monitoring, instead of the humanized text report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Install / uninstall / status the daemon as an OS service (launchd on macOS,
@@ -161,14 +192,28 @@ async fn main() -> anyhow::Result<()> {
     // keeps logging to stderr. TLS is not touched by parsing, so this stays after
     // the CryptoProvider install and before any network work.
     let cli = Cli::parse();
-    init_tracing(&cli.command);
+    init_tracing(&cli.command, cli.verbose);
 
+    // The verbose signal for error rendering: the `-v` flag OR an explicit
+    // `RUST_LOG` at debug/trace. A plain `RUST_LOG=error` must NOT flip us
+    // verbose — that user asked for LESS noise, not more (issue #11/#16).
+    let verbose_errors = cli.verbose
+        || std::env::var("RUST_LOG")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("debug") || v.contains("trace")
+            })
+            .unwrap_or(false);
+
+    let verbose = cli.verbose;
     let result = match cli.command {
         Command::Login {
             email,
             signup,
             name,
         } => commands::login(email, signup, name).await,
+        Command::Whoami => commands::whoami(),
+        Command::Spaces => commands::spaces().await,
         Command::Init {
             dir,
             name,
@@ -180,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
             name,
             no_daemon,
         } => commands::clone(space_id, dir, name, no_daemon).await,
-        Command::Status { dir } => commands::status(dir).await,
+        Command::Unmap { dir } => commands::unmap(dir),
+        Command::Status { dir } => commands::status(dir, verbose).await,
         Command::Ls { dir } => commands::ls(dir),
         Command::Sync { dir, no_daemon } => commands::sync(dir, no_daemon).await,
         Command::Daemon { dirs } => commands::daemon(dirs).await,
@@ -189,49 +235,69 @@ async fn main() -> anyhow::Result<()> {
             apply,
             grace_secs,
         } => commands::gc(dir, apply, grace_secs).await,
-        Command::Metrics { dir } => commands::metrics(dir),
+        Command::Metrics { dir, json } => commands::metrics(dir, json),
         Command::Service { action } => commands::service(action),
     };
 
     // Render a failure ourselves so a typed Coordinator error becomes a human
     // message + next step (issue #11) instead of anyhow's raw Debug chain. The
-    // raw detail (and the Convex Request ID) is shown only when RUST_LOG asks
-    // for debug/trace — the CLI's existing verbosity signal (there is no
-    // -v/--verbose flag). A plain `RUST_LOG=error` must NOT flip us verbose:
-    // that user asked for LESS noise, not more. We still exit non-zero so
-    // scripts and the integration gates see the failure.
+    // raw detail (and the Convex Request ID) is shown only when verbose (the
+    // `-v` flag or RUST_LOG at debug/trace). We still exit non-zero so scripts
+    // and the integration gates see the failure.
     if let Err(err) = result {
-        let verbose = std::env::var("RUST_LOG")
-            .map(|v| {
-                let v = v.to_ascii_lowercase();
-                v.contains("debug") || v.contains("trace")
-            })
-            .unwrap_or(false);
-        errors::report(&err, verbose);
+        // Close any open one-shot progress line so the error does not land on
+        // the same terminal row (issue #16).
+        progress::finish();
+        errors::report(&err, verbose_errors);
         std::process::exit(1);
     }
     Ok(())
 }
 
-/// The default log filter: `RUST_LOG` if set, else `info`. Shared by both the
-/// stderr and the rotating-file initializers so daemon and one-shot logging honor
-/// the same verbosity rules.
-fn env_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+/// The log filter for this run.
+///
+/// - An explicit `RUST_LOG` ALWAYS wins (verbatim), for both the daemon and
+///   one-shot commands.
+/// - Otherwise the daemon keeps `info` (it can run for weeks; its log is its
+///   observability), and `-v/--verbose` restores `info` for one-shot commands
+///   too — the full internal tracing (`convex::*`, `ft_*`).
+/// - Otherwise a one-shot command defaults to `warn`, so the internal machinery
+///   (`convex::*` "Starting action…", per-batch upload INFO) stops drowning the
+///   command's own output (issue #16). The command's result is `println!` to
+///   stdout and is unaffected; progress is rendered separately (see `progress`).
+fn env_filter(command: &Command, verbose: bool) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    if std::env::var_os("RUST_LOG").is_some() {
+        return EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    }
+    if matches!(command, Command::Daemon { .. }) || verbose {
+        EnvFilter::new("info")
+    } else {
+        EnvFilter::new("warn")
+    }
 }
 
 /// Initialize tracing for this invocation.
 ///
-/// One-shot commands (and the Linux daemon under systemd, which journald rotates)
-/// log to stderr exactly as before. The daemon logs to a size-rotated FILE it
-/// owns whenever it would otherwise be at the mercy of launchd's unbounded stderr
-/// redirect: on macOS, or when `FILETHING_LOG_TO_FILE` is set non-empty (a manual
-/// opt-in on any OS). If that file can't be opened we warn and fall back to
-/// stderr — the daemon must still run. When stderr is a terminal (a foreground
-/// `filething daemon`) we tee to both so it stays visible while the file always
-/// receives the log.
-fn init_tracing(command: &Command) {
+/// The fmt layer honors [`env_filter`] (per-layer, so it can suppress INFO
+/// without hiding it from the progress layer below). One-shot commands (and the
+/// Linux daemon under systemd, which journald rotates) log to stderr. The daemon
+/// logs to a size-rotated FILE it owns whenever it would otherwise be at the
+/// mercy of launchd's unbounded stderr redirect: on macOS, or when
+/// `FILETHING_LOG_TO_FILE` is set non-empty (a manual opt-in on any OS). If that
+/// file can't be opened we warn and fall back to stderr — the daemon must still
+/// run. When stderr is a terminal (a foreground `filething daemon`) we tee to
+/// both so it stays visible while the file always receives the log.
+///
+/// On top of the fmt layer, one-shot `init`/`clone`/`sync` runs get the compact
+/// [`progress`] layer — a single rewriting stderr line instead of per-batch INFO
+/// logs (issue #16) — but only on a TTY, when not verbose, and with no explicit
+/// `RUST_LOG` (where the user wants the raw logs, or nothing, instead).
+fn init_tracing(command: &Command, verbose: bool) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::Layer as _;
+
     let log_to_file = matches!(command, Command::Daemon { .. })
         && (cfg!(target_os = "macos")
             || std::env::var("FILETHING_LOG_TO_FILE")
@@ -241,16 +307,22 @@ fn init_tracing(command: &Command) {
     if log_to_file {
         match daemon_file_writer() {
             Ok(writer) => {
-                let builder = tracing_subscriber::fmt()
-                    .with_env_filter(env_filter())
-                    .with_ansi(false);
+                let filter = env_filter(command, verbose);
                 // Foreground run (tty): tee to the file AND stderr so the file is
                 // always written yet the operator still sees the log live.
                 if std::io::stderr().is_terminal() {
                     use tracing_subscriber::fmt::writer::MakeWriterExt as _;
-                    builder.with_writer(writer.and(std::io::stderr)).init();
+                    let fmt = tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(writer.and(std::io::stderr))
+                        .with_filter(filter);
+                    tracing_subscriber::registry().with(fmt).init();
                 } else {
-                    builder.with_writer(writer).init();
+                    let fmt = tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(writer)
+                        .with_filter(filter);
+                    tracing_subscriber::registry().with(fmt).init();
                 }
                 return;
             }
@@ -262,10 +334,40 @@ fn init_tracing(command: &Command) {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter())
+    let show_progress = !matches!(command, Command::Daemon { .. })
+        && !verbose
+        && std::env::var_os("RUST_LOG").is_none()
+        && std::io::stderr().is_terminal();
+
+    // The progress layer sees the engine's progress events regardless of the fmt
+    // layer's (possibly WARN) filter, because per-layer filters are independent —
+    // that is exactly what lets us hide the raw INFO logs yet still draw the
+    // progress line.
+    let progress_layer = show_progress.then(|| {
+        progress::ProgressLayer.with_filter(tracing_subscriber::filter::filter_fn(
+            |meta: &tracing::Metadata<'_>| is_progress_target(meta.target()),
+        ))
+    });
+
+    let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
+        .with_filter(env_filter(command, verbose));
+
+    tracing_subscriber::registry()
+        .with(fmt)
+        .with(progress_layer)
         .init();
+}
+
+/// Whether a tracing event's `target` (its originating crate/module path) is one
+/// the compact [`progress`] layer should see. The progress events live in TWO
+/// crates: `ft-engine` emits the commit/reconcile phases and the fast-forward
+/// start/finish markers, while `ft-diff` emits the intermediate "applying changes"
+/// ticks that advance the line during a clone/fast-forward (the engine only frames
+/// that phase, it does not tick it — issue #15). Anything else (`convex::*`,
+/// `reqwest`, …) stays out so the line is not disturbed by unrelated INFO.
+fn is_progress_target(target: &str) -> bool {
+    target.starts_with("ft_engine") || target.starts_with("ft_diff")
 }
 
 /// Build the daemon's rotating log writer at `<config_dir>/daemon.log`
@@ -290,6 +392,22 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The progress-layer filter admits BOTH engine crates — including `ft_diff`,
+    /// whose "applying changes" ticks are the only ones that advance the line on a
+    /// clone/fast-forward (issue #15) — and rejects unrelated targets so foreign
+    /// INFO never disturbs the line. Guards against the regression where the
+    /// filter matched `ft_engine` only and the clone line stayed frozen.
+    #[test]
+    fn progress_filter_admits_both_engine_crates() {
+        assert!(is_progress_target("ft_engine"));
+        assert!(is_progress_target("ft_engine::pull"));
+        assert!(is_progress_target("ft_diff"));
+        assert!(is_progress_target("ft_diff::lib"));
+        assert!(!is_progress_target("convex::client"));
+        assert!(!is_progress_target("reqwest"));
+        assert!(!is_progress_target("ft_core"));
     }
 
     /// `login --email` parses to a log-in (no signup, no device name).
@@ -466,12 +584,32 @@ mod tests {
         }
     }
 
+    /// `-v/--verbose` is a global flag: it parses both before and after the
+    /// subcommand, and defaults to false.
+    #[test]
+    fn parse_global_verbose_flag() {
+        assert!(!Cli::parse_from(["filething", "status"]).verbose);
+        assert!(Cli::parse_from(["filething", "-v", "status"]).verbose);
+        assert!(Cli::parse_from(["filething", "status", "--verbose"]).verbose);
+    }
+
     /// `metrics` accepts an optional dir; `service <action>` parses the nested
     /// subcommand.
     #[test]
     fn parse_metrics_and_service() {
         match Cli::parse_from(["filething", "metrics"]).command {
-            Command::Metrics { dir } => assert!(dir.is_none()),
+            Command::Metrics { dir, json } => {
+                assert!(dir.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected Metrics, got {other:?}"),
+        }
+        // `--json` parses (and works before the positional dir too).
+        match Cli::parse_from(["filething", "metrics", "--json"]).command {
+            Command::Metrics { dir, json } => {
+                assert!(dir.is_none());
+                assert!(json);
+            }
             other => panic!("expected Metrics, got {other:?}"),
         }
         match Cli::parse_from(["filething", "service", "install"]).command {
@@ -480,5 +618,24 @@ mod tests {
         }
         // `service` with no action is a parse error.
         assert!(Cli::try_parse_from(["filething", "service"]).is_err());
+    }
+
+    /// `whoami` / `spaces` take no arguments; `unmap` requires a dir.
+    #[test]
+    fn parse_whoami_spaces_and_unmap() {
+        assert!(matches!(
+            Cli::parse_from(["filething", "whoami"]).command,
+            Command::Whoami
+        ));
+        assert!(matches!(
+            Cli::parse_from(["filething", "spaces"]).command,
+            Command::Spaces
+        ));
+        match Cli::parse_from(["filething", "unmap", "/home/u/proj"]).command {
+            Command::Unmap { dir } => assert_eq!(dir, PathBuf::from("/home/u/proj")),
+            other => panic!("expected Unmap, got {other:?}"),
+        }
+        // `unmap` with no dir is a parse error (the dir is required).
+        assert!(Cli::try_parse_from(["filething", "unmap"]).is_err());
     }
 }

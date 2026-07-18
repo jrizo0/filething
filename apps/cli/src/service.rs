@@ -22,12 +22,22 @@
 //! printing the manual command if that step fails (so a restricted environment
 //! still gets the files written).
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context as _};
 
 use crate::config::Config;
+
+/// Uptime (seconds) below which a nonzero last-exit reads as a crash-loop rather
+/// than a normal recent (re)start (issue #19).
+const CRASH_LOOP_UPTIME_SECS: u64 = 30;
+/// systemd `NRestarts` at or above which the unit is treated as crash-looping
+/// regardless of the current instance's uptime/exit (issue #19).
+const CRASH_LOOP_RESTARTS: u64 = 3;
+/// How many trailing log lines to show when warning about a crash-loop.
+const ERROR_LOG_TAIL: usize = 15;
 
 /// launchd job label / systemd unit base name.
 const LABEL: &str = "com.filething.daemon";
@@ -388,29 +398,282 @@ fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A uniform snapshot of the daemon service, so `status` reads the same on both
+/// platforms instead of dumping the raw launchctl dict (issue #19).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ServiceStatus {
+    /// Whether a live daemon process is currently running.
+    running: bool,
+    /// The daemon PID, when running.
+    pid: Option<u32>,
+    /// Seconds the current process has been up (from `ps`), when running.
+    uptime_secs: Option<u64>,
+    /// The last observed exit code (launchd `LastExitStatus` / systemd
+    /// `ExecMainStatus`). `0` while a run is healthy.
+    last_exit_code: Option<i64>,
+    /// systemd `NRestarts` (the auto-restart count). `None` on launchd, which
+    /// exposes no equivalent.
+    restarts: Option<u64>,
+}
+
+impl ServiceStatus {
+    /// Crash-loop heuristic (issue #19): the supervisor keeps relaunching the
+    /// daemon but it keeps dying. Two independent signals:
+    /// - a nonzero last exit together with either "not running" or an uptime of
+    ///   only seconds — the launchd trap where the agent shows a fresh PID that
+    ///   is about to die again, with `LastExitStatus != 0` buried in the dump;
+    /// - a high systemd restart count, which climbs across a restart loop even
+    ///   when we happen to sample it mid-run (its `ExecMainStatus` reads `0`).
+    fn looks_crash_looping(&self) -> bool {
+        let recent_bad_exit = matches!(self.last_exit_code, Some(c) if c != 0);
+        let young = matches!(self.uptime_secs, Some(s) if s < CRASH_LOOP_UPTIME_SECS);
+        let many_restarts = matches!(self.restarts, Some(n) if n >= CRASH_LOOP_RESTARTS);
+        many_restarts || (recent_bad_exit && (young || !self.running))
+    }
+}
+
 fn status() -> anyhow::Result<()> {
-    if cfg!(target_os = "macos") {
+    if !is_installed() {
+        println!("filething daemon service: not installed");
+        println!(
+            "  install it with `filething service install` (or just run `filething init`/`clone`, \
+             which installs it automatically)."
+        );
+        return Ok(());
+    }
+
+    let mut st = if cfg!(target_os = "macos") {
+        // `launchctl list <label>` exits 0 (and prints the dict) only while the
+        // job is loaded; a nonzero exit means "not loaded" = stopped.
         match run_cmd_output("launchctl", &["list", LABEL]) {
-            Ok(out) => {
-                println!("launchd agent {LABEL}: loaded");
-                print!("{out}");
-            }
-            Err(_) => println!("launchd agent {LABEL}: not loaded"),
+            Ok(out) => parse_launchctl_list(&out),
+            Err(_) => ServiceStatus::default(),
         }
     } else if cfg!(target_os = "linux") {
-        let active = run_cmd_output("systemctl", &["--user", "is-active", SYSTEMD_UNIT])
-            .unwrap_or_else(|_| "unknown".into());
-        let enabled = run_cmd_output("systemctl", &["--user", "is-enabled", SYSTEMD_UNIT])
-            .unwrap_or_else(|_| "unknown".into());
-        println!(
-            "systemd user unit {SYSTEMD_UNIT}: active={} enabled={}",
-            active.trim(),
-            enabled.trim()
-        );
+        // `systemctl --user show` always succeeds for an installed unit and
+        // prints KEY=VALUE properties; parse the few we report.
+        match run_cmd_output(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                SYSTEMD_UNIT,
+                "-p",
+                "ActiveState",
+                "-p",
+                "MainPID",
+                "-p",
+                "ExecMainStatus",
+                "-p",
+                "NRestarts",
+            ],
+        ) {
+            Ok(out) => parse_systemd_show(&out),
+            Err(_) => ServiceStatus::default(),
+        }
     } else {
         bail!("`service` supports macOS (launchd) and Linux (systemd) only");
+    };
+
+    // Uptime uniformly from the live PID (`ps -o etime`), so both platforms
+    // report it even though only systemd exposes a start timestamp of its own.
+    if let Some(pid) = st.pid {
+        st.uptime_secs = process_uptime_secs(pid);
     }
+
+    render_status(&st);
     Ok(())
+}
+
+/// Prints the uniform status report (issue #19) and, on a detected crash-loop,
+/// a WARNING with the log location and its last lines.
+fn render_status(st: &ServiceStatus) {
+    println!(
+        "filething daemon service: {}",
+        if st.running { "running" } else { "stopped" }
+    );
+    if let Some(pid) = st.pid {
+        println!("  pid: {pid}");
+    }
+    match st.uptime_secs {
+        Some(s) => println!("  uptime: {}", crate::commands::humanize_secs(s)),
+        None if st.running => println!("  uptime: unknown"),
+        None => {}
+    }
+    if let Some(code) = st.last_exit_code {
+        println!("  last exit code: {code}");
+    }
+    if let Some(n) = st.restarts {
+        println!("  restarts: {n}");
+    }
+    let log = log_location_hint();
+    println!("  log: {log}");
+
+    if st.looks_crash_looping() {
+        let exit = st
+            .last_exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".into());
+        let up = st
+            .uptime_secs
+            .map(|s| format!("up {}", crate::commands::humanize_secs(s)))
+            .unwrap_or_else(|| "not running".into());
+        println!();
+        println!("  WARNING: the daemon looks like it is crash-looping (last exit {exit}, {up}).");
+        let lines = last_error_log_lines(ERROR_LOG_TAIL);
+        if lines.is_empty() {
+            println!("  (no recent log lines found; see {log})");
+        } else {
+            println!("  last log lines:");
+            for l in &lines {
+                println!("    {l}");
+            }
+        }
+        println!(
+            "  \u{2192} a single dead Space can do this (issue #8): check \
+             `filething status` for a QUARANTINED Space and `filething unmap <dir>` it."
+        );
+    }
+}
+
+/// Parses `launchctl list <label>` output — a plist-ish dict of `"Key" = value;`
+/// lines — into a [`ServiceStatus`]. A present `PID` means the job is running;
+/// `LastExitStatus` is the last observed exit code (the value that used to be
+/// buried in the raw dump, issue #19).
+fn parse_launchctl_list(out: &str) -> ServiceStatus {
+    let mut pid = None;
+    let mut last_exit_code = None;
+    for line in out.lines() {
+        let line = line.trim().trim_end_matches(';');
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().trim_matches('"');
+        let val = v.trim().trim_matches('"');
+        match key {
+            "PID" => pid = val.parse::<u32>().ok(),
+            "LastExitStatus" => last_exit_code = val.parse::<i64>().ok(),
+            _ => {}
+        }
+    }
+    ServiceStatus {
+        running: pid.is_some(),
+        pid,
+        uptime_secs: None,
+        last_exit_code,
+        restarts: None,
+    }
+}
+
+/// Parses `systemctl --user show` KEY=VALUE properties into a [`ServiceStatus`]:
+/// `ActiveState` (running ⟺ `active`), `MainPID` (0 ⇒ not running),
+/// `ExecMainStatus` (last exit code), `NRestarts` (auto-restart count).
+fn parse_systemd_show(out: &str) -> ServiceStatus {
+    let map: HashMap<&str, &str> = out
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
+        .collect();
+    let running = map.get("ActiveState").is_some_and(|s| *s == "active");
+    let pid = map
+        .get("MainPID")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|p| *p != 0);
+    let last_exit_code = map
+        .get("ExecMainStatus")
+        .and_then(|s| s.parse::<i64>().ok());
+    let restarts = map.get("NRestarts").and_then(|s| s.parse::<u64>().ok());
+    ServiceStatus {
+        running,
+        pid,
+        uptime_secs: None,
+        last_exit_code,
+        restarts,
+    }
+}
+
+/// Elapsed seconds for `pid` via `ps -o etime=` (portable across macOS/Linux),
+/// or `None` if the process is gone or `ps` is unavailable.
+fn process_uptime_secs(pid: u32) -> Option<u64> {
+    let out = run_cmd_output("ps", &["-o", "etime=", "-p", &pid.to_string()]).ok()?;
+    parse_etime(out.trim())
+}
+
+/// Parses a `ps -o etime` field (`[[dd-]hh:]mm:ss`) into whole seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, sec): (u64, u64, u64) = match parts.as_slice() {
+        [h, m, s] => (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?),
+        [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
+        _ => return None,
+    };
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
+/// Where the daemon's log lives, for the `log:` line. macOS always logs to the
+/// rotated file (`daemon.log`); Linux logs to journald unless the file-log
+/// opt-in wrote `daemon.log` (`FILETHING_LOG_TO_FILE`), in which case that file
+/// is shown. The macOS `daemon.err.log` (panics/startup) is read by
+/// [`last_error_log_lines`] but not named here to keep the line short.
+fn log_location_hint() -> String {
+    let daemon_log = Config::config_dir().join(LOG_FILE);
+    if cfg!(target_os = "macos") || daemon_log.exists() {
+        daemon_log.display().to_string()
+    } else {
+        format!("journalctl --user -u {SYSTEMD_UNIT}")
+    }
+}
+
+/// The last `n` log lines to show under a crash-loop warning. macOS prefers the
+/// tiny `daemon.err.log` (where panics/pre-tracing fatal errors land), falling
+/// back to the rotated `daemon.log`. Linux tails `daemon.log` when present, else
+/// asks journald.
+fn last_error_log_lines(n: usize) -> Vec<String> {
+    let dir = Config::config_dir();
+    if cfg!(target_os = "macos") {
+        let err = tail_file(&dir.join(ERR_FILE), n);
+        if !err.is_empty() {
+            return err;
+        }
+        return tail_file(&dir.join(LOG_FILE), n);
+    }
+    let daemon_log = dir.join(LOG_FILE);
+    if daemon_log.exists() {
+        return tail_file(&daemon_log, n);
+    }
+    match run_cmd_output(
+        "journalctl",
+        &[
+            "--user",
+            "-u",
+            SYSTEMD_UNIT,
+            "-n",
+            &n.to_string(),
+            "--no-pager",
+        ],
+    ) {
+        Ok(out) => out.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Reads the last `n` lines of a text file, or an empty vec if it cannot be read.
+fn tail_file(path: &Path, n: usize) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].iter().map(|l| l.to_string()).collect()
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 // ----- small IO / process helpers -----
@@ -523,5 +786,123 @@ mod tests {
         assert!(u.contains("ExecStart=\"/usr/local/bin/filething\" daemon\n"));
         assert!(u.contains("Restart=always"));
         assert!(u.contains("WantedBy=default.target"));
+    }
+
+    // ----- status parsing / crash-loop detection (issue #19) -----
+
+    #[test]
+    fn parse_launchctl_list_reads_pid_and_last_exit() {
+        // A loaded, healthy job: PID present, LastExitStatus 0.
+        let running = r#"{
+	"StandardOutPath" = "/cfg/daemon.err.log";
+	"LimitLoadToSessionType" = "Aqua";
+	"Label" = "com.filething.daemon";
+	"OnDemand" = false;
+	"LastExitStatus" = 0;
+	"PID" = 4242;
+	"Program" = "/bin/sh";
+};"#;
+        let st = parse_launchctl_list(running);
+        assert!(st.running);
+        assert_eq!(st.pid, Some(4242));
+        assert_eq!(st.last_exit_code, Some(0));
+        assert_eq!(st.restarts, None);
+
+        // The issue's crash-loop trap: a relaunched PID but LastExitStatus 256.
+        let looping = "{\n\t\"LastExitStatus\" = 256;\n\t\"PID\" = 9001;\n};";
+        let st = parse_launchctl_list(looping);
+        assert_eq!(st.pid, Some(9001));
+        assert_eq!(st.last_exit_code, Some(256));
+        assert!(st.running); // has a PID *right now*…
+    }
+
+    #[test]
+    fn parse_launchctl_list_not_running_when_no_pid() {
+        let stopped = "{\n\t\"LastExitStatus\" = 0;\n\t\"OnDemand\" = false;\n};";
+        let st = parse_launchctl_list(stopped);
+        assert!(!st.running);
+        assert_eq!(st.pid, None);
+    }
+
+    #[test]
+    fn parse_systemd_show_reads_state_pid_exit_restarts() {
+        let active = "ActiveState=active\nMainPID=1234\nExecMainStatus=0\nNRestarts=0\n";
+        let st = parse_systemd_show(active);
+        assert!(st.running);
+        assert_eq!(st.pid, Some(1234));
+        assert_eq!(st.last_exit_code, Some(0));
+        assert_eq!(st.restarts, Some(0));
+
+        // Failed unit mid-restart-loop: no MainPID, nonzero exit, restarts climbing.
+        let failed = "ActiveState=failed\nMainPID=0\nExecMainStatus=1\nNRestarts=7\n";
+        let st = parse_systemd_show(failed);
+        assert!(!st.running);
+        assert_eq!(st.pid, None); // MainPID 0 → not running
+        assert_eq!(st.last_exit_code, Some(1));
+        assert_eq!(st.restarts, Some(7));
+    }
+
+    #[test]
+    fn parse_etime_handles_all_field_widths() {
+        assert_eq!(parse_etime("03"), None); // ss alone is not a valid etime
+        assert_eq!(parse_etime("00:03"), Some(3)); // mm:ss
+        assert_eq!(parse_etime("01:02"), Some(62));
+        assert_eq!(parse_etime("01:00:00"), Some(3600)); // hh:mm:ss
+        assert_eq!(parse_etime("2-03:00:00"), Some(2 * 86_400 + 3 * 3600)); // dd-hh:mm:ss
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("garbage"), None);
+    }
+
+    #[test]
+    fn crash_loop_detection() {
+        // Healthy: long uptime, clean exit → not a loop.
+        let healthy = ServiceStatus {
+            running: true,
+            pid: Some(1),
+            uptime_secs: Some(3600),
+            last_exit_code: Some(0),
+            restarts: Some(0),
+        };
+        assert!(!healthy.looks_crash_looping());
+
+        // launchd trap: a fresh PID (running), up only 3s, last exit 256.
+        let launchd_loop = ServiceStatus {
+            running: true,
+            pid: Some(2),
+            uptime_secs: Some(3),
+            last_exit_code: Some(256),
+            restarts: None,
+        };
+        assert!(launchd_loop.looks_crash_looping());
+
+        // A healthy-but-recent (re)start with a clean exit must NOT false-positive.
+        let just_started = ServiceStatus {
+            running: true,
+            pid: Some(3),
+            uptime_secs: Some(2),
+            last_exit_code: Some(0),
+            restarts: None,
+        };
+        assert!(!just_started.looks_crash_looping());
+
+        // systemd: sampled mid-run (ExecMainStatus 0) but NRestarts high.
+        let systemd_loop = ServiceStatus {
+            running: true,
+            pid: Some(4),
+            uptime_secs: Some(4),
+            last_exit_code: Some(0),
+            restarts: Some(9),
+        };
+        assert!(systemd_loop.looks_crash_looping());
+
+        // Stopped after a bad exit is also a loop signal (nothing running now).
+        let down_bad = ServiceStatus {
+            running: false,
+            pid: None,
+            uptime_secs: None,
+            last_exit_code: Some(1),
+            restarts: Some(0),
+        };
+        assert!(down_bad.looks_crash_looping());
     }
 }

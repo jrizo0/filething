@@ -6,10 +6,11 @@
 //! ([`crate::env`]), open the Space's local index, drive a `SpaceContext`, and
 //! print a clear result.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use convex::ConvexClient;
 use ft_core::SpaceCrypto;
 use ft_engine::{
     AccountId, CommitOutcome, DeviceId, GcOptions, PullOutcome, SpaceContext, SpaceId, SyncMetrics,
@@ -84,6 +85,7 @@ pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow:
     let mut config = Config::load()?;
     config.set_identity(
         &url,
+        &email,
         ensured.account_id.as_str(),
         ensured.device_id.as_str(),
         &device_name,
@@ -156,6 +158,85 @@ fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, Devic
 fn require_credentials() -> anyhow::Result<Credentials> {
     Credentials::load()?
         .ok_or_else(|| anyhow::anyhow!("no Device credentials found — run `filething login` first"))
+}
+
+/// `whoami` — show the logged-in identity from the local config (issue #15).
+///
+/// No network: everything shown is cached at `login` — the account email + id,
+/// this Device's name + id, and the Coordinator URL. Errors with a `login` hint
+/// if this Device has never logged in. The email may be absent for a config
+/// written before it was cached; the account id is then shown alone.
+pub fn whoami() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let (url, account_id, device_id) = require_identity(&config)?;
+    match config.email.as_deref() {
+        Some(email) => println!("account: {email} ({account_id})"),
+        None => println!("account: {account_id}"),
+    }
+    match config.device_name.as_deref() {
+        Some(name) => println!("device:  {name} ({device_id})"),
+        None => println!("device:  {device_id}"),
+    }
+    println!("coordinator: {url}");
+    Ok(())
+}
+
+/// `spaces` — list the Spaces owned by the logged-in account, marking which are
+/// mapped to a local folder on THIS Device and where (issue #15). Needs the
+/// Coordinator (`spaces:listMine`); the local mapping comes from `config.json`.
+pub async fn spaces() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let (url, _account_id, _device_id) = require_identity(&config)?;
+    let creds = Credentials::load()?;
+
+    let mut coordinator = env::connect(&url, creds.as_ref()).await?;
+    let spaces = coordinator.list_mine().await.context("spaces:listMine")?;
+    if spaces.is_empty() {
+        println!("no Spaces in this account yet — run `filething init` to create one.");
+        return Ok(());
+    }
+    for space in &spaces {
+        // Names are cleartext UTF-8 bytes in the MVP (`§6.2`); render lossily so
+        // a malformed name never aborts the listing.
+        let name = String::from_utf8_lossy(&space.name);
+        println!("{name}");
+        println!("  id:     {}", space.space_id);
+        match config
+            .spaces
+            .iter()
+            .find(|m| m.space_id == space.space_id.as_str())
+        {
+            Some(m) => println!("  mapped: {}", m.local_root),
+            None => println!(
+                "  mapped: no  (clone it here with `filething clone {} <dir>`)",
+                space.space_id
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `unmap <dir>` — stop syncing a Space on this Device (issue #15).
+///
+/// KEEPS the local files; only drops the mapping from `config.json` and restarts
+/// the background daemon (if installed) so it stops watching the folder. The
+/// Space and its history stay on the Coordinator and on the account's other
+/// Devices — this is a local un-mapping, not a delete. Matters most when a dead
+/// Space is bricking the daemon (issue #8): unmapping it is the escape hatch.
+pub fn unmap(dir: PathBuf) -> anyhow::Result<()> {
+    let root = normalize_abs(&dir);
+    let mut config = Config::load()?;
+    if !config.remove_space_by_root(&root.to_string_lossy()) {
+        anyhow::bail!(
+            "{} is not a Space mapped on this Device — nothing to unmap. \
+             Run `filething spaces` to see what is mapped.",
+            root.display()
+        );
+    }
+    config.save()?;
+    println!("Unmapped {} — local files kept.", root.display());
+    restart_daemon_after_unmap();
+    Ok(())
 }
 
 /// `init <dir>` — make a local folder a fresh Space and commit its first Revision
@@ -306,61 +387,139 @@ fn resolve_root(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(normalize_abs(&dir))
 }
 
-/// `status [<dir>]` — show the synced base and whether there are uncommitted
-/// local changes for the Space at `dir` (or cwd) (`docs/BUILD-PLAN.md §3`).
+/// `status [<dir>]` — show the synced base, local changes, and whether this
+/// Device is up to date with the remote (`docs/BUILD-PLAN.md §3`, issue #17).
 ///
-/// Robust + informative: it reads the local index (the source of truth for
-/// `last_synced`) and re-scans the tree to detect local changes WITHOUT a network
-/// round-trip. If the Coordinator is reachable it also reports whether the remote
-/// head has advanced past the synced base.
-pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
+/// Which Space(s) it reports:
+/// - an explicit `dir`: just that Space (errors if the folder is not a Space);
+/// - no `dir`, run INSIDE a Space: that Space;
+/// - no `dir`, NOT inside a Space: every Space mapped in `config.json` (like
+///   `metrics`), so `status` never dead-ends with "not a filething Space".
+///
+/// The local half (synced base + uncommitted changes) is computed offline from
+/// the index and a re-scan. The remote half is a best-effort verdict — `up to
+/// date` or `behind by N revisions (seq X → Y)` — so the user gets an answer to
+/// "am I up to date?" instead of a root hash next to an incomparable revision id.
+/// Raw hashes/ids are shown only with `-v` (`verbose`).
+pub async fn status(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let root = resolve_root(dir)?;
-    let space_id = env::space_id_at(&root)?;
     let (url, account_id, device_id) = require_identity(&config)?;
     let creds = Credentials::load()?;
 
-    let index = env::open_index(&root)?;
+    // Resolve the Space set + whether a per-Space failure should abort (an
+    // explicit target) or just be reported inline (the mapped-Space sweep).
+    let (roots, tolerate_errors) = match &dir {
+        Some(d) => (vec![normalize_abs(d)], false),
+        None => {
+            let cwd = resolve_root(None)?;
+            if env::existing_space_id_at(&cwd)?.is_some() {
+                (vec![cwd], false)
+            } else {
+                let mapped = config
+                    .spaces
+                    .iter()
+                    .map(|m| PathBuf::from(&m.local_root))
+                    .collect::<Vec<_>>();
+                (mapped, true)
+            }
+        }
+    };
+    if roots.is_empty() {
+        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
+        return Ok(());
+    }
 
-    // Best-effort connection: `status` must work offline, and scanning never
-    // touches the Vault — so a failed connect degrades to an [`UnavailableVault`]
-    // placeholder (mount requires one) plus "remote head: unavailable" below.
-    let client = env::connect_client(&url, creds.as_ref()).await;
-    let vault = match env::build_vault(client.as_ref().ok().cloned()).await {
+    // One best-effort connection shared across every Space: `status` must work
+    // offline (a failed connect degrades to "remote: unavailable"), and every
+    // mapped Space belongs to the same account/Coordinator, so one client serves
+    // all of them.
+    let client = env::connect_client(&url, creds.as_ref()).await.ok();
+
+    for (i, root) in roots.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let res = status_one(
+            root,
+            &account_id,
+            &device_id,
+            creds.as_ref(),
+            client.clone(),
+            verbose,
+        )
+        .await;
+        if let Err(e) = res {
+            if tolerate_errors {
+                // A mapped folder that is not (yet) a Space, or a transient read
+                // error: report it inline instead of aborting the whole listing.
+                println!("Space at {}", root.display());
+                println!("  error: {e}");
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reports one Space for [`status`]: the local synced base + change detection
+/// (offline), then the best-effort remote verdict. Errors only on a genuinely
+/// broken Space (not a Space folder, unreadable index/tree); an unreachable
+/// Coordinator is NOT an error here — it degrades to "remote: unavailable".
+async fn status_one(
+    root: &Path,
+    account_id: &AccountId,
+    device_id: &DeviceId,
+    creds: Option<&Credentials>,
+    client: Option<ConvexClient>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let space_id = env::space_id_at(root)?;
+    let index = env::open_index(root)?;
+
+    // Scanning never touches the Vault, but mounting requires one; a failed
+    // connect (or no client) degrades to the offline placeholder.
+    let vault = match env::build_vault(client.clone()).await {
         Ok(v) => v,
         Err(_) => Box::new(env::UnavailableVault),
     };
 
-    // Mount for scanning only (no Coordinator needed to detect LOCAL changes).
     let mut ctx = SpaceContext::mount(
         index,
         vault,
         Box::new(ft_fsmap::LinuxFs),
-        account_id,
-        device_id,
+        account_id.clone(),
+        device_id.clone(),
         space_id.clone(),
     )
     .context("mounting Space for status")?;
 
     // Attach crypto from the LOCAL cache so the scanned Manifest root matches the
-    // committed `alg=1` base (the block cids — and hence the root — differ under
+    // committed `alg=1` base (block cids — and hence the root — differ under
     // encryption; without the key status would always report false local changes).
-    if let Some(crypto) = env::load_space_crypto(&root, &space_id, creds.as_ref())? {
+    if let Some(crypto) = env::load_space_crypto(root, &space_id, creds)? {
         ctx.attach_crypto(crypto);
     }
 
     println!("Space {space_id}");
     println!("  local: {}", root.display());
-    println!(
-        "  last synced: seq {} root {}",
-        ctx.last_synced.seq,
-        hex32(ctx.last_synced.root.as_bytes())
-    );
 
     // Local change detection: build the scanned tree's root and compare.
     let scan = ctx.scan().context("scanning the Space")?;
     let local_root = ft_manifest::build(scan.entries.clone()).root;
     let has_local_changes = ctx.last_synced.seq < 0 || local_root != ctx.last_synced.root;
+
+    // The synced base: the seq is human-comparable; the raw root hash is noise
+    // unless verbose (issue #17).
+    if verbose {
+        println!(
+            "  synced: seq {} root {}",
+            ctx.last_synced.seq,
+            hex32(ctx.last_synced.root.as_bytes())
+        );
+    } else {
+        println!("  synced: seq {}", ctx.last_synced.seq);
+    }
     if has_local_changes {
         println!("  local changes: yes (uncommitted — run `filething sync` or the daemon)");
     } else {
@@ -370,8 +529,7 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Unresolved conflict copies still on disk (issue #14). Recognize BOTH the
     // current and legacy name formats; match on the basename so a parent dir
-    // never trips the check. A separate, minimal block — a later issue redesigns
-    // `status` output wholesale.
+    // never trips the check.
     let mut conflict_paths: Vec<&str> = scan
         .entries
         .iter()
@@ -391,37 +549,12 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
         }
     }
 
-    // Best-effort remote head check (does not fail status if the Coordinator is
-    // unreachable — status must work offline). Reuses the connection from above.
-    match client.map(ft_engine::Coordinator::from_client) {
-        Ok(mut coordinator) => match coordinator.get_space(&space_id).await {
-            Ok(space) => match space.head_revision_id {
-                Some(head) => {
-                    let behind = ctx.last_synced_revision_id.as_ref() != Some(&head);
-                    println!(
-                        "  remote head: {head}{}",
-                        if behind {
-                            " (behind — pull pending)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                None => println!("  remote head: none yet"),
-            },
-            // A deleted / inaccessible Space here is a typed CoordinatorError;
-            // show its human headline instead of the raw "Server Error" (#11).
-            Err(e) => println!(
-                "  remote head: unavailable ({})",
-                crate::errors::headline(&e)
-            ),
-        },
-        Err(e) => println!("  remote head: unavailable ({e})"),
-    }
+    // The remote verdict (issue #17): up to date / behind by N. Best-effort.
+    print_remote_verdict(client, &space_id, &ctx, verbose).await;
 
     // If the background daemon has quarantined this Space (issue #8), say so — it
     // explains why sync appears stuck even though the config looks fine.
-    let m = SyncMetrics::load(&root);
+    let m = SyncMetrics::load(root);
     if m.quarantined {
         let err = m
             .last_quarantine_error
@@ -430,6 +563,103 @@ pub async fn status(dir: Option<PathBuf>) -> anyhow::Result<()> {
         println!("  daemon: Space is QUARANTINED ({err})");
     }
     Ok(())
+}
+
+/// Prints the `remote:` line for [`status_one`] (issue #17): the human verdict
+/// comparing the local synced base to the live Space head. `client` is the
+/// shared best-effort connection; `None` or an unreachable Coordinator prints
+/// "remote: unavailable (…)" rather than failing `status`.
+async fn print_remote_verdict(
+    client: Option<ConvexClient>,
+    space_id: &SpaceId,
+    ctx: &SpaceContext,
+    verbose: bool,
+) {
+    let Some(client) = client else {
+        println!("  remote: unavailable (offline — could not reach the Coordinator)");
+        return;
+    };
+    let mut coordinator = ft_engine::Coordinator::from_client(client);
+    match read_remote_head(&mut coordinator, space_id).await {
+        Ok(head) => render_remote_verdict(ctx, &head, verbose),
+        Err(e) => {
+            // A typed Coordinator error (deleted/forbidden Space, …) → its human
+            // headline (#11); anything else → its Display.
+            let msg = crate::errors::find_coordinator_error(&e)
+                .map(crate::errors::headline)
+                .unwrap_or_else(|| e.to_string());
+            println!("  remote: unavailable ({msg})");
+        }
+    }
+}
+
+/// Reads the current remote head (id + seq + manifest root) via a one-shot head
+/// subscription — Convex pushes the current value immediately on subscribe, so
+/// the first stream item is the live head. Bounded by a short timeout so
+/// `status` never hangs on a wedged connection.
+async fn read_remote_head(
+    coordinator: &mut ft_engine::Coordinator,
+    space_id: &SpaceId,
+) -> anyhow::Result<ft_coordinator::HeadUpdate> {
+    use futures::StreamExt as _;
+    let fetch = async {
+        let mut stream = coordinator.subscribe_head(space_id).await?;
+        stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("head subscription closed before first value"))?
+            .map_err(anyhow::Error::new)
+    };
+    tokio::time::timeout(Duration::from_secs(10), fetch)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out reading the remote head"))?
+}
+
+/// Renders the `remote:` verdict text (issue #17). "Up to date" is the same
+/// equality the engine's fast-forward uses — the head `manifestRoot` equals the
+/// synced base root — so it never disagrees with what a `sync` would do. When
+/// behind, it reports the seq distance if both seqs are known and ordered. Raw
+/// ids/hashes are appended only with `-v`.
+fn render_remote_verdict(ctx: &SpaceContext, head: &ft_coordinator::HeadUpdate, verbose: bool) {
+    let local_seq = ctx.last_synced.seq;
+    match &head.manifest_root {
+        // The remote Space has no Revisions yet.
+        None => println!("  remote: no revisions yet"),
+        Some(head_root) if *head_root == ctx.last_synced.root => {
+            println!("  remote: up to date");
+        }
+        Some(head_root) => {
+            match head.seq {
+                Some(head_seq) if local_seq >= 0 && head_seq as i64 > local_seq => {
+                    let n = head_seq as i64 - local_seq;
+                    let unit = if n == 1 { "revision" } else { "revisions" };
+                    println!("  remote: behind by {n} {unit} (seq {local_seq} → {head_seq})");
+                }
+                // Roots differ but the remote is NOT strictly ahead. With a
+                // committed base at an equal-or-higher seq this is a genuine
+                // DIVERGENCE (both sides advanced to different roots), not "behind"
+                // — saying "behind" here would lie about what a pull can do.
+                Some(head_seq) if local_seq >= 0 => {
+                    println!("  remote: diverged (remote at seq {head_seq})")
+                }
+                // No committed base yet (local_seq < 0): the remote holds the only
+                // revision, so we really are behind it.
+                Some(head_seq) => println!("  remote: behind (remote at seq {head_seq})"),
+                None => println!("  remote: behind (pull pending)"),
+            }
+            if verbose {
+                let head_id = head
+                    .head_revision_id
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  remote head: {head_id} root {}",
+                    hex32(head_root.as_bytes())
+                );
+            }
+        }
+    }
 }
 
 /// `ls [<dir>]` — list the synced paths of the Space at `dir` (or cwd), read from
@@ -678,6 +908,25 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
 /// (`docs/format.md §6.3`, `docs/adr/0007`). Requires a Coordinator (retained
 /// roots + retention floor). Pass `--apply` to actually delete.
 pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::Result<()> {
+    // In the managed deployment this Device holds no direct storage credentials
+    // (S3_*); its data plane is the presigned SignedVault, which cannot `list`
+    // or `delete` across the bucket, so gc is operator-side only there. Detect
+    // that mode UP FRONT — before requiring a login, opening the index, or
+    // spending ~5s minting `vault:sign` URLs only to fail on the first `list()`
+    // with a duplicated operator-only error — and stop with a friendly note:
+    // gc is simply not this user's job in a managed deployment (issue #21).
+    if !env::direct_s3_configured() {
+        println!(
+            "gc: in the managed deployment, garbage collection runs on the operator \
+             side; you don't need to run it."
+        );
+        println!(
+            "  (gc needs direct S3_* storage credentials this Device does not have; its \
+             data plane is the one signed by the Coordinator.)"
+        );
+        return Ok(());
+    }
+
     let config = Config::load()?;
     let root = normalize_abs(&dir);
     let space_id = env::space_id_at(&root)?;
@@ -738,7 +987,7 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
 
 /// `metrics [<dir>]` — print the persisted sync counters for a Space (or every
 /// mapped Space). Reads `<root>/.filething/metrics.json` locally; no network.
-pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn metrics(dir: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     let roots: Vec<PathBuf> = match dir {
         Some(d) => vec![normalize_abs(&d)],
         None => Config::load()?
@@ -747,14 +996,25 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
             .map(|m| PathBuf::from(&m.local_root))
             .collect(),
     };
-    if roots.is_empty() {
-        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
-        return Ok(());
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    if json {
+        // A JSON array of raw values (durations in whole seconds), stable for
+        // monitoring — the humanized text below is for people (issue #18). An
+        // empty array when no Spaces are mapped, so a monitor always parses.
+        let items: Vec<serde_json::Value> = roots.iter().map(|r| metrics_json(r, now)).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&items).context("serializing metrics as JSON")?
+        );
+        return Ok(());
+    }
+    if roots.is_empty() {
+        println!("no Spaces mapped yet — run `filething init` or `clone` first.");
+        return Ok(());
+    }
     for root in roots {
         let m = SyncMetrics::load(&root);
         println!("Space at {}", root.display());
@@ -779,7 +1039,12 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
                     .as_deref()
                     .unwrap_or("unknown error");
                 match m.last_quarantine {
-                    Some(t) => println!("  QUARANTINED ({}s ago): {err}", now.saturating_sub(t)),
+                    Some(t) => {
+                        println!(
+                            "  QUARANTINED ({} ago): {err}",
+                            humanize_secs(now.saturating_sub(t))
+                        )
+                    }
                     None => println!("  QUARANTINED: {err}"),
                 }
             }
@@ -791,12 +1056,78 @@ pub fn metrics(dir: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints a unix-seconds timestamp as "<n>s ago", or "never" when absent.
+/// Prints a unix-seconds timestamp as its age in natural units ("16s ago",
+/// "4h 23m ago", "5d 22h ago"), or "never" when absent (issue #18).
 fn print_ago(label: &str, ts: Option<u64>, now: u64) {
     match ts {
-        Some(t) => println!("{label}: {}s ago", now.saturating_sub(t)),
+        Some(t) => println!("{label}: {} ago", humanize_secs(now.saturating_sub(t))),
         None => println!("{label}: never"),
     }
+}
+
+/// Formats a duration in whole seconds as its two largest natural units:
+/// `16s`, `1m 15s`, `4h 23m`, `5d 22h`. Below a minute it is a single unit; a
+/// zero lower unit is dropped (`1m`, `1h`, `1d`). For humans only — the `--json`
+/// output keeps the raw seconds (issue #18). Shared with `service` status, which
+/// humanizes the daemon's uptime the same way (issue #19).
+pub(crate) fn humanize_secs(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MIN {
+        format!("{secs}s")
+    } else if secs < HOUR {
+        let (m, s) = (secs / MIN, secs % MIN);
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    } else if secs < DAY {
+        let (h, m) = (secs / HOUR, (secs % HOUR) / MIN);
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        }
+    } else {
+        let (d, h) = (secs / DAY, (secs % DAY) / HOUR);
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d {h}h")
+        }
+    }
+}
+
+/// The `--json` view of one Space's metrics: every counter plus, for each
+/// timestamp, both the raw unix seconds (`*_at`, stable across calls) and the
+/// age in whole seconds at call time (`*_secs_ago`, what the text report
+/// humanizes). Absent timestamps serialize as `null`. `has_metrics` is false
+/// when no daemon has written a snapshot yet (issue #18).
+fn metrics_json(root: &std::path::Path, now: u64) -> serde_json::Value {
+    let m = SyncMetrics::load(root);
+    let secs_ago = |ts: Option<u64>| ts.map(|t| now.saturating_sub(t));
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "has_metrics": m != SyncMetrics::default(),
+        "commits": m.commits,
+        "pulls_applied": m.pulls_applied,
+        "conflicts": m.conflicts,
+        "feed_errors": m.feed_errors,
+        "stale_alerts": m.stale_alerts,
+        "quarantines": m.quarantines,
+        "quarantined": m.quarantined,
+        "last_quarantine_error": m.last_quarantine_error,
+        "started_at": m.started_at,
+        "started_secs_ago": secs_ago(m.started_at),
+        "last_head_seen_at": m.last_head_seen,
+        "last_head_seen_secs_ago": secs_ago(m.last_head_seen),
+        "last_commit_at": m.last_commit,
+        "last_commit_secs_ago": secs_ago(m.last_commit),
+        "last_quarantine_at": m.last_quarantine,
+        "last_quarantine_secs_ago": secs_ago(m.last_quarantine),
+    })
 }
 
 /// `service <install|uninstall|status>` — manage the daemon as an OS service.
@@ -856,6 +1187,28 @@ fn ensure_background_daemon(new_space: bool, no_daemon: bool) {
     }
 }
 
+/// Restarts the background daemon after an `unmap` so it stops watching the
+/// dropped Space (the daemon resolves its Space list fresh from `config.json` on
+/// every start — see [`crate::commands::daemon`]). Best-effort, mirroring
+/// [`ensure_background_daemon`]: skipped when the service is not installed or
+/// `FILETHING_NO_AUTO_DAEMON` is set, and any failure is a warning, never fatal
+/// — the mapping has already been removed either way.
+fn restart_daemon_after_unmap() {
+    if std::env::var("FILETHING_NO_AUTO_DAEMON")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !crate::service::is_installed() {
+        return;
+    }
+    match crate::service::restart() {
+        Ok(()) => println!("daemon: restarted to drop the unmapped Space"),
+        Err(e) => tracing::warn!("could not restart the background daemon service: {e:#}"),
+    }
+}
+
 /// Lowercase hex of a 32-byte id, for human-readable output of a `manifestRoot`.
 fn hex32(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -863,4 +1216,52 @@ fn hex32(bytes: &[u8; 32]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples from issue #18 plus the unit boundaries: below a minute is a
+    /// single unit, otherwise the two largest units, dropping a zero lower unit.
+    #[test]
+    fn humanize_secs_formats_natural_units() {
+        assert_eq!(humanize_secs(0), "0s");
+        assert_eq!(humanize_secs(16), "16s");
+        assert_eq!(humanize_secs(59), "59s");
+        assert_eq!(humanize_secs(60), "1m");
+        assert_eq!(humanize_secs(75), "1m 15s");
+        assert_eq!(humanize_secs(3600), "1h");
+        assert_eq!(humanize_secs(15_780), "4h 23m"); // 4*3600 + 23*60
+        assert_eq!(humanize_secs(86_400), "1d");
+        assert_eq!(humanize_secs(514_483), "5d 22h"); // the issue's «514483s ago»
+    }
+
+    /// The JSON view carries raw seconds: both the absolute unix timestamp and
+    /// the age, and `has_metrics` reflects whether a snapshot exists. A default
+    /// (never-run) Space reports nulls and `has_metrics: false`.
+    #[test]
+    fn metrics_json_exposes_raw_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000u64;
+
+        // No snapshot yet: has_metrics false, timestamps null.
+        let v = metrics_json(dir.path(), now);
+        assert_eq!(v["has_metrics"], serde_json::json!(false));
+        assert_eq!(v["started_at"], serde_json::Value::Null);
+        assert_eq!(v["started_secs_ago"], serde_json::Value::Null);
+
+        // With a snapshot, secs_ago is the raw difference (parseable, not "5d").
+        let m = SyncMetrics {
+            commits: 3,
+            started_at: Some(now - 514_483),
+            ..Default::default()
+        };
+        m.save(dir.path());
+        let v = metrics_json(dir.path(), now);
+        assert_eq!(v["has_metrics"], serde_json::json!(true));
+        assert_eq!(v["commits"], serde_json::json!(3));
+        assert_eq!(v["started_at"], serde_json::json!(now - 514_483));
+        assert_eq!(v["started_secs_ago"], serde_json::json!(514_483));
+    }
 }

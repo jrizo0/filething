@@ -44,6 +44,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
 
+    /// The account email this Device logged in as (`filething login --email`),
+    /// cached from `login` so `filething whoami` can show the human identity with
+    /// no network call (issue #15). Non-secret, like the ids above. Optional via
+    /// `serde(default)`: a config written before this field existed still loads
+    /// (the field is then `None`, and `whoami` shows the account id alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+
     /// The Spaces this Device syncs, each mapped one-to-one to a local folder.
     #[serde(default)]
     pub spaces: Vec<SpaceMapping>,
@@ -124,15 +132,18 @@ impl Config {
     }
 
     /// Records (or replaces) the identity learned from a `login`, including the
-    /// human-readable `device_name` used to label conflict copies (issue #14).
+    /// human-readable `device_name` used to label conflict copies (issue #14) and
+    /// the account `email` shown by `whoami` (issue #15).
     pub fn set_identity(
         &mut self,
         coordinator_url: &str,
+        email: &str,
         account_id: &str,
         device_id: &str,
         device_name: &str,
     ) {
         self.coordinator_url = Some(coordinator_url.to_string());
+        self.email = Some(email.to_string());
         self.account_id = Some(account_id.to_string());
         self.device_id = Some(device_id.to_string());
         self.device_name = Some(device_name.to_string());
@@ -149,6 +160,17 @@ impl Config {
                 local_root: local_root.to_string(),
             });
         }
+    }
+
+    /// Removes the Space mapping whose `local_root` matches (as stored, an
+    /// absolute path — callers pass a [`normalize_abs`]-ed root, the same form
+    /// [`upsert_space`](Self::upsert_space) records). Returns whether a mapping
+    /// was removed. Backing store for `filething unmap` (issue #15): it only
+    /// forgets the mapping — the local files are left untouched.
+    pub fn remove_space_by_root(&mut self, local_root: &str) -> bool {
+        let before = self.spaces.len();
+        self.spaces.retain(|m| m.local_root != local_root);
+        self.spaces.len() != before
     }
 }
 
@@ -185,7 +207,13 @@ mod tests {
         let path = dir.path().join("config.json");
 
         let mut cfg = Config::default();
-        cfg.set_identity("http://localhost:3210", "acc_1", "dev_1", "Julian's Mac");
+        cfg.set_identity(
+            "http://localhost:3210",
+            "julian@example.com",
+            "acc_1",
+            "dev_1",
+            "Julian's Mac",
+        );
         cfg.upsert_space("sp_1", "/home/u/proj");
         cfg.upsert_space("sp_2", "/home/u/notes");
         cfg.save_to(&path).unwrap();
@@ -196,6 +224,7 @@ mod tests {
             back.coordinator_url.as_deref(),
             Some("http://localhost:3210")
         );
+        assert_eq!(back.email.as_deref(), Some("julian@example.com"));
         assert_eq!(back.account_id.as_deref(), Some("acc_1"));
         assert_eq!(back.device_id.as_deref(), Some("dev_1"));
         assert_eq!(back.device_name.as_deref(), Some("Julian's Mac"));
@@ -235,6 +264,25 @@ mod tests {
         cfg.upsert_space("sp_1", "/b"); // same id -> replace, not duplicate.
         assert_eq!(cfg.spaces.len(), 1);
         assert_eq!(cfg.spaces[0].local_root, "/b");
+    }
+
+    #[test]
+    fn remove_space_by_root_removes_only_the_match() {
+        let mut cfg = Config::default();
+        cfg.upsert_space("sp_1", "/home/u/proj");
+        cfg.upsert_space("sp_2", "/home/u/notes");
+
+        // A root that is not mapped: nothing removed, list unchanged.
+        assert!(!cfg.remove_space_by_root("/home/u/other"));
+        assert_eq!(cfg.spaces.len(), 2);
+
+        // The mapped root: removed, and only it.
+        assert!(cfg.remove_space_by_root("/home/u/proj"));
+        assert_eq!(cfg.spaces.len(), 1);
+        assert_eq!(cfg.spaces[0].space_id, "sp_2");
+
+        // Removing it again is a no-op that reports false.
+        assert!(!cfg.remove_space_by_root("/home/u/proj"));
     }
 
     #[test]

@@ -368,6 +368,18 @@ pub async fn build_vault(client: Option<ConvexClient>) -> anyhow::Result<Box<dyn
     }
 }
 
+/// Whether direct storage credentials (`S3_*`) are configured for this run.
+///
+/// When true the Vault is the operator-only [`S3Vault`](ft_vault::S3Vault),
+/// which can `list`/`delete` across the bucket — the ONLY mode that supports
+/// `gc`. When false the CLI is on the managed presigned-URL data plane
+/// ([`SignedVault`](crate::signed_vault::SignedVault)), where `gc` runs
+/// operator-side only (issue #21). Reads exactly the `S3_*` vars [`build_vault`]
+/// checks, so the two always agree on which plane a run uses.
+pub fn direct_s3_configured() -> bool {
+    ft_vault::S3Config::from_env().is_some()
+}
+
 /// One [`connect`] + [`build_vault`] over the SAME authenticated connection —
 /// the standard preamble of every online subcommand.
 pub async fn connect_and_vault(

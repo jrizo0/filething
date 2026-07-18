@@ -61,6 +61,16 @@ enum Command {
         name: Option<String>,
     },
 
+    /// Show who this Device is logged in as: the account email (when known) and
+    /// id, this Device's name and id, and the Coordinator URL. Reads the local
+    /// config only — no network.
+    Whoami,
+
+    /// List the Spaces owned by the logged-in account, marking which are mapped
+    /// to a local folder on THIS Device (and where). Handy before `clone` from a
+    /// second Device, so the Space id no longer has to be copied by hand.
+    Spaces,
+
     /// Make a local folder a new Space and commit its first Revision.
     Init {
         /// The folder to turn into a Space.
@@ -89,7 +99,17 @@ enum Command {
         no_daemon: bool,
     },
 
+    /// Stop syncing a Space on this Device: KEEP the local files, remove its
+    /// mapping from `config.json`, and restart the background daemon (if
+    /// installed as a service) so it drops the Space. The Space and its history
+    /// stay on the Coordinator and on your other Devices.
+    Unmap {
+        /// The mapped Space folder to unmap.
+        dir: PathBuf,
+    },
+
     /// Show a Space's synced base and whether it has uncommitted local changes.
+    /// With no dir, outside a Space, reports every mapped Space (like `metrics`).
     Status {
         /// The Space folder (defaults to the current directory).
         dir: Option<PathBuf>,
@@ -185,12 +205,15 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or(false);
 
+    let verbose = cli.verbose;
     let result = match cli.command {
         Command::Login {
             email,
             signup,
             name,
         } => commands::login(email, signup, name).await,
+        Command::Whoami => commands::whoami(),
+        Command::Spaces => commands::spaces().await,
         Command::Init {
             dir,
             name,
@@ -202,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
             name,
             no_daemon,
         } => commands::clone(space_id, dir, name, no_daemon).await,
-        Command::Status { dir } => commands::status(dir).await,
+        Command::Unmap { dir } => commands::unmap(dir),
+        Command::Status { dir } => commands::status(dir, verbose).await,
         Command::Ls { dir } => commands::ls(dir),
         Command::Sync { dir, no_daemon } => commands::sync(dir, no_daemon).await,
         Command::Daemon { dirs } => commands::daemon(dirs).await,
@@ -566,5 +590,24 @@ mod tests {
         }
         // `service` with no action is a parse error.
         assert!(Cli::try_parse_from(["filething", "service"]).is_err());
+    }
+
+    /// `whoami` / `spaces` take no arguments; `unmap` requires a dir.
+    #[test]
+    fn parse_whoami_spaces_and_unmap() {
+        assert!(matches!(
+            Cli::parse_from(["filething", "whoami"]).command,
+            Command::Whoami
+        ));
+        assert!(matches!(
+            Cli::parse_from(["filething", "spaces"]).command,
+            Command::Spaces
+        ));
+        match Cli::parse_from(["filething", "unmap", "/home/u/proj"]).command {
+            Command::Unmap { dir } => assert_eq!(dir, PathBuf::from("/home/u/proj")),
+            other => panic!("expected Unmap, got {other:?}"),
+        }
+        // `unmap` with no dir is a parse error (the dir is required).
+        assert!(Cli::try_parse_from(["filething", "unmap"]).is_err());
     }
 }

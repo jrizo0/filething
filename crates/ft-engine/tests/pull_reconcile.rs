@@ -544,3 +544,248 @@ async fn conflict_copy_loser_block_reaches_vault_on_next_stage() {
         "loser content intact on the peer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (6) DIRECTORIES as first-class entries (ADR 0019): empty dirs materialize,
+// emptied dirs are removed, a remote dir-delete keeps a dir still holding local
+// unsynced content, and a deep chain deletes deepest-first.
+// ---------------------------------------------------------------------------
+
+/// A `FileType::Dir` manifest entry at `path` (no blocks to upload).
+fn dir_entry(path: &str) -> (CasefoldKey, FileEntry) {
+    let p = CanonicalPath(path.to_string());
+    let entry = FileEntry {
+        p: p.clone(),
+        t: FileType::Dir,
+        x: false,
+        sz: 0,
+        pcid: Pcid::new([0u8; 32]),
+        bk: vec![],
+        bk_ref: None,
+        lt: None,
+        wu: None,
+    };
+    (ft_fsmap::casefold_key(&p), entry)
+}
+
+#[tokio::test]
+async fn fast_forward_materializes_an_empty_directory() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+    let base = empty_root(&vault).await;
+    let head = build_and_upload(&vault, vec![dir_entry("emptydir")]).await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-ff-dir";
+    seed_state(&index, space_id, bdir.path(), base, -1);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+
+    let outcome = ctx.apply_head(head, Some(0), None).await.unwrap();
+    assert_eq!(outcome, PullOutcome::FastForwarded { applied: 1 });
+    assert!(
+        bdir.path().join("emptydir").is_dir(),
+        "the empty directory must materialize on the peer"
+    );
+    assert_eq!(ctx.last_synced.root, head);
+}
+
+#[tokio::test]
+async fn fast_forward_removes_an_emptied_directory() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+    // base has dir "d"; the head removed it (rmdir on the other Device).
+    let base = build_and_upload(&vault, vec![dir_entry("d")]).await;
+    let head = empty_root(&vault).await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(bdir.path().join("d")).unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-rmdir";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap(); // index reflects the local dir; root == base.
+
+    let outcome = ctx.apply_head(head, Some(1), None).await.unwrap();
+    assert_eq!(outcome, PullOutcome::FastForwarded { applied: 1 });
+    assert!(
+        !bdir.path().join("d").exists(),
+        "the emptied directory must be removed on the peer"
+    );
+}
+
+#[tokio::test]
+async fn remote_dir_delete_keeps_a_dir_that_holds_unsynced_local_content() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+    // base has dir "X"; the remote head removed it.
+    let base = build_and_upload(&vault, vec![dir_entry("X")]).await;
+    let head = empty_root(&vault).await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(bdir.path().join("X")).unwrap();
+    // An unsynced local file lives inside X (never committed anywhere).
+    write(bdir.path(), "X/keep.txt", b"local only");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dirsafe";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    // No scan-prime: X/keep.txt is a local change vs base -> the reconcile path.
+
+    let outcome = ctx.apply_head(head, Some(1), None).await.unwrap();
+    assert!(
+        matches!(outcome, PullOutcome::Reconciled { .. }),
+        "a local unsynced file forces the reconcile path"
+    );
+
+    // The dir survived (it still holds local content) and the file is intact —
+    // remove_dir must never force-delete a populated directory (ADR 0019).
+    assert!(
+        bdir.path().join("X").is_dir(),
+        "a dir with unsynced local content must be kept"
+    );
+    assert_eq!(read(bdir.path(), "X/keep.txt"), b"local only");
+}
+
+#[tokio::test]
+async fn deep_empty_dir_chain_propagates_then_deletes_deepest_first() {
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+    let base = empty_root(&vault).await;
+    // A deep chain of empty directories.
+    let head1 = build_and_upload(
+        &vault,
+        vec![dir_entry("a"), dir_entry("a/b"), dir_entry("a/b/c")],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-chain";
+    seed_state(&index, space_id, bdir.path(), base, -1);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+
+    // Pull the chain -> all three directories materialize.
+    let o1 = ctx.apply_head(head1, Some(0), None).await.unwrap();
+    assert_eq!(o1, PullOutcome::FastForwarded { applied: 3 });
+    assert!(bdir.path().join("a").join("b").join("c").is_dir());
+
+    // The whole chain is removed remotely (back to the empty tree). The
+    // deepest-first Phase-B ordering must remove all three, not leave `a`/`a/b`.
+    let o2 = ctx.apply_head(base, Some(1), None).await.unwrap();
+    assert_eq!(o2, PullOutcome::FastForwarded { applied: 3 });
+    assert!(
+        !bdir.path().join("a").exists(),
+        "the whole empty chain must be removed deepest-first"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_remote_deletes_populated_dir_tree_without_resurrection() {
+    // The RECONCILE path (a local change on an unrelated file forces it, not a
+    // fast-forward) with the remote head having deleted a POPULATED dir tree.
+    // Reconcile visits keys ascending, so the parent `a` sorts BEFORE `a/f`;
+    // executing its TakeRemoteDeletion in-loop would hit ENOTEMPTY, keep the dir
+    // + its index row, and resurrect it into the next commit — the deletion would
+    // NEVER propagate. Deferring the dir delete (deepest-first, after the loop)
+    // removes `a/f` before its parent `a`, so the whole tree really disappears.
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    // base: dir a + file a/f (a populated tree), plus an unrelated other.txt.
+    let base = build_and_upload(
+        &vault,
+        vec![
+            dir_entry("a"),
+            file_entry_uploaded(&vault, "a/f", b"inside", false).await,
+            file_entry_uploaded(&vault, "other.txt", b"O0", false).await,
+        ],
+    )
+    .await;
+    // remote head: the whole a/ tree deleted; other.txt unchanged.
+    let remote = build_and_upload(
+        &vault,
+        vec![file_entry_uploaded(&vault, "other.txt", b"O0", false).await],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(bdir.path().join("a")).unwrap();
+    write(bdir.path(), "a/f", b"inside");
+    write(bdir.path(), "other.txt", b"O0");
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dirtree-del";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap(); // index reflects base; local root == base.
+
+    // A local edit on the UNRELATED file forces the reconcile branch while the
+    // a/ tree still matches the base (so it resolves to TakeRemoteDeletion).
+    write(bdir.path(), "other.txt", b"O_LOCAL");
+
+    let outcome = ctx.apply_head(remote, Some(1), None).await.unwrap();
+    assert!(
+        matches!(outcome, PullOutcome::Reconciled { .. }),
+        "the unrelated local edit forces the reconcile path"
+    );
+
+    // The whole populated tree is gone from disk, with no error.
+    assert!(!bdir.path().join("a").join("f").exists(), "a/f deleted");
+    assert!(
+        !bdir.path().join("a").exists(),
+        "the parent dir a must be deleted too (no ENOTEMPTY resurrection)"
+    );
+
+    // The regression assertion: B's next scan must NOT re-emit `a` — a resurrected
+    // dir row would re-publish a deletion that never propagates.
+    let scan = ctx.scan().unwrap();
+    assert!(
+        !scan.entries.iter().any(|(_, e)| e.p.as_str() == "a"),
+        "the deleted dir must not resurrect in the next scan"
+    );
+}
+
+#[tokio::test]
+async fn fast_forward_dir_gains_then_loses_content() {
+    // Cross-device pipeline: an empty dir `d` in the base gains a child `d/file.txt`
+    // in the head (fast-forward materializes both), then the head drops the file
+    // but keeps `d` (fast-forward removes only the file, the dir stays).
+    let vdir = tempfile::tempdir().unwrap();
+    let vault = FsVault::new(vdir.path());
+
+    let base = build_and_upload(&vault, vec![dir_entry("d")]).await;
+    let head1 = build_and_upload(
+        &vault,
+        vec![
+            dir_entry("d"),
+            file_entry_uploaded(&vault, "d/file.txt", b"content", false).await,
+        ],
+    )
+    .await;
+
+    let bdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(bdir.path().join("d")).unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dir-content";
+    seed_state(&index, space_id, bdir.path(), base, 0);
+    let mut ctx = mount(index, Box::new(FsVault::new(vdir.path())), space_id);
+    ctx.scan().unwrap(); // index reflects the empty dir d; root == base.
+
+    // The dir gains a file: both exist on disk after the fast-forward.
+    let o1 = ctx.apply_head(head1, Some(1), None).await.unwrap();
+    assert_eq!(o1, PullOutcome::FastForwarded { applied: 1 });
+    assert!(bdir.path().join("d").is_dir());
+    assert_eq!(read(bdir.path(), "d/file.txt"), b"content");
+
+    // Reverse: the head drops the file but keeps the dir.
+    let o2 = ctx.apply_head(base, Some(2), None).await.unwrap();
+    assert_eq!(o2, PullOutcome::FastForwarded { applied: 1 });
+    assert!(
+        !bdir.path().join("d").join("file.txt").exists(),
+        "the file must be gone"
+    );
+    assert!(
+        bdir.path().join("d").is_dir(),
+        "the now-empty dir must remain (only the file was deleted)"
+    );
+}

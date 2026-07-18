@@ -147,19 +147,23 @@ fn scan_classifies_files_exec_and_skips_control_dir() {
 
     let scan = ctx.scan().unwrap();
 
-    // The three real files appear; nothing under .filething/ does.
+    // The three real files appear; the `src` and `scripts` directories are now
+    // first-class entries too (ADR 0019); nothing under .filething/ does, and the
+    // control dir itself is never an entry.
     let paths: Vec<&str> = scan.entries.iter().map(|(_, e)| e.p.as_str()).collect();
     assert!(paths.contains(&"readme.md"));
+    assert!(paths.contains(&"src"));
     assert!(paths.contains(&"src/main.rs"));
+    assert!(paths.contains(&"scripts"));
     assert!(paths.contains(&"scripts/run.sh"));
     assert_eq!(
         scan.entries.len(),
-        3,
-        "control dir must be skipped: {paths:?}"
+        5,
+        "three files + the src and scripts directories: {paths:?}"
     );
     assert!(
         !paths.iter().any(|p| p.starts_with(".filething")),
-        "no .filething/ path may be synced"
+        "no .filething/ path may be synced (the control dir is never an entry)"
     );
 
     // Canonical paths are forward-slash, relative, byte-exact.
@@ -796,4 +800,79 @@ fn scan_without_crypto_stays_cleartext_alg0() {
     assert_eq!(ft_block::cid_of_object(obj).unwrap(), *cid);
     let (header, _payload) = ft_block::decode(obj).unwrap();
     assert_eq!(header.alg, ft_core::ALG_CLEARTEXT);
+}
+
+// ---------------------------------------------------------------------------
+// Directories as first-class entries (ADR 0019): the scanner emits a t=3 entry
+// for every plain directory (empty or not) and keeps descending; the derived
+// check still wins for node_modules/ etc.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_emits_empty_and_nonempty_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // An empty directory, and a non-empty one holding a file.
+    std::fs::create_dir_all(root.join("emptydir")).unwrap();
+    write_file(root, "full/f.txt", b"hi", false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dirs";
+    seed_space_state(&index, space_id, root, [0x77; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let scan = ctx.scan().unwrap();
+
+    // The empty directory is a t=3 entry with no blocks.
+    let empty = entry_for(&scan.entries, "emptydir").expect("empty dir must be an entry");
+    assert_eq!(empty.t, FileType::Dir);
+    assert!(empty.bk.is_empty());
+    assert_eq!(empty.sz, 0);
+
+    // The non-empty directory is ALSO an entry, and the walk descended into it.
+    let full = entry_for(&scan.entries, "full").expect("dir must be an entry");
+    assert_eq!(full.t, FileType::Dir);
+    let f = entry_for(&scan.entries, "full/f.txt").expect("child file must be an entry");
+    assert_eq!(f.t, FileType::File);
+
+    // The index row for the empty dir is tracked and NOT local_only (it syncs).
+    let row = ctx
+        .index
+        .get_entry(space_id, &CanonicalPath("emptydir".to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.file_type, FileType::Dir);
+    assert!(!row.local_only, "a synced directory is not local_only");
+}
+
+#[test]
+fn scan_dir_entry_persists_when_it_gains_and_loses_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("d")).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-dir-lifecycle";
+    seed_space_state(&index, space_id, root, [0x88; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    // Empty dir -> one Dir entry.
+    let s1 = ctx.scan().unwrap();
+    assert_eq!(entry_for(&s1.entries, "d").unwrap().t, FileType::Dir);
+    assert!(entry_for(&s1.entries, "d/x.txt").is_none());
+
+    // Gains a file -> the dir entry REMAINS and the file appears.
+    write_file(root, "d/x.txt", b"x", false);
+    let s2 = ctx.scan().unwrap();
+    assert_eq!(entry_for(&s2.entries, "d").unwrap().t, FileType::Dir);
+    assert_eq!(entry_for(&s2.entries, "d/x.txt").unwrap().t, FileType::File);
+
+    // Loses the file again -> the dir entry STAYS; only the file drops out.
+    std::fs::remove_file(root.join("d").join("x.txt")).unwrap();
+    let s3 = ctx.scan().unwrap();
+    assert_eq!(entry_for(&s3.entries, "d").unwrap().t, FileType::Dir);
+    assert!(entry_for(&s3.entries, "d/x.txt").is_none());
 }

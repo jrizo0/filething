@@ -20,6 +20,9 @@
 //!     KEPT OUT of the Manifest;
 //!   - **Derived** (`t=2`): a `t=2` FileEntry with empty `bk` and no uploaded
 //!     bytes; the walk does NOT descend into a derived directory.
+//!   - **Dir** (`t=3`): a plain directory as a first-class `t=3` FileEntry (empty
+//!     `bk`, no bytes) so empty directories sync (ADR 0019); the walk DOES descend
+//!     into it. The Space root itself is never an entry.
 //!
 //! It then upserts the local-index path rows (`upsert_entry`) and DELETES index
 //! rows whose path vanished from disk (so they drop out of the next Manifest — a
@@ -140,6 +143,9 @@ impl SpaceContext {
                 FileType::Derived => {
                     self.handle_derived(&item, base_seq, &mut result)?;
                 }
+                FileType::Dir => {
+                    self.handle_dir(&item, base_seq, &mut result)?;
+                }
             }
         }
 
@@ -245,12 +251,10 @@ impl SpaceContext {
                 continue;
             }
 
-            // Plain directories are implicit in the Manifest (path → blocks): we
-            // descend but emit no FileEntry for the directory node itself.
-            if meta.is_dir() {
-                continue;
-            }
-
+            // A plain directory is a first-class entry (ADR 0019) so empty
+            // directories sync: emit a WalkItem for it AND keep descending (unlike
+            // a derived dir, which is not descended). The Space root is never an
+            // entry (skipped above). `classify` maps it to `FileType::Dir`.
             let key = casefold_key(&canonical);
             out.push(Ok(WalkItem {
                 abs,
@@ -458,6 +462,43 @@ impl SpaceContext {
                 base_seq,
                 blocks: Vec::new(),
                 local_only: true, // derived bytes are not synced (§5.1, §9).
+            },
+        )?;
+        result.entries.push((item.key.clone(), entry));
+        Ok(())
+    }
+
+    /// Dir (`t=3`): a plain directory tracked as a first-class entry so empty
+    /// directories sync (ADR 0019). Only `p`/`t` are meaningful; no bytes travel.
+    /// Mirrors [`handle_derived`](Self::handle_derived) but the index row is NOT
+    /// `local_only` (dirs DO enter the Manifest and sync) and carries no `pcid`.
+    fn handle_dir(&self, item: &WalkItem, base_seq: i64, result: &mut ScanResult) -> Result<()> {
+        let space_id = self.space_id.as_str();
+        let entry = FileEntry {
+            p: item.canonical.clone(),
+            t: FileType::Dir,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: Vec::new(),
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+        let mtime = self.mtime_secs(&item.abs);
+        self.index.upsert_entry(
+            space_id,
+            &LocalEntry {
+                path: item.canonical.clone(),
+                casefold_key: item.key.clone(),
+                file_type: FileType::Dir,
+                exec: false,
+                size: 0,
+                mtime,
+                pcid: None,
+                base_seq,
+                blocks: Vec::new(),
+                local_only: false, // dirs DO sync (ADR 0019), unlike derived.
             },
         )?;
         result.entries.push((item.key.clone(), entry));

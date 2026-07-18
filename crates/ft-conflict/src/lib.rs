@@ -10,9 +10,9 @@
 //!
 //! "Changed against base" is decided CAUSALLY, by type-keyed content identity
 //! (`pcid` + exec bit `x` for files, literal target `lt` for symlinks, type
-//! alone for derived) — NEVER by clock/`mtime` (a project decision; `mtime` only
-//! speeds the re-scan). A type change (file <-> symlink <-> derived) is itself a
-//! change. The decision table (`§10`):
+//! alone for derived and dir) — NEVER by clock/`mtime` (a project decision;
+//! `mtime` only speeds the re-scan). A type change (file <-> symlink <-> derived
+//! <-> dir) is itself a change. The decision table (`§10`):
 //!
 //! | local | remote | outcome |
 //! |-------|--------|---------|
@@ -93,8 +93,10 @@ pub enum Resolution {
 ///   (contentless) `pcid` is still a real change.
 /// - [`FileType::Derived`] — nothing beyond the type: derived paths carry no
 ///   content, so two derived entries are always equivalent.
+/// - [`FileType::Dir`] — nothing beyond the type: a directory entry carries no
+///   content (ADR 0019), so two dir entries at one path are always equivalent.
 ///
-/// A change of TYPE itself (file <-> symlink <-> derived) is never "same
+/// A change of TYPE itself (file <-> symlink <-> derived <-> dir) is never "same
 /// content". This is causal, never the clock (`mtime` is never consulted, `§10`).
 #[inline]
 fn same_content(a: &FileEntry, b: &FileEntry) -> bool {
@@ -102,7 +104,7 @@ fn same_content(a: &FileEntry, b: &FileEntry) -> bool {
         && match a.t {
             FileType::File => a.pcid == b.pcid && a.x == b.x,
             FileType::Symlink => a.lt == b.lt,
-            FileType::Derived => true,
+            FileType::Derived | FileType::Dir => true,
         }
 }
 

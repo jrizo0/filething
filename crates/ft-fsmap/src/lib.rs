@@ -231,15 +231,20 @@ pub fn is_derived(path: &Path) -> bool {
 ///
 /// A Derived path (per [`is_derived`]) wins regardless of `meta`: it is recorded
 /// as `Derived` with an empty `bk` and its bytes never travel. Otherwise a
-/// symlink (`meta.is_symlink()`) is `Symlink` and everything else is `File`.
+/// symlink (`meta.is_symlink()`) is `Symlink`, a plain directory is `Dir` (a
+/// first-class entry so empty directories sync, ADR 0019) and everything else is
+/// `File`.
 ///
 /// `meta` must come from a NON-following stat (`fs::symlink_metadata`), so that a
-/// symlink reports as a symlink rather than as its target.
+/// symlink reports as a symlink rather than as its target. The derived check
+/// stays first so `node_modules/` etc. remain `Derived`, never `Dir`.
 pub fn classify(meta: &fs::Metadata, path: &Path) -> FileType {
     if is_derived(path) {
         FileType::Derived
     } else if meta.is_symlink() {
         FileType::Symlink
+    } else if meta.is_dir() {
+        FileType::Dir
     } else {
         FileType::File
     }

@@ -15,8 +15,14 @@
 //! (`ft_block::verify`, `§4.3`), decodes and concatenates the payloads IN ORDER,
 //! and writes the bytes through the [`OsFs`] adapter (honoring the executable
 //! bit). Symlinks (`t=1`) are recreated from their literal target `lt`; Derived
-//! entries (`t=2`) materialize no bytes. [`apply`] drives a slice of [`Change`]s:
-//! Added/Modified materialize, Deleted removes the file from the filesystem.
+//! entries (`t=2`) materialize no bytes; Dir entries (`t=3`) create the directory
+//! itself so empty directories sync (ADR 0019). [`apply`] drives a slice of
+//! [`Change`]s in FOUR ordered phases (ADR 0019) so a batch mixing type
+//! transitions and deletes converges without a racy `ENOTEMPTY`: (1) non-dir→dir
+//! transitions shallowest-first, (2) the concurrent bulk of adds/mods/non-dir
+//! deletes, (3) dir deletions deepest-first (empty-only, never recursive), then
+//! (4) dir→non-dir transitions — run last so the dir's children are already gone
+//! and its `remove_dir` succeeds. See [`apply`] for the full rationale.
 
 use std::path::{Path, PathBuf};
 
@@ -446,15 +452,17 @@ fn key_of(e: &FileEntry) -> CasefoldKey {
 /// - **Symlink** — the literal target `lt` (its `pcid` is contentless).
 /// - **Derived** — type alone (its bytes never travel, so two derived entries at
 ///   one path are equivalent).
+/// - **Dir** — type alone (a directory entry carries no content, ADR 0019, so two
+///   dir entries at one path are equivalent).
 ///
-/// A change of TYPE itself (file <-> symlink <-> derived) is never the same
-/// identity. `mtime` is never consulted (`§10`).
+/// A change of TYPE itself (file <-> symlink <-> derived <-> dir) is never the
+/// same identity. `mtime` is never consulted (`§10`).
 fn same_identity(a: &FileEntry, b: &FileEntry) -> bool {
     a.t == b.t
         && match a.t {
             ft_core::FileType::File => a.pcid == b.pcid && a.x == b.x,
             ft_core::FileType::Symlink => a.lt == b.lt,
-            ft_core::FileType::Derived => true,
+            ft_core::FileType::Derived | ft_core::FileType::Dir => true,
         }
 }
 
@@ -474,9 +482,14 @@ fn same_identity(a: &FileEntry, b: &FileEntry) -> bool {
 /// - **Symlink** (`t=1`): recreates the symlink at the entry's path pointing at
 ///   its literal target `lt` (no bytes downloaded).
 /// - **Derived** (`t=2`): materializes nothing (its bytes never travel, `§5.1`).
+/// - **Dir** (`t=3`): creates the directory (idempotent `create_dir_all`), so an
+///   empty directory syncs (ADR 0019). A file/symlink already at the path is
+///   removed first (file->dir transition); an existing dir is left untouched.
 ///
 /// The on-disk path is `space_root` joined with the entry's canonical path; any
-/// missing parent directories are created first.
+/// missing parent directories are created first. A `File` whose path is currently
+/// an empty directory (dir->file transition) has that dir removed first; a
+/// non-empty dir there surfaces an error rather than being force-removed.
 ///
 /// `crypto` carries the Space's key material when runtime encryption is ON:
 /// `alg=1` Block objects are decrypted with it (unwrapping each data key from its
@@ -508,6 +521,23 @@ pub async fn materialize(
         }
         ft_core::FileType::Derived => {
             // Derived bytes never travel; nothing to materialize. `§5.1`.
+            Ok(())
+        }
+        ft_core::FileType::Dir => {
+            // A directory entry carries no content (ADR 0019): create the
+            // directory (and any missing parents). `create_dir_all` is idempotent,
+            // so an already-present dir is a no-op and its contents are left
+            // untouched. If a FILE or symlink currently occupies the path
+            // (file->dir transition), remove it first so the mkdir does not fail
+            // EEXIST — mirroring the idempotent-replace philosophy (`BUG 1`).
+            ensure_parent(fs, &dest)?;
+            if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+                if !meta.file_type().is_dir() {
+                    remove_path(&dest)?;
+                }
+            }
+            std::fs::create_dir_all(&dest)
+                .map_err(|source| Error::Fs(ft_fsmap::FsMapError::Io(source)))?;
             Ok(())
         }
         ft_core::FileType::File => {
@@ -652,12 +682,37 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 /// `alg=1` Block can be decrypted; `None` keeps the cleartext path (see
 /// [`materialize`]).
 ///
-/// The changes run CONCURRENTLY (`buffer_unordered`, bounded to 8 in flight):
-/// `changes` comes from a single [`diff`] call, whose merge-join emits at most one
-/// `Change` per [`CasefoldKey`](ft_core::CasefoldKey) — every change here targets
-/// a DIFFERENT path, so materializing/removing them in parallel touches disjoint
-/// files and is safe. Aborts on the first error (a later change may still be
-/// in flight when that happens; `apply` is not resumable mid-batch either way).
+/// The batch runs in FOUR ordered phases (ADR 0019). Type transitions between a
+/// directory and a non-directory at one path race the child changes of that dir
+/// unless deletes and transitions are sequenced around the concurrent bulk, so:
+///
+/// - **Phase 1** (SEQUENTIAL, path depth ASCENDING): every `Modified` that turns
+///   a file/symlink INTO a dir (`old.t != Dir && new.t == Dir`). Shallowest-first
+///   so a parent dir exists before a child's transition; `materialize` removes the
+///   occupant and `create_dir_all`s the directory.
+/// - **Phase 2** (CONCURRENT, `buffer_unordered` bounded to 8): every `Added`,
+///   every `Modified` where NEITHER side is a `Dir`, and every `Deleted` of a
+///   NON-`Dir` entry. `changes` comes from a single [`diff`], whose merge-join
+///   emits at most one `Change` per [`CasefoldKey`](ft_core::CasefoldKey), so each
+///   targets a DIFFERENT path and `materialize` creates parents idempotently — no
+///   intra-phase ordering is needed.
+/// - **Phase 3** (SEQUENTIAL, path depth DESCENDING): every `Deleted` of a `Dir`
+///   entry, deepest-first so a parent is only removed once its now-deleted children
+///   are gone. Each uses `remove_dir` (never `remove_dir_all`): NotFound is a
+///   no-op and a still-populated directory (local unsynced content) is a SILENT
+///   keep, so a dir is never force-deleted.
+/// - **Phase 4** (SEQUENTIAL): every `Modified` that turns a dir INTO a
+///   file/symlink (`old.t == Dir && new.t != Dir`). Run AFTER Phase 3 so the dir's
+///   children (deleted above) are gone and `materialize`'s `remove_dir` of the now
+///   empty dir succeeds. If the dir is STILL non-empty here (local unsynced
+///   children), `materialize` surfaces the error rather than recursively deleting —
+///   the batch aborts with a typed error, never silent data loss.
+///
+/// (A `Modified` with `old.t == Dir && new.t == Dir` never occurs: `same_identity`
+/// for a `Dir` is type-only, so two dir entries at one key are never a change.)
+///
+/// Aborts on the first error (a later change may still be in flight when that
+/// happens; `apply` is not resumable mid-batch either way).
 pub async fn apply(
     vault: &dyn Vault,
     fs: &dyn OsFs,
@@ -673,8 +728,49 @@ pub async fn apply(
     tracing::info!(total, "applying changes");
     let started = Instant::now();
     let completed = AtomicUsize::new(0);
+    let bump = |completed: &AtomicUsize| {
+        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(25) {
+            tracing::info!(completed = n, total, "applying changes");
+        }
+    };
+    let bump = &bump;
 
-    stream::iter(changes.iter())
+    let is_dir = ft_core::FileType::Dir;
+
+    // Partition into the four phases (see the fn doc).
+    let mut phase1_to_dir: Vec<&Change> = Vec::new(); // Modified: *->Dir
+    let mut phase2_concurrent: Vec<&Change> = Vec::new(); // adds/mods(non-dir)/non-dir deletes
+    let mut phase3_dir_deletes: Vec<&FileEntry> = Vec::new(); // Deleted(Dir)
+    let mut phase4_from_dir: Vec<&Change> = Vec::new(); // Modified: Dir->*
+    for change in changes {
+        match change {
+            Change::Modified { old, new } if new.t == is_dir && old.t != is_dir => {
+                phase1_to_dir.push(change);
+            }
+            Change::Modified { old, new } if old.t == is_dir && new.t != is_dir => {
+                phase4_from_dir.push(change);
+            }
+            Change::Deleted(entry) if entry.t == is_dir => phase3_dir_deletes.push(entry),
+            _ => phase2_concurrent.push(change),
+        }
+    }
+
+    // Phase 1 — file/symlink -> dir transitions, shallowest-first so a parent dir
+    // exists before a child's transition.
+    phase1_to_dir.sort_by_key(|c| match c {
+        Change::Modified { new, .. } => path_depth(&new.p),
+        _ => 0,
+    });
+    for change in &phase1_to_dir {
+        if let Change::Modified { new, .. } = change {
+            materialize(vault, fs, space_root, new, crypto).await?;
+            bump(&completed);
+        }
+    }
+
+    // Phase 2 — concurrent adds/mods (non-dir) + non-dir deletes.
+    stream::iter(phase2_concurrent)
         .map(|change| {
             let completed = &completed;
             async move {
@@ -687,16 +783,33 @@ pub async fn apply(
                         remove_path(&dest)?;
                     }
                 }
-                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_multiple_of(25) {
-                    tracing::info!(completed = n, total, "applying changes");
-                }
+                bump(completed);
                 Result::Ok(())
             }
         })
         .buffer_unordered(8)
         .try_collect::<Vec<()>>()
         .await?;
+
+    // Phase 3 — dir deletions deepest-first so a parent is only removed after its
+    // (now-deleted) children.
+    phase3_dir_deletes.sort_by_key(|d| std::cmp::Reverse(path_depth(&d.p)));
+    for entry in phase3_dir_deletes {
+        let dest = join_canonical(space_root, entry);
+        remove_dir_if_empty(&dest)?;
+        bump(&completed);
+    }
+
+    // Phase 4 — dir -> file/symlink transitions, AFTER all deletes so the dir is
+    // empty and materialize's remove_dir succeeds. A dir that is STILL non-empty
+    // (local unsynced children) surfaces materialize's error — never recursive
+    // deletion.
+    for change in &phase4_from_dir {
+        if let Change::Modified { new, .. } = change {
+            materialize(vault, fs, space_root, new, crypto).await?;
+            bump(&completed);
+        }
+    }
 
     tracing::info!(
         total,
@@ -706,11 +819,65 @@ pub async fn apply(
     Ok(())
 }
 
-/// Removes a file or symlink at `dest`; an absent path is a no-op.
+/// Number of path components in a canonical path — its directory depth. Used to
+/// order `Dir` deletions deepest-first so a parent is removed after its children.
+fn path_depth(p: &ft_core::CanonicalPath) -> usize {
+    p.as_str().split('/').filter(|s| !s.is_empty()).count()
+}
+
+/// Removes whatever occupies `dest` — a regular file or symlink via `remove_file`
+/// (which never follows the link), a real directory via `remove_dir` — so a
+/// materialize can replace a path across a type transition (dir->file, file->dir).
+/// An absent path is a no-op (a delete is idempotent). A NON-EMPTY directory is
+/// NEVER force-removed: `remove_dir`'s `DirectoryNotEmpty` surfaces as an error,
+/// so unsynced local content under a path that is turning into a file is never
+/// destroyed (`remove_dir_all` is deliberately not used). A symlink to a directory
+/// is removed as a link, not followed, because the type is read from the
+/// non-following `symlink_metadata`.
 fn remove_path(dest: &Path) -> Result<()> {
-    match std::fs::remove_file(dest) {
+    let is_dir = match std::fs::symlink_metadata(dest) {
+        Ok(meta) => meta.file_type().is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::Remove {
+                path: dest.display().to_string(),
+                source,
+            })
+        }
+    };
+    let result = if is_dir {
+        std::fs::remove_dir(dest)
+    } else {
+        std::fs::remove_file(dest)
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Remove {
+            path: dest.display().to_string(),
+            source,
+        }),
+    }
+}
+
+/// True if `e` reports a non-empty directory (`remove_dir` on a dir that still has
+/// entries). `ErrorKind::DirectoryNotEmpty` is the portable signal; the raw
+/// `ENOTEMPTY` is checked as a fallback for toolchains that still map it to
+/// `ErrorKind::Other` — `39` on Linux, `66` on macOS/BSD.
+fn is_dir_not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || matches!(e.raw_os_error(), Some(39) | Some(66))
+}
+
+/// Removes an empty directory at `dest` for a `Change::Deleted` of a `Dir` entry
+/// (ADR 0019). NotFound is a no-op; a directory that still holds local (unsynced)
+/// content is a SILENT keep — it must never be force-deleted, and the next commit
+/// re-adds the entry. Any other error surfaces. `remove_dir_all` is never used.
+fn remove_dir_if_empty(dest: &Path) -> Result<()> {
+    match std::fs::remove_dir(dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if is_dir_not_empty(&e) => Ok(()),
         Err(source) => Err(Error::Remove {
             path: dest.display().to_string(),
             source,
@@ -1720,5 +1887,314 @@ mod tests {
     /// True if `haystack` contains `needle` as a contiguous subslice.
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // -----------------------------------------------------------------------
+    // Directories as first-class entries (ADR 0019): materialize creates them,
+    // Deleted removes only EMPTY dirs (deepest-first), type transitions replace.
+    // -----------------------------------------------------------------------
+
+    /// A `FileType::Dir` entry at `name`: no content, only `p`/`t` meaningful.
+    fn dir_entry(name: &str) -> FileEntry {
+        FileEntry {
+            p: CanonicalPath(name.to_string()),
+            t: FileType::Dir,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: vec![],
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        }
+    }
+
+    /// The same, as a `(CasefoldKey, FileEntry)` pair for `build`.
+    fn dir_entry_kv(name: &str) -> (CasefoldKey, FileEntry) {
+        let e = dir_entry(name);
+        (ft_fsmap::casefold_key(&e.p), e)
+    }
+
+    #[tokio::test]
+    async fn materialize_dir_creates_the_directory() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        materialize(
+            &vault,
+            &fs,
+            space_dir.path(),
+            &dir_entry("empty/nested"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(space_dir.path().join("empty").join("nested").is_dir());
+    }
+
+    #[tokio::test]
+    async fn materialize_dir_replaces_a_file_at_the_path() {
+        // file->dir transition: a regular file at "p" becomes a directory.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (fe, _c) = upload_multiblock_file(&vault, "p", &[b"i was a file" as &[u8]]).await;
+        materialize(&vault, &fs, space_dir.path(), &fe, None)
+            .await
+            .unwrap();
+        assert!(space_dir.path().join("p").is_file());
+
+        materialize(&vault, &fs, space_dir.path(), &dir_entry("p"), None)
+            .await
+            .unwrap();
+        assert!(
+            space_dir.path().join("p").is_dir(),
+            "the file must be replaced by a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_file_replaces_an_empty_directory_at_the_path() {
+        // dir->file transition: an EMPTY directory at "q" becomes a regular file.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        std::fs::create_dir_all(space_dir.path().join("q")).unwrap();
+        let (fe, content) = upload_multiblock_file(&vault, "q", &[b"now a file" as &[u8]]).await;
+        materialize(&vault, &fs, space_dir.path(), &fe, None)
+            .await
+            .unwrap();
+
+        let meta = std::fs::symlink_metadata(space_dir.path().join("q")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the empty dir must be replaced by a regular file"
+        );
+        assert_eq!(std::fs::read(space_dir.path().join("q")).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn apply_delete_removes_an_empty_directory_and_is_idempotent() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        std::fs::create_dir_all(space_dir.path().join("gone")).unwrap();
+        let change = [Change::Deleted(dir_entry("gone"))];
+        apply(&vault, &fs, space_dir.path(), &change, None)
+            .await
+            .unwrap();
+        assert!(!space_dir.path().join("gone").exists());
+        // Re-applying the same deletion is a no-op (NotFound).
+        apply(&vault, &fs, space_dir.path(), &change, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_delete_keeps_a_nonempty_directory_silently() {
+        // A dir the remote deleted but which still holds LOCAL unsynced content
+        // must be kept — never force-deleted — and must not abort the batch.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        std::fs::create_dir_all(space_dir.path().join("keepme")).unwrap();
+        std::fs::write(space_dir.path().join("keepme").join("local.txt"), b"local").unwrap();
+
+        // Delete the dir AND, after it, add an unrelated sentinel file: if the
+        // ENOTEMPTY aborted the batch the sentinel would never land.
+        let (sentinel, sentinel_bytes) =
+            upload_multiblock_file(&vault, "after.txt", &[b"i must exist" as &[u8]]).await;
+        apply(
+            &vault,
+            &fs,
+            space_dir.path(),
+            &[
+                Change::Deleted(dir_entry("keepme")),
+                Change::Added(sentinel),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(space_dir.path().join("keepme").is_dir(), "dir kept");
+        assert!(
+            space_dir.path().join("keepme").join("local.txt").exists(),
+            "unsynced local content kept"
+        );
+        assert_eq!(
+            std::fs::read(space_dir.path().join("after.txt")).unwrap(),
+            sentinel_bytes,
+            "batch must not have aborted on the kept dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_deletes_nested_dirs_deepest_first() {
+        // The whole chain a/b/c (all empty) is deleted in one batch. Only a
+        // deepest-first order removes all three: deleting `a` before `a/b/c` would
+        // hit ENOTEMPTY and (silently) keep it.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        std::fs::create_dir_all(space_dir.path().join("a").join("b").join("c")).unwrap();
+        // Deliberately shallow-first in the input to prove apply reorders.
+        let changes = [
+            Change::Deleted(dir_entry("a")),
+            Change::Deleted(dir_entry("a/b")),
+            Change::Deleted(dir_entry("a/b/c")),
+        ];
+        apply(&vault, &fs, space_dir.path(), &changes, None)
+            .await
+            .unwrap();
+        assert!(
+            !space_dir.path().join("a").exists(),
+            "the whole empty chain must be removed deepest-first"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_manifest_without_dirs_diffs_and_applies_against_a_tree_with_dirs() {
+        // A pre-ADR-0018 manifest holds only file entries (directories implicit).
+        // Diffing it against a new tree that ALSO carries explicit dir entries must
+        // surface the dirs as plain Additions; apply then creates them. And a diff
+        // of the old tree against itself is empty (absence decodes fine).
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let old = build(vec![file_entry("a/b/c.txt", 1), file_entry("a/b/d.txt", 2)]);
+        let new = build(vec![
+            dir_entry_kv("a"),
+            dir_entry_kv("a/b"),
+            file_entry("a/b/c.txt", 1),
+            file_entry("a/b/d.txt", 2),
+        ]);
+        upload_manifest(&vault, &old).await;
+        upload_manifest(&vault, &new).await;
+
+        let changes = diff(&vault, &old.root, &new.root).await.unwrap();
+        assert_eq!(changed_paths(&changes), vec!["A:a", "A:a/b"]);
+
+        let same = diff(&vault, &old.root, &old.root).await.unwrap();
+        assert!(
+            same.is_empty(),
+            "diff of an old manifest with itself is empty"
+        );
+
+        apply(&vault, &fs, space_dir.path(), &changes, None)
+            .await
+            .unwrap();
+        assert!(space_dir.path().join("a").is_dir());
+        assert!(space_dir.path().join("a").join("b").is_dir());
+    }
+
+    // -----------------------------------------------------------------------
+    // (ADR 0019 phase ordering) A single batch that mixes child deletes with a
+    // dir<->file transition at the SAME path must converge deterministically. The
+    // old 2-phase apply ran the transition CONCURRENTLY with the child changes and
+    // was racy (ENOTEMPTY on the dir->file remove_dir; a stale file under a
+    // file->dir add). The four-phase ordering makes both cases deterministic.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn apply_mixed_batch_dir_to_file_with_child_deletes() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        // On disk: d/ is a directory holding a file child.txt and an empty subdir
+        // s/. The head turns d itself into a regular FILE and drops both children.
+        std::fs::create_dir_all(space_dir.path().join("d").join("s")).unwrap();
+        std::fs::write(space_dir.path().join("d").join("child.txt"), b"child").unwrap();
+
+        let (d_file, d_content) =
+            upload_multiblock_file(&vault, "d", &[b"i am now a regular file" as &[u8]]).await;
+
+        // Deliberately shuffled so the batch cannot rely on input order: the
+        // dir->file Modified appears BEFORE the child deletes it depends on.
+        let changes = [
+            Change::Modified {
+                old: dir_entry("d"),
+                new: d_file,
+            },
+            Change::Deleted(dir_entry("d/s")),
+            Change::Deleted(file_entry("d/child.txt", 5).1),
+        ];
+        apply(&vault, &fs, space_dir.path(), &changes, None)
+            .await
+            .unwrap();
+
+        // d ends as a regular file with exactly the head's bytes: Phase 2/3 emptied
+        // it (child.txt removed, s/ rmdir'd) before Phase 4's dir->file transition.
+        let meta = std::fs::symlink_metadata(space_dir.path().join("d")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "d must be a regular file after the dir->file transition, got {:?}",
+            meta.file_type()
+        );
+        assert_eq!(
+            std::fs::read(space_dir.path().join("d")).unwrap(),
+            d_content
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_mixed_batch_file_to_dir_with_child_add() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        // On disk: d is a regular FILE. The head turns d into a DIRECTORY and adds
+        // a child d/new.txt under it in the same batch.
+        let (d_old_file, _c) =
+            upload_multiblock_file(&vault, "d", &[b"i was a file" as &[u8]]).await;
+        materialize(&vault, &fs, space_dir.path(), &d_old_file, None)
+            .await
+            .unwrap();
+        assert!(space_dir.path().join("d").is_file());
+
+        let (child, child_content) =
+            upload_multiblock_file(&vault, "d/new.txt", &[b"child bytes" as &[u8]]).await;
+
+        // Child Added appears BEFORE the file->dir Modified in the input: only the
+        // Phase 1 (transition, shallowest-first) -> Phase 2 (adds) ordering makes
+        // the child land inside the freshly created dir instead of racing the stale
+        // file at d.
+        let changes = [
+            Change::Added(child),
+            Change::Modified {
+                old: d_old_file,
+                new: dir_entry("d"),
+            },
+        ];
+        apply(&vault, &fs, space_dir.path(), &changes, None)
+            .await
+            .unwrap();
+
+        assert!(
+            space_dir.path().join("d").is_dir(),
+            "d must be a directory after the file->dir transition"
+        );
+        assert_eq!(
+            std::fs::read(space_dir.path().join("d").join("new.txt")).unwrap(),
+            child_content,
+            "the added child must live inside the new directory"
+        );
     }
 }

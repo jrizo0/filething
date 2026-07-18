@@ -278,7 +278,7 @@ impl fmt::Display for CasefoldKey {
 // ---------------------------------------------------------------------------
 
 /// Kind of a [`FileEntry`]. Wire value is a `u8` (`0=file, 1=symlink,
-/// 2=derived`). `docs/format.md §5.1`.
+/// 2=derived, 3=dir`). `docs/format.md §5.1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FileType {
@@ -288,6 +288,10 @@ pub enum FileType {
     Symlink = 1,
     /// A derived path (e.g. `node_modules/`, `target/`): `bk` always empty.
     Derived = 2,
+    /// A plain directory tracked as a first-class entry so empty directories
+    /// sync (ADR 0019). Only `p` and `t` are meaningful: `sz=0`, `pcid` zeroed,
+    /// `x=false`, `bk` empty, no `bk_ref`/`lt`. The Space root is never an entry.
+    Dir = 3,
 }
 
 impl FileType {
@@ -304,6 +308,7 @@ impl FileType {
             0 => Ok(FileType::File),
             1 => Ok(FileType::Symlink),
             2 => Ok(FileType::Derived),
+            3 => Ok(FileType::Dir),
             other => Err(Error::InvalidFileType(other)),
         }
     }
@@ -357,7 +362,7 @@ pub struct FileEntry {
     #[serde(rename = "p")]
     pub p: CanonicalPath,
 
-    /// File type (`0=file, 1=symlink, 2=derived`). `§5.1` field `"t"`.
+    /// File type (`0=file, 1=symlink, 2=derived, 3=dir`). `§5.1` field `"t"`.
     #[serde(rename = "t")]
     pub t: FileType,
 
@@ -706,6 +711,7 @@ mod tests {
             (FileType::File, 0u8),
             (FileType::Symlink, 1),
             (FileType::Derived, 2),
+            (FileType::Dir, 3),
         ] {
             assert_eq!(t.as_u8(), n);
             assert_eq!(u8::from(t), n);
@@ -716,9 +722,11 @@ mod tests {
 
     #[test]
     fn filetype_rejects_unknown() {
+        // 3 is now Dir (ADR 0019); the first invalid discriminant is 4.
+        assert_eq!(FileType::from_u8(3).unwrap(), FileType::Dir);
         assert!(matches!(
-            FileType::from_u8(3),
-            Err(Error::InvalidFileType(3))
+            FileType::from_u8(4),
+            Err(Error::InvalidFileType(4))
         ));
         assert!(matches!(
             FileType::try_from(255u8),

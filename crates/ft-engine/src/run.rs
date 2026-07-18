@@ -301,13 +301,18 @@ impl SpaceContext {
                     return true; // no echo state: treat every event as a change.
                 };
                 let abs = join_canonical(&self.local_root, &canonical);
-                // A directory event carries no content; ignore it (its files fire
-                // their own events).
                 let Ok(meta) = std::fs::symlink_metadata(&abs) else {
                     return true; // vanished mid-flight: let the commit sort it out.
                 };
                 if meta.is_dir() {
-                    return false;
+                    // Directories are first-class entries now (ADR 0019), so a
+                    // freshly CREATED directory — which may be empty and thus have
+                    // no child file events to arm a commit — must arm one itself. A
+                    // MODIFIED dir event is only a mtime bump from child activity
+                    // that already fires its own events, so it is ignored to avoid
+                    // redundant scans. There is no content pcid to echo-check; a
+                    // commit armed by our own just-pulled dir simply finds NoChange.
+                    return matches!(event.kind, ChangeKind::Created);
                 }
                 let mtime = self
                     .fs

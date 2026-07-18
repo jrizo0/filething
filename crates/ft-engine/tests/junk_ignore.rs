@@ -89,15 +89,21 @@ fn scan_excludes_ds_store_in_root_and_subdir_keeps_normal_files() {
 
     let paths = scanned_paths(&ctx);
 
-    // Normal files survive.
+    // Normal files survive; the `src` directory is now a first-class entry too
+    // (ADR 0019).
     assert!(paths.contains(&"readme.md".to_string()));
+    assert!(paths.contains(&"src".to_string()));
     assert!(paths.contains(&"src/main.rs".to_string()));
     // No .DS_Store anywhere.
     assert!(
         !paths.iter().any(|p| p.ends_with(".DS_Store")),
         "no .DS_Store may enter the Manifest: {paths:?}"
     );
-    assert_eq!(paths.len(), 2, "only the two real files: {paths:?}");
+    assert_eq!(
+        paths.len(),
+        3,
+        "the two real files plus the src directory: {paths:?}"
+    );
 
     // And it is not recorded in the local index either.
     assert!(ctx
@@ -136,8 +142,12 @@ fn scan_excludes_thumbs_db_and_desktop_ini() {
 
     assert_eq!(
         paths,
-        vec!["gallery/pic.png".to_string(), "photo.jpg".to_string()],
-        "only the two images survive: {paths:?}"
+        vec![
+            "gallery".to_string(),
+            "gallery/pic.png".to_string(),
+            "photo.jpg".to_string()
+        ],
+        "the two images plus the gallery directory survive: {paths:?}"
     );
     assert!(
         !paths.iter().any(|p| p.ends_with("Thumbs.db")),
@@ -179,9 +189,10 @@ fn scan_keeps_lookalike_names_exact_match_only() {
             "DS_Store".to_string(),
             "Desktop.ini".to_string(),
             "mythumbs.db".to_string(),
+            "notes".to_string(),
             "notes/thumbs.db".to_string(),
         ],
-        "exact-name match only: look-alikes must sync, the real .DS_Store must not: {paths:?}"
+        "exact-name match only: look-alikes (and the notes dir) sync, the real .DS_Store must not: {paths:?}"
     );
 }
 

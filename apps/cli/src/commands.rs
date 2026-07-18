@@ -412,6 +412,7 @@ pub fn ls(dir: Option<PathBuf>) -> anyhow::Result<()> {
             }
             ft_core::FileType::Symlink => "l",
             ft_core::FileType::Derived => "d",
+            ft_core::FileType::Dir => "D",
         };
         println!("{kind}  {:>10}  {}", entry.size, entry.path.as_str());
     }

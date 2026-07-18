@@ -8,9 +8,12 @@ license.workspace = true
 ft-engine = { workspace = true }
 
 tokio = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` (not in tokio's "full") powers #[tokio::test(start_paused = true)]:
+# the quarantine-backoff tests drive the retry timers on virtual time.
+tokio = { workspace = true, features = ["test-util"] }

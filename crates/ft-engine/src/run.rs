@@ -41,6 +41,12 @@ use crate::{CommitOutcome, PullOutcome};
 /// editor's save (write + rename + chmod) into a single commit.
 const COMMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// How far out to re-arm the commit debounce after a commit FAILED, so the edit
+/// is retried rather than dropped (issue #8: a transient commit error must not
+/// tear the loop down). Longer than [`COMMIT_DEBOUNCE`] so a persistent fault
+/// retries at a human pace instead of hot-looping.
+const COMMIT_RETRY_BACKOFF: Duration = Duration::from_secs(10);
+
 /// A safety-net interval for pulling the head even when the change feed is quiet.
 ///
 /// The `head_stream` branch of the `select!` is normally the ONLY way remote
@@ -112,6 +118,11 @@ impl SpaceContext {
         // the current stale episode (so we warn once, not every tick).
         let mut last_head_seen = Instant::now();
         let mut stale_alerted = false;
+        // The last metrics snapshot the heartbeat logged at `info`. The periodic
+        // "sync metrics" line only rises to `info` when a counter changed since
+        // then; an idle Space demotes it to `debug` so a healthy daemon stops
+        // writing one line per Space per minute forever (GitHub #22).
+        let mut last_logged_metrics: Option<(u64, u64, u64, u64, u64)> = None;
 
         // Initial catch-up so a freshly mounted Device is current before watching:
         // pull the head AND commit any local edits/deletes made while the daemon
@@ -169,7 +180,11 @@ impl SpaceContext {
                             // fault (e.g. a Coordinator round-trip that lands mid
                             // auth-refresh/reconnect, issue #12) must not kill the
                             // daemon. Log with the cause, count it, and let the
-                            // next feed item or backstop tick retry.
+                            // next feed item or backstop tick retry. (A structural
+                            // failure at loop STARTUP — watcher, subscribe, initial
+                            // sync — still propagates: the daemon's supervisor
+                            // quarantines that Space and retries with backoff,
+                            // issue #8.)
                             //
                             // The head is only confirmed AFTER a successful pull:
                             // a pull that fails permanently (Space deleted, auth
@@ -228,8 +243,20 @@ impl SpaceContext {
                 // Debounce fired: if there were real edits, commit them as one.
                 _ = &mut debounce, if dirty => {
                     dirty = false;
-                    if let CommitOutcome::Committed { .. } = self.commit_and_reconcile().await? {
-                        metrics.record_commit();
+                    // A commit can fail transiently (a mid-flight Vault/Coordinator
+                    // hiccup, an exhausted CAS retry). Don't tear the loop down
+                    // (issue #8): warn, mark the tree dirty again, and re-arm the
+                    // debounce further out so the edit is retried, not dropped.
+                    match self.commit_and_reconcile().await {
+                        Ok(CommitOutcome::Committed { .. }) => metrics.record_commit(),
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "commit failed; retrying shortly");
+                            dirty = true;
+                            debounce
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + COMMIT_RETRY_BACKOFF);
+                        }
                     }
                     metrics.save(&self.local_root);
                 }
@@ -249,15 +276,39 @@ impl SpaceContext {
                         metrics.record_stale();
                         stale_alerted = true;
                     }
-                    tracing::info!(
-                        space = %self.space_id,
-                        commits = metrics.commits,
-                        pulls = metrics.pulls_applied,
-                        conflicts = metrics.conflicts,
-                        feed_errors = metrics.feed_errors,
-                        stale_alerts = metrics.stale_alerts,
-                        "sync metrics"
+                    // Log at `info` only when something moved since the last
+                    // heartbeat; otherwise demote to `debug` so RUST_LOG=debug
+                    // still sees it but a steady-state daemon does not spam the
+                    // log with an unchanging line every interval.
+                    let snapshot = (
+                        metrics.commits,
+                        metrics.pulls_applied,
+                        metrics.conflicts,
+                        metrics.feed_errors,
+                        metrics.stale_alerts,
                     );
+                    if last_logged_metrics != Some(snapshot) {
+                        tracing::info!(
+                            space = %self.space_id,
+                            commits = metrics.commits,
+                            pulls = metrics.pulls_applied,
+                            conflicts = metrics.conflicts,
+                            feed_errors = metrics.feed_errors,
+                            stale_alerts = metrics.stale_alerts,
+                            "sync metrics"
+                        );
+                        last_logged_metrics = Some(snapshot);
+                    } else {
+                        tracing::debug!(
+                            space = %self.space_id,
+                            commits = metrics.commits,
+                            pulls = metrics.pulls_applied,
+                            conflicts = metrics.conflicts,
+                            feed_errors = metrics.feed_errors,
+                            stale_alerts = metrics.stale_alerts,
+                            "sync metrics"
+                        );
+                    }
                     metrics.save(&self.local_root);
                 }
             }

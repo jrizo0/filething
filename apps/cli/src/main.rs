@@ -15,9 +15,11 @@ mod config;
 mod credentials;
 mod env;
 mod errors;
+mod logrotate;
 mod service;
 mod signed_vault;
 
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -153,17 +155,14 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
 
-    // Logs: default to info, override with RUST_LOG. Written to stderr so command
-    // output on stdout stays clean for scripting.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
+    // Parse before initializing logging: the daemon subcommand logs to a rotating
+    // FILE (it can run for weeks under launchd, which otherwise appends its stderr
+    // to one unbounded daemon.log — GitHub #22), while every one-shot command
+    // keeps logging to stderr. TLS is not touched by parsing, so this stays after
+    // the CryptoProvider install and before any network work.
     let cli = Cli::parse();
+    init_tracing(&cli.command);
+
     let result = match cli.command {
         Command::Login {
             email,
@@ -212,6 +211,74 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The default log filter: `RUST_LOG` if set, else `info`. Shared by both the
+/// stderr and the rotating-file initializers so daemon and one-shot logging honor
+/// the same verbosity rules.
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Initialize tracing for this invocation.
+///
+/// One-shot commands (and the Linux daemon under systemd, which journald rotates)
+/// log to stderr exactly as before. The daemon logs to a size-rotated FILE it
+/// owns whenever it would otherwise be at the mercy of launchd's unbounded stderr
+/// redirect: on macOS, or when `FILETHING_LOG_TO_FILE` is set non-empty (a manual
+/// opt-in on any OS). If that file can't be opened we warn and fall back to
+/// stderr — the daemon must still run. When stderr is a terminal (a foreground
+/// `filething daemon`) we tee to both so it stays visible while the file always
+/// receives the log.
+fn init_tracing(command: &Command) {
+    let log_to_file = matches!(command, Command::Daemon { .. })
+        && (cfg!(target_os = "macos")
+            || std::env::var("FILETHING_LOG_TO_FILE")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false));
+
+    if log_to_file {
+        match daemon_file_writer() {
+            Ok(writer) => {
+                let builder = tracing_subscriber::fmt()
+                    .with_env_filter(env_filter())
+                    .with_ansi(false);
+                // Foreground run (tty): tee to the file AND stderr so the file is
+                // always written yet the operator still sees the log live.
+                if std::io::stderr().is_terminal() {
+                    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+                    builder.with_writer(writer.and(std::io::stderr)).init();
+                } else {
+                    builder.with_writer(writer).init();
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "filething: could not open the rotating daemon log ({e}); logging to stderr"
+                );
+            }
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Build the daemon's rotating log writer at `<config_dir>/daemon.log`
+/// (5 MB per file, 3 generations). Creates the config dir if needed.
+fn daemon_file_writer() -> std::io::Result<logrotate::SharedRotatingWriter> {
+    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    const KEEP: usize = 3;
+    let path = config::Config::config_dir().join(service::LOG_FILE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let writer = logrotate::RotatingFileWriter::new(path, MAX_BYTES, KEEP)?;
+    Ok(logrotate::SharedRotatingWriter::new(writer))
 }
 
 #[cfg(test)]

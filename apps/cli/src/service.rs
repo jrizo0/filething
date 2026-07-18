@@ -35,8 +35,17 @@ const LABEL: &str = "com.filething.daemon";
 const SYSTEMD_UNIT: &str = "filething.service";
 /// The captured-env filename under the config dir (0600).
 const ENV_FILE: &str = "service.env";
-/// The daemon log filename under the config dir.
-const LOG_FILE: &str = "daemon.log";
+/// The daemon log filename under the config dir. The daemon process OWNS this
+/// file and rotates it itself (`crate::logrotate`), so launchd no longer redirects
+/// its std streams here — see [`ERR_FILE`]. Kept for the `install()` "logs at …"
+/// message, which still points operators at the rotated log, and shared with
+/// `crate::main`'s rotating-writer setup so the two can never drift.
+pub(crate) const LOG_FILE: &str = "daemon.log";
+/// Where launchd sends the daemon's raw stdout/stderr: panics, early-startup
+/// errors before tracing is up, and the couple of `println!` lines. Tiny by
+/// construction (the bulk of logging goes through the rotated [`LOG_FILE`]), so it
+/// needs no rotation of its own (GitHub #22).
+const ERR_FILE: &str = "daemon.err.log";
 
 /// Environment variables captured into the service env file so the daemon starts
 /// with the same credentials the install shell had. Missing ones are skipped.
@@ -113,7 +122,15 @@ fn env_file_body(vars: &[(String, String)]) -> String {
 /// (auto-exporting via `set -a`) then execs `filething daemon` with no folder
 /// arguments — it resolves every Space mapped in `config.json` at startup, so
 /// this body never needs rewriting when a Space is added.
-fn plist_body(exe: &str, env_file: &str, log_file: &str) -> String {
+///
+/// launchd's `Standard{Out,Error}Path` point at the small [`ERR_FILE`], NOT the
+/// rotated [`LOG_FILE`]: the daemon writes its real log through the rotating
+/// writer, so this file only catches panics / pre-tracing startup errors and
+/// stays tiny (GitHub #22 — the old design let launchd append forever here).
+/// `ThrottleInterval` keeps a persistent GLOBAL failure (broken identity/
+/// credentials — per-Space failures no longer exit, GitHub #8) from relaunching
+/// more than once per 30s, bounding how fast [`ERR_FILE`] can grow.
+fn plist_body(exe: &str, env_file: &str, err_file: &str) -> String {
     let cmd = format!(
         "set -a; . {}; set +a; exec {} daemon",
         sh_quote(env_file),
@@ -136,16 +153,18 @@ fn plist_body(exe: &str, env_file: &str, log_file: &str) -> String {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>{log}</string>
+  <string>{err}</string>
   <key>StandardErrorPath</key>
-  <string>{log}</string>
+  <string>{err}</string>
 </dict>
 </plist>
 "#,
         label = LABEL,
         cmd = xml_escape(&cmd),
-        log = xml_escape(log_file),
+        err = xml_escape(err_file),
     )
 }
 
@@ -305,13 +324,16 @@ fn write_env_file() -> anyhow::Result<PathBuf> {
 pub(crate) fn install() -> anyhow::Result<()> {
     let exe = current_exe()?;
     let env_file = write_env_file()?;
+    // The rotated log the daemon owns (shown to the operator below); the tiny
+    // err file launchd captures raw stdout/stderr into (see `plist_body`).
     let log_file = Config::config_dir().join(LOG_FILE);
+    let err_file = Config::config_dir().join(ERR_FILE);
     let env_file_s = env_file.to_string_lossy().into_owned();
-    let log_file_s = log_file.to_string_lossy().into_owned();
+    let err_file_s = err_file.to_string_lossy().into_owned();
     let path = service_file_path()?;
 
     if cfg!(target_os = "macos") {
-        write_file(&path, &plist_body(&exe, &env_file_s, &log_file_s))?;
+        write_file(&path, &plist_body(&exe, &env_file_s, &err_file_s))?;
         println!("Wrote launchd agent: {}", path.display());
         // Reload: unload first (ignore errors), then load.
         let plist_s = path.to_string_lossy().into_owned();
@@ -470,7 +492,7 @@ mod tests {
         let p = plist_body(
             "/usr/local/bin/filething",
             "/cfg/service.env",
-            "/cfg/daemon.log",
+            "/cfg/daemon.err.log",
         );
         assert!(p.contains("<string>com.filething.daemon</string>"));
         assert!(p.contains("/bin/sh"));
@@ -479,7 +501,11 @@ mod tests {
         assert!(p.contains(
             "set -a; . &apos;/cfg/service.env&apos;; set +a; exec &apos;/usr/local/bin/filething&apos; daemon"
         ));
-        assert!(p.contains("<string>/cfg/daemon.log</string>"));
+        // launchd captures raw std streams into the tiny err file; the rotated
+        // daemon.log is owned by the process and must NOT appear in the plist
+        // (GitHub #22).
+        assert!(p.contains("<string>/cfg/daemon.err.log</string>"));
+        assert!(!p.contains("<string>/cfg/daemon.log</string>"));
     }
 
     #[test]

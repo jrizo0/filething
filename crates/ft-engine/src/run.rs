@@ -127,7 +127,12 @@ impl SpaceContext {
         // Initial catch-up so a freshly mounted Device is current before watching:
         // pull the head AND commit any local edits/deletes made while the daemon
         // was down (§7/§9).
-        self.startup_sync().await?;
+        let (startup_pull, startup_retry_conflicts) = self.startup_sync().await?;
+        // The startup pull is a pull like any other: FastForwarded/Reconciled
+        // count as pulls_applied (+ conflicts); the commit-retry conflict copies
+        // count as conflicts only.
+        record_pull_outcome(startup_pull, &mut metrics);
+        metrics.record_conflicts(startup_retry_conflicts.len());
         metrics.record_head_seen();
         metrics.save(&self.local_root);
 
@@ -248,8 +253,16 @@ impl SpaceContext {
                     // (issue #8): warn, mark the tree dirty again, and re-arm the
                     // debounce further out so the edit is retried, not dropped.
                     match self.commit_and_reconcile().await {
-                        Ok(CommitOutcome::Committed { .. }) => metrics.record_commit(),
-                        Ok(_) => {}
+                        Ok((outcome, conflicts)) => {
+                            if let CommitOutcome::Committed { .. } = outcome {
+                                metrics.record_commit();
+                            }
+                            // A concurrent edit surfaces here as a CAS conflict
+                            // whose retry pull reconciles and writes conflict copies
+                            // (issue #9): count them even when this branch (not the
+                            // feed) drove the reconcile.
+                            metrics.record_conflicts(conflicts.len());
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "commit failed; retrying shortly");
                             dirty = true;
@@ -339,10 +352,19 @@ impl SpaceContext {
     /// full loop needs a live head subscription; this needs only a Coordinator for
     /// the commit path). Order matters: pull first so the commit's `expected_base`
     /// reflects the current head and a first commit reconciles instead of looping.
-    pub async fn startup_sync(&mut self) -> Result<()> {
-        self.pull().await?;
-        self.commit_and_reconcile().await?;
-        Ok(())
+    ///
+    /// Returns the initial catch-up pull's [`PullOutcome`] — so the caller can
+    /// fold it into [`SyncMetrics`](crate::SyncMetrics) with the SAME semantics as
+    /// any other pull (a startup fast-forward or reconcile counts as
+    /// `pulls_applied`, and a reconcile's conflict copies count as `conflicts`,
+    /// issue #9) — plus the conflict-copy paths written by the reconciling retries
+    /// inside [`commit_and_reconcile`](SpaceContext::commit_and_reconcile), which
+    /// are counted as conflicts only (their enclosing commit is the accounted
+    /// event; see [`SyncMetrics::record_conflicts`](crate::SyncMetrics::record_conflicts)).
+    pub async fn startup_sync(&mut self) -> Result<(PullOutcome, Vec<String>)> {
+        let outcome = self.pull().await?;
+        let (_committed, retry_conflicts) = self.commit_and_reconcile().await?;
+        Ok((outcome, retry_conflicts))
     }
 
     /// Decides whether a watcher [`ChangeEvent`] is a genuine user change (vs our
@@ -460,6 +482,53 @@ fn record_pull_outcome(outcome: PullOutcome, metrics: &mut SyncMetrics) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The metrics-folding contract behind issue #9. The end-to-end
+    /// commit→CAS-conflict→reconcile→retry path needs a live Coordinator (no
+    /// offline double exists), so it is exercised by the `#[ignore]`d multi-device
+    /// test `commit_retry_reconcile_conflicts_are_counted` in `tests/two_devices.rs`.
+    /// This locks the layer that regressed: a reconcile's conflict copies must
+    /// reach `SyncMetrics.conflicts` no matter which branch drove the reconcile.
+
+    #[test]
+    fn feed_branch_reconcile_counts_pull_and_conflicts() {
+        let mut m = SyncMetrics::default();
+        record_pull_outcome(
+            PullOutcome::Reconciled {
+                conflicts: vec!["a (conflicto devX, seq 0).txt".to_string()],
+            },
+            &mut m,
+        );
+        assert_eq!(m.pulls_applied, 1, "a reconcile is an applied pull");
+        assert_eq!(m.conflicts, 1, "its conflict copy is counted");
+    }
+
+    #[test]
+    fn commit_retry_conflicts_are_counted_without_a_pull() {
+        // The exact shape of the bug: the debounce/startup path records the commit
+        // but the reconcile happened inside commit_and_reconcile's retry. Recording
+        // the commit alone must leave `conflicts` at 0; folding the returned
+        // conflict copies is what fixes it — and it must NOT inflate pulls_applied.
+        let mut m = SyncMetrics::default();
+        m.record_commit();
+        assert_eq!(m.conflicts, 0, "a commit by itself records no conflict");
+
+        // Two conflict copies came back from the retry pulls.
+        m.record_conflicts(2);
+        assert_eq!(m.conflicts, 2, "retry-pull conflicts must be counted");
+        assert_eq!(
+            m.pulls_applied, 0,
+            "commit-retry pulls do not count as pulls_applied"
+        );
+    }
+
+    #[test]
+    fn up_to_date_and_ff_without_changes_count_nothing() {
+        let mut m = SyncMetrics::default();
+        record_pull_outcome(PullOutcome::UpToDate, &mut m);
+        record_pull_outcome(PullOutcome::FastForwarded { applied: 0 }, &mut m);
+        assert_eq!(m, SyncMetrics::default());
+    }
 
     #[test]
     fn permanent_pull_errors_are_the_typed_never_recoverable_codes() {

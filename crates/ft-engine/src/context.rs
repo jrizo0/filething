@@ -61,6 +61,13 @@ pub struct SpaceContext {
     pub device_id: DeviceId,
     /// The Space being synced.
     pub space_id: SpaceId,
+    /// A human-readable name for this Device (from `filething login --name`,
+    /// cached in the CLI config), used to label conflict copies so they read
+    /// `notas (conflicto <name>, seq N).md` instead of exposing the opaque
+    /// [`device_id`](Self::device_id). `None` (the default) falls back to the
+    /// `device_id`. Set via [`set_device_display_name`](Self::set_device_display_name);
+    /// it is NOT persisted in `space_state` (the CLI plumbs it in on each mount).
+    pub device_display_name: Option<String>,
     /// Local folder mapped one-to-one to this Space.
     pub local_root: PathBuf,
     /// Base Revision of the last successful sync (`§9`).
@@ -192,6 +199,7 @@ impl SpaceContext {
             account_id,
             device_id,
             space_id,
+            device_display_name: None,
             local_root: PathBuf::from(&state.local_root_path),
             last_synced: LastSynced {
                 seq: state.last_synced_seq,
@@ -232,6 +240,14 @@ impl SpaceContext {
     /// `clone_space`.
     pub fn attach_crypto(&mut self, crypto: SpaceCrypto) {
         self.crypto = Some(crypto);
+    }
+
+    /// Sets the human-readable Device name used to label conflict copies
+    /// ([`device_display_name`](Self::device_display_name)). The CLI calls this
+    /// after mounting with the name cached in its config; `None` (or an empty
+    /// string, treated the same) falls back to the opaque `device_id`.
+    pub fn set_device_display_name(&mut self, name: Option<String>) {
+        self.device_display_name = name.filter(|s| !s.is_empty());
     }
 
     /// The `expected_base` `RevisionId` is NOT stored in `space_state` (which

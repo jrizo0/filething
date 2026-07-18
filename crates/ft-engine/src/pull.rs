@@ -25,10 +25,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use ft_conflict::{collision_is_conflict, conflict_copy_name, resolve, Resolution};
+use ft_conflict::{collision_is_conflict, conflict_copy_name, merge3, resolve, Merge3, Resolution};
 use ft_coordinator::RevisionId;
 use ft_core::{CanonicalPath, CasefoldKey, Cid, FileEntry, FileType, Pcid};
-use ft_diff::{apply, diff, materialize, Change};
+use ft_diff::{apply, diff, fetch_file_bytes, materialize, Change};
 use futures::StreamExt;
 
 use crate::context::{join_canonical, SpaceContext};
@@ -481,7 +481,13 @@ impl SpaceContext {
         keys.extend(local.keys().cloned());
         keys.extend(remote.keys().cloned());
 
-        let device_id = self.device_id.as_str().to_string();
+        // The conflict-copy label: the human-readable Device name when set, else
+        // the opaque device_id (issue #14). It only names copies THIS Device
+        // writes, so a per-Device value never breaks cross-Device convergence.
+        let label = self
+            .device_display_name
+            .clone()
+            .unwrap_or_else(|| self.device_id.as_str().to_string());
         let seq = self.last_synced.seq.max(0) as u64;
         let mut conflicts: Vec<String> = Vec::new();
         // Verdicts that must not run in the ascending-key loop (see fn docs):
@@ -514,14 +520,20 @@ impl SpaceContext {
             if let (Some(l), Some(r)) = (l, r) {
                 if collision_is_conflict(&key, &key, &l.p, &r.p) {
                     let mut renamed = r.clone();
-                    renamed.p = conflict_copy_name(&r.p, &device_id, seq);
+                    renamed.p = conflict_copy_name(&r.p, &label, seq);
+                    tracing::warn!(
+                        space = %self.space_id,
+                        original = %r.p.as_str(),
+                        conflict_copy = %renamed.p.as_str(),
+                        "casefold/NFC collision: remote path moved aside to a conflict copy"
+                    );
                     conflicts.push(renamed.p.as_str().to_string());
                     to_materialize.push(renamed);
                     continue;
                 }
             }
 
-            match resolve(b, l, r, &device_id, seq) {
+            match resolve(b, l, r, &label, seq) {
                 Resolution::NoChange
                 | Resolution::FastForwardToLocal(_)
                 | Resolution::KeepLocal => {
@@ -562,11 +574,48 @@ impl SpaceContext {
                     }
                 }
                 Resolution::ConflictCopy { winner, loser } => {
+                    // Before keeping both, try a textual 3-way content merge: when
+                    // BOTH sides are Files and a common base entry exists, the two
+                    // divergent edits may not overlap (appends / disjoint line
+                    // regions) and can be fused into one file. Only Files carry
+                    // mergeable content; a symlink/derived winner or loser, or a
+                    // base with no entry (created on both sides, no ancestor),
+                    // skips straight to the conflict copy.
+                    if winner.t == FileType::File
+                        && loser.t == FileType::File
+                        && base.get(&key).is_some_and(|be| be.t == FileType::File)
+                    {
+                        let base_entry = base.get(&key).expect("checked is_some_and above");
+                        if let Some(merged) = self.try_auto_merge(base_entry, &winner).await {
+                            // Non-overlapping edits fused: write the merged bytes to
+                            // the real path and skip the conflict copy entirely. We
+                            // deliberately do NOT record this in the index/block
+                            // table nor echo-mark it (see [`write_merged`]): the
+                            // merged content is a brand-new local change the NEXT
+                            // commit re-scans, chunks and uploads — never a phantom
+                            // block. Also NOT pushed to `to_materialize`, so phase B
+                            // cannot overwrite the merge with the remote winner.
+                            self.write_merged(&winner, &merged)?;
+                            tracing::info!(
+                                space = %self.space_id,
+                                path = %winner.p.as_str(),
+                                "auto-merged divergent edits (3-way content merge)"
+                            );
+                            continue;
+                        }
+                    }
+
                     // Keep BOTH: remote winner at the real path, local loser moved
                     // aside to its conflict-copy name. The loser's bytes are the
                     // LOCAL ones already on disk at the winner's path, so copy them
                     // NOW (phase A) — before any winner overwrites that path in
                     // phase B.
+                    tracing::warn!(
+                        space = %self.space_id,
+                        original = %winner.p.as_str(),
+                        conflict_copy = %loser.p.as_str(),
+                        "divergent edit: local version kept as a conflict copy"
+                    );
                     self.write_conflict_copy(l, &loser).await?;
                     conflicts.push(loser.p.as_str().to_string());
                     if currently_dir && winner.t != FileType::Dir {
@@ -797,6 +846,96 @@ impl SpaceContext {
         Ok(())
     }
 
+    /// Attempts a textual 3-way content merge for a divergent File edit, returning
+    /// the merged bytes when the two sides do NOT overlap (appends / disjoint line
+    /// regions / identical edit), or `None` to fall back to a conflict copy.
+    ///
+    /// The three sides (`§10`, issue #14 point 4):
+    /// - **base** — the last common version, fetched from the Vault via
+    ///   [`fetch_file_bytes`] from the `base_entry`. Its Blocks are retained by the
+    ///   `base_seq` GC guard; if the fetch still fails (a corrupt/missing object),
+    ///   we return `None` and let the caller keep both — a merge failure must never
+    ///   abort the reconcile.
+    /// - **remote** — the winning remote version, fetched from the Vault via
+    ///   [`fetch_file_bytes`] from `winner`.
+    /// - **local** — the loser's bytes, which are the ones CURRENTLY on disk at the
+    ///   winner's path (nothing has overwritten them yet in phase A), read from the
+    ///   filesystem exactly as [`write_conflict_copy`](Self::write_conflict_copy)
+    ///   reads its `original`.
+    ///
+    /// Returns `Some(bytes)` only for [`Merge3::Clean`]; [`Merge3::Conflict`],
+    /// [`Merge3::Binary`], and any Vault/fs read error all yield `None`.
+    async fn try_auto_merge(&self, base_entry: &FileEntry, winner: &FileEntry) -> Option<Vec<u8>> {
+        let base_bytes =
+            match fetch_file_bytes(self.vault.as_ref(), base_entry, self.crypto.as_ref()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        space = %self.space_id,
+                        path = %winner.p.as_str(),
+                        error = %e,
+                        "auto-merge: base bytes unavailable, falling back to conflict copy"
+                    );
+                    return None;
+                }
+            };
+        let remote_bytes =
+            match fetch_file_bytes(self.vault.as_ref(), winner, self.crypto.as_ref()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        space = %self.space_id,
+                        path = %winner.p.as_str(),
+                        error = %e,
+                        "auto-merge: remote bytes unavailable, falling back to conflict copy"
+                    );
+                    return None;
+                }
+            };
+        let local_path = join_canonical(&self.local_root, &winner.p);
+        let local_bytes = match std::fs::read(&local_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    space = %self.space_id,
+                    path = %winner.p.as_str(),
+                    error = %e,
+                    "auto-merge: local bytes unavailable, falling back to conflict copy"
+                );
+                return None;
+            }
+        };
+
+        match merge3(&base_bytes, &local_bytes, &remote_bytes) {
+            Merge3::Clean(merged) => Some(merged),
+            Merge3::Conflict | Merge3::Binary => None,
+        }
+    }
+
+    /// Writes auto-merged bytes to the winner's real path (phase A) WITHOUT
+    /// recording anything in the index/block table and WITHOUT echo-marking.
+    ///
+    /// This is the anti-"phantom block" contract (mirrors the reasoning in
+    /// [`write_conflict_copy`](Self::write_conflict_copy)): the merged content is
+    /// bytes NO Device has ever chunked or uploaded, so it must NOT claim any
+    /// Block presence and must NOT overwrite the path's index row with a
+    /// remote/local `pcid`. Leaving the row untouched means the next `scan`
+    /// (`§9`) sees the on-disk bytes differ from the recorded `pcid`, re-chunks
+    /// them, and the following commit uploads the fused Blocks naturally.
+    ///
+    /// Because it is deliberately NOT echo-marked, the daemon's watcher sees this
+    /// write as a genuine local change and schedules the commit that uploads it —
+    /// the mechanism that also covers a feed-triggered reconcile with no
+    /// commit_and_reconcile in the same turn (see the module-level LIMITS note).
+    fn write_merged(&self, winner: &FileEntry, merged: &[u8]) -> Result<()> {
+        let dest = join_canonical(&self.local_root, &winner.p);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(EngineError::Io)?;
+        }
+        self.fs.write_bytes(&dest, merged, winner.x)?;
+        Ok(())
+    }
+
     /// Commits local changes, reconciling on a CAS conflict and retrying (`§7`
     /// step 6 + `§10`). This is the routine the [`run`](SpaceContext::run) loop
     /// drives.
@@ -806,21 +945,48 @@ impl SpaceContext {
     /// [`CommitOutcome::Conflict`] it [`pull`](SpaceContext::pull)s (which
     /// reconciles per file and advances the base) and retries with the new
     /// `expected_base`, up to [`MAX_COMMIT_RETRIES`] times.
-    pub async fn commit_and_reconcile(&mut self) -> Result<crate::CommitOutcome> {
+    ///
+    /// Returns the [`CommitOutcome`] AND the conflict-copy paths written by the
+    /// reconciling pulls it ran to clear a CAS conflict (issue #9). Those pulls are
+    /// invisible to the daemon's feed/backstop branches, so without surfacing their
+    /// conflicts here the `conflicts` metric stayed 0 for the most common conflict
+    /// case (a concurrent edit that only shows up as a CAS conflict on commit). The
+    /// caller folds the returned paths into [`SyncMetrics`](crate::SyncMetrics); the
+    /// retry pulls are NOT counted as `pulls_applied` (see
+    /// [`SyncMetrics::record_conflicts`](crate::SyncMetrics::record_conflicts)).
+    pub async fn commit_and_reconcile(&mut self) -> Result<(crate::CommitOutcome, Vec<String>)> {
         use crate::CommitOutcome;
+        // Conflict copies accumulated across the reconciling retry pulls below.
+        let mut conflicts: Vec<String> = Vec::new();
         for _ in 0..MAX_COMMIT_RETRIES {
             let expected_base = self.last_synced_revision_id.clone();
             match self.commit(expected_base).await? {
                 CommitOutcome::Committed { seq, root } => {
-                    return Ok(CommitOutcome::Committed { seq, root });
+                    return Ok((CommitOutcome::Committed { seq, root }, conflicts));
                 }
-                CommitOutcome::NoChange => return Ok(CommitOutcome::NoChange),
+                CommitOutcome::NoChange => return Ok((CommitOutcome::NoChange, conflicts)),
                 CommitOutcome::Conflict { .. } => {
                     // The head moved under us: reconcile against the new head, then
-                    // retry the commit with the advanced base.
-                    self.pull().await?;
+                    // retry the commit with the advanced base. A reconcile that
+                    // writes conflict copies must not be lost (issue #9) — collect
+                    // them for the caller's metrics.
+                    if let PullOutcome::Reconciled { conflicts: written } = self.pull().await? {
+                        conflicts.extend(written);
+                    }
                 }
             }
+        }
+        // The Err path cannot carry the conflict-copy paths, and the copies ARE
+        // already on disk — surface them in the log so they are not silently
+        // dropped with the error (issue #9 reviewer finding).
+        if !conflicts.is_empty() {
+            tracing::warn!(
+                space = %self.space_id,
+                conflict_copies = conflicts.len(),
+                paths = ?conflicts,
+                "commit_and_reconcile failed to converge AFTER writing conflict copies; \
+                 they are on disk but not folded into metrics"
+            );
         }
         Err(EngineError::SpaceState(format!(
             "commit_and_reconcile did not converge after {MAX_COMMIT_RETRIES} retries"

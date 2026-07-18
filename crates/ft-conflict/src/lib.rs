@@ -27,10 +27,13 @@
 //!
 //! Encryption is OFF in the MVP (`alg=0`, `cid == pcid`); nothing here touches a
 //! `Cid` directly. This crate is PURE: it inspects three [`FileEntry`] snapshots
-//! and the `(device_id, seq)` pair and returns a [`Resolution`]; it performs no
-//! IO and applies nothing. The caller (the engine) executes the verdict.
+//! and the `(label, seq)` pair and returns a [`Resolution`]; it performs no IO and
+//! applies nothing. The caller (the engine) executes the verdict.
 
 use ft_core::{CanonicalPath, CasefoldKey, FileEntry, FileType};
+
+pub mod merge;
+pub use merge::{merge3, Merge3};
 
 // ---------------------------------------------------------------------------
 // Resolution
@@ -125,9 +128,10 @@ fn changed(base: Option<&FileEntry>, side: Option<&FileEntry>) -> bool {
 ///
 /// `base`/`local`/`remote` are the path's [`FileEntry`] in the base Revision, on
 /// local disk, and in the incoming Revision respectively; `None` means the path
-/// is absent in that state. `device_id` and `seq` name the local Device and the
-/// incoming Revision sequence — they parameterize the conflict-copy name so two
-/// Devices never collide on the rename. "Changed" is decided by `pcid` only
+/// is absent in that state. `label` and `seq` name the local Device (a
+/// human-readable Device name, or its opaque id as a fallback) and the incoming
+/// Revision sequence — they parameterize the conflict-copy name so two Devices
+/// never collide on the rename. "Changed" is decided by `pcid` only
 /// (`docs/format.md §10`); `mtime` is never consulted.
 ///
 /// The result is a pure verdict; the caller applies it.
@@ -135,7 +139,7 @@ pub fn resolve(
     base: Option<&FileEntry>,
     local: Option<&FileEntry>,
     remote: Option<&FileEntry>,
-    device_id: &str,
+    label: &str,
     seq: u64,
 ) -> Resolution {
     let local_changed = changed(base, local);
@@ -170,7 +174,7 @@ pub fn resolve(
             if same_content(l, r) {
                 Resolution::NoChange
             } else {
-                let loser = conflict_copy_entry(l, device_id, seq);
+                let loser = conflict_copy_entry(l, label, seq);
                 Resolution::ConflictCopy {
                     winner: r.clone(),
                     loser,
@@ -188,9 +192,9 @@ pub fn resolve(
 
 /// Clones `entry` and rewrites its `p` to the conflict-copy path, leaving content
 /// (`pcid`, `bk`, …) untouched — only the key moves aside.
-fn conflict_copy_entry(entry: &FileEntry, device_id: &str, seq: u64) -> FileEntry {
+fn conflict_copy_entry(entry: &FileEntry, label: &str, seq: u64) -> FileEntry {
     let mut loser = entry.clone();
-    loser.p = conflict_copy_name(&entry.p, device_id, seq);
+    loser.p = conflict_copy_name(&entry.p, label, seq);
     loser
 }
 
@@ -199,8 +203,14 @@ fn conflict_copy_entry(entry: &FileEntry, device_id: &str, seq: u64) -> FileEntr
 // ---------------------------------------------------------------------------
 
 /// Builds the DETERMINISTIC conflict-copy path for a loser: inserts
-/// `" (conflicto <deviceId> <seq>)"` before the file extension (or at the end
+/// `" (conflicto <label>, seq <seq>)"` before the file extension (or at the end
 /// when there is no extension), preserving the directory prefix.
+///
+/// `label` is the human-readable Device name (or its opaque id as a fallback) that
+/// makes the copy legible instead of cryptic. It is SANITIZED first (`/`, `(`, `)`
+/// each collapse to `_`) so the result stays a single valid [`CanonicalPath`]
+/// component and cannot confuse [`is_conflict_copy_name`]; every other character —
+/// including spaces — is kept verbatim.
 ///
 /// Rules:
 /// - The extension is the final `.` segment of the LAST path component, and only
@@ -211,16 +221,17 @@ fn conflict_copy_entry(entry: &FileEntry, device_id: &str, seq: u64) -> FileEntr
 /// - Directory components are never touched.
 /// - Pure and deterministic: same inputs always yield the same path.
 ///
-/// Examples (`device_id = "dev1"`, `seq = 7`):
-/// - `notes.txt`         -> `notes (conflicto dev1 7).txt`
-/// - `README`            -> `README (conflicto dev1 7)`
-/// - `a/b/report.tar.gz` -> `a/b/report.tar (conflicto dev1 7).gz`
-/// - `.gitignore`        -> `.gitignore (conflicto dev1 7)`
-/// - `..hidden`          -> `..hidden (conflicto dev1 7)`
-/// - `a..b`              -> `a. (conflicto dev1 7).b`
-pub fn conflict_copy_name(path: &CanonicalPath, device_id: &str, seq: u64) -> CanonicalPath {
+/// Examples (`label = "dev1"`, `seq = 7`):
+/// - `notes.txt`         -> `notes (conflicto dev1, seq 7).txt`
+/// - `README`            -> `README (conflicto dev1, seq 7)`
+/// - `a/b/report.tar.gz` -> `a/b/report.tar (conflicto dev1, seq 7).gz`
+/// - `.gitignore`        -> `.gitignore (conflicto dev1, seq 7)`
+/// - `..hidden`          -> `..hidden (conflicto dev1, seq 7)`
+/// - `a..b`              -> `a. (conflicto dev1, seq 7).b`
+pub fn conflict_copy_name(path: &CanonicalPath, label: &str, seq: u64) -> CanonicalPath {
     let full = path.as_str();
-    let suffix = format!(" (conflicto {device_id} {seq})");
+    let label = sanitize_label(label);
+    let suffix = format!(" (conflicto {label}, seq {seq})");
 
     // Split off the directory prefix (everything up to and including the last
     // '/'); the rename only rewrites the final component.
@@ -250,6 +261,77 @@ pub fn conflict_copy_name(path: &CanonicalPath, device_id: &str, seq: u64) -> Ca
     };
 
     CanonicalPath(format!("{dir}{renamed}"))
+}
+
+/// Sanitizes a conflict-copy `label` so it stays a single valid path component:
+/// `/` (would spawn a directory), `(` and `)` (would confuse the parenthetical
+/// [`is_conflict_copy_name`] scans for) each collapse to `_`. Everything else,
+/// spaces included, is preserved so a Device name like `Julian's Mac` reads
+/// naturally.
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| match c {
+            '/' | '(' | ')' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// is_conflict_copy_name — recognize a conflict-copy path (both formats)
+// ---------------------------------------------------------------------------
+
+/// Reports whether `name` looks like a conflict-copy path produced by
+/// [`conflict_copy_name`], recognizing BOTH the current format
+/// (`… (conflicto <label>, seq <n>)…`) and the LEGACY one
+/// (`… (conflicto <deviceId> <n>)…`) so copies already on disk from an older
+/// build are still surfaced by `filething status`.
+///
+/// It scans for the literal `(conflicto ` marker and, for each occurrence, checks
+/// that the parenthesized body ends in a sequence number — `", seq <digits>"` for
+/// the current format or ` <digits>` (trailing space-delimited digits) for the
+/// legacy one. Passing a full canonical path is fine: the marker only ever appears
+/// in the renamed component, but callers that want to match on the basename alone
+/// may split it off first.
+pub fn is_conflict_copy_name(name: &str) -> bool {
+    const MARKER: &str = "(conflicto ";
+    let mut rest = name;
+    while let Some(start) = rest.find(MARKER) {
+        let after = &rest[start + MARKER.len()..];
+        match after.find(')') {
+            Some(end) => {
+                if conflict_marker_body_is_valid(&after[..end]) {
+                    return true;
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// True iff `body` (the text between `(conflicto ` and the closing `)`) ends in a
+/// sequence number for either format: the current `"<label>, seq <digits>"` or the
+/// legacy `"<label> <digits>"`. `<digits>` must be a non-empty run of ASCII digits.
+fn conflict_marker_body_is_valid(body: &str) -> bool {
+    if let Some((_label, digits)) = body.rsplit_once(", seq ") {
+        if is_seq_digits(digits) {
+            return true;
+        }
+    }
+    if let Some((_label, digits)) = body.rsplit_once(' ') {
+        if is_seq_digits(digits) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A non-empty run of ASCII digits (a conflict-copy sequence number).
+fn is_seq_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +552,7 @@ mod tests {
             Resolution::ConflictCopy { winner, loser } => {
                 // Remote wins the real path; local is moved aside.
                 assert_eq!(winner, remote);
-                assert_eq!(loser.p.as_str(), "a (conflicto dev1 7).txt");
+                assert_eq!(loser.p.as_str(), "a (conflicto dev1, seq 7).txt");
                 // The loser keeps the LOCAL content (only the key moved).
                 assert_eq!(loser.pcid, local.pcid);
                 assert_eq!(loser.bk, local.bk);
@@ -487,7 +569,7 @@ mod tests {
         match resolve3(None, Some(&local), Some(&remote)) {
             Resolution::ConflictCopy { winner, loser } => {
                 assert_eq!(winner, remote);
-                assert_eq!(loser.p.as_str(), "new (conflicto dev1 7).txt");
+                assert_eq!(loser.p.as_str(), "new (conflicto dev1, seq 7).txt");
             }
             other => panic!("expected ConflictCopy, got {other:?}"),
         }
@@ -542,7 +624,7 @@ mod tests {
         match resolve3(Some(&base), Some(&local), Some(&remote)) {
             Resolution::ConflictCopy { winner, loser } => {
                 assert_eq!(winner, remote);
-                assert_eq!(loser.p.as_str(), "script (conflicto dev1 7).sh");
+                assert_eq!(loser.p.as_str(), "script (conflicto dev1, seq 7).sh");
                 assert!(loser.x, "loser must preserve the local exec bit");
             }
             other => panic!("expected ConflictCopy, got {other:?}"),
@@ -636,7 +718,7 @@ mod tests {
         let p = CanonicalPath("notes.txt".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "notes (conflicto dev1 7).txt"
+            "notes (conflicto dev1, seq 7).txt"
         );
     }
 
@@ -645,7 +727,7 @@ mod tests {
         let p = CanonicalPath("README".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "README (conflicto dev1 7)"
+            "README (conflicto dev1, seq 7)"
         );
     }
 
@@ -654,7 +736,7 @@ mod tests {
         let p = CanonicalPath("a/b/report.txt".to_string());
         assert_eq!(
             conflict_copy_name(&p, "deviceX", 42).as_str(),
-            "a/b/report (conflicto deviceX 42).txt"
+            "a/b/report (conflicto deviceX, seq 42).txt"
         );
     }
 
@@ -663,7 +745,7 @@ mod tests {
         let p = CanonicalPath("a/b/report.tar.gz".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "a/b/report.tar (conflicto dev1 7).gz"
+            "a/b/report.tar (conflicto dev1, seq 7).gz"
         );
     }
 
@@ -672,7 +754,7 @@ mod tests {
         let p = CanonicalPath(".gitignore".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            ".gitignore (conflicto dev1 7)"
+            ".gitignore (conflicto dev1, seq 7)"
         );
     }
 
@@ -682,7 +764,7 @@ mod tests {
         let p = CanonicalPath("file.".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "file. (conflicto dev1 7)"
+            "file. (conflicto dev1, seq 7)"
         );
     }
 
@@ -695,7 +777,7 @@ mod tests {
         let p = CanonicalPath("..hidden".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "..hidden (conflicto dev1 7)"
+            "..hidden (conflicto dev1, seq 7)"
         );
     }
 
@@ -706,7 +788,7 @@ mod tests {
         let p = CanonicalPath("..hidden.txt".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "..hidden (conflicto dev1 7).txt"
+            "..hidden (conflicto dev1, seq 7).txt"
         );
     }
 
@@ -717,8 +799,63 @@ mod tests {
         let p = CanonicalPath("a..b".to_string());
         assert_eq!(
             conflict_copy_name(&p, "dev1", 7).as_str(),
-            "a. (conflicto dev1 7).b"
+            "a. (conflicto dev1, seq 7).b"
         );
+    }
+
+    #[test]
+    fn conflict_copy_name_uses_human_label_with_spaces() {
+        // A real Device name (with a space) reads naturally and stays one
+        // component; the extension split is unaffected by the label's spaces.
+        let p = CanonicalPath("notes.txt".to_string());
+        assert_eq!(
+            conflict_copy_name(&p, "Julian's Mac", 5).as_str(),
+            "notes (conflicto Julian's Mac, seq 5).txt"
+        );
+    }
+
+    #[test]
+    fn conflict_copy_name_sanitizes_slashes_and_parens_in_label() {
+        // A label with `/` would spawn a directory and `(`/`)` would confuse the
+        // recognizer; each collapses to `_`, keeping the copy one valid component.
+        let p = CanonicalPath("notes.txt".to_string());
+        let out = conflict_copy_name(&p, "a/b (x)", 7);
+        assert_eq!(out.as_str(), "notes (conflicto a_b _x_, seq 7).txt");
+        // Still a single component (no interior '/') and still recognized.
+        assert!(!out.as_str()["notes ".len()..].contains('/'));
+        assert!(is_conflict_copy_name(out.as_str()));
+    }
+
+    // ---- is_conflict_copy_name: recognizes both formats ----------------
+
+    #[test]
+    fn is_conflict_copy_name_recognizes_current_format() {
+        assert!(is_conflict_copy_name("notes (conflicto dev1, seq 7).txt"));
+        assert!(is_conflict_copy_name(
+            "README (conflicto Julian's Mac, seq 42)"
+        ));
+        assert!(is_conflict_copy_name(
+            "a/b/report (conflicto dev1, seq 0).gz"
+        ));
+        // Consistent with what the formatter emits.
+        let made = conflict_copy_name(&CanonicalPath("x/y.md".to_string()), "dev1", 3);
+        assert!(is_conflict_copy_name(made.as_str()));
+    }
+
+    #[test]
+    fn is_conflict_copy_name_recognizes_legacy_format() {
+        // Copies already on disk from the pre-`seq` build must still be surfaced.
+        assert!(is_conflict_copy_name("notes (conflicto dev1 7).txt"));
+        assert!(is_conflict_copy_name("README (conflicto k17abc 42)"));
+    }
+
+    #[test]
+    fn is_conflict_copy_name_rejects_non_conflict_names() {
+        assert!(!is_conflict_copy_name("notes.txt"));
+        assert!(!is_conflict_copy_name("my (conflicto notes)")); // no seq number
+        assert!(!is_conflict_copy_name("(conflicto dev1, seq abc)")); // seq not digits
+        assert!(!is_conflict_copy_name("plain (draft 2).txt")); // not the marker
+        assert!(!is_conflict_copy_name("")); // empty
     }
 
     #[test]

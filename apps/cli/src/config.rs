@@ -36,6 +36,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
 
+    /// This Device's human-readable name (`filething login --name`, else the
+    /// hostname), cached from `login` so the engine can label conflict copies
+    /// legibly (issue #14) instead of exposing the opaque `device_id`. Optional
+    /// via `serde(default)`: a config written by an older build has no field and
+    /// still loads; the engine then falls back to the `device_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+
     /// The Spaces this Device syncs, each mapped one-to-one to a local folder.
     #[serde(default)]
     pub spaces: Vec<SpaceMapping>,
@@ -115,11 +123,19 @@ impl Config {
         Ok(())
     }
 
-    /// Records (or replaces) the identity learned from a `login`.
-    pub fn set_identity(&mut self, coordinator_url: &str, account_id: &str, device_id: &str) {
+    /// Records (or replaces) the identity learned from a `login`, including the
+    /// human-readable `device_name` used to label conflict copies (issue #14).
+    pub fn set_identity(
+        &mut self,
+        coordinator_url: &str,
+        account_id: &str,
+        device_id: &str,
+        device_name: &str,
+    ) {
         self.coordinator_url = Some(coordinator_url.to_string());
         self.account_id = Some(account_id.to_string());
         self.device_id = Some(device_id.to_string());
+        self.device_name = Some(device_name.to_string());
     }
 
     /// Registers (or updates, by `space_id`) a Space ↔ folder mapping. The
@@ -169,7 +185,7 @@ mod tests {
         let path = dir.path().join("config.json");
 
         let mut cfg = Config::default();
-        cfg.set_identity("http://localhost:3210", "acc_1", "dev_1");
+        cfg.set_identity("http://localhost:3210", "acc_1", "dev_1", "Julian's Mac");
         cfg.upsert_space("sp_1", "/home/u/proj");
         cfg.upsert_space("sp_2", "/home/u/notes");
         cfg.save_to(&path).unwrap();
@@ -182,6 +198,7 @@ mod tests {
         );
         assert_eq!(back.account_id.as_deref(), Some("acc_1"));
         assert_eq!(back.device_id.as_deref(), Some("dev_1"));
+        assert_eq!(back.device_name.as_deref(), Some("Julian's Mac"));
         assert_eq!(back.spaces.len(), 2);
     }
 
@@ -193,6 +210,22 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert!(cfg.account_id.is_none());
         assert!(cfg.spaces.is_empty());
+    }
+
+    #[test]
+    fn loads_legacy_config_without_device_name() {
+        // A config written before `device_name` existed must still parse (serde
+        // default), leaving the field `None` so the engine falls back to the id.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"coordinator_url":"http://x","account_id":"acc_1","device_id":"dev_1","spaces":[]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.device_id.as_deref(), Some("dev_1"));
+        assert_eq!(cfg.device_name, None);
     }
 
     #[test]

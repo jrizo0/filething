@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "filething"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "ft-block"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "ft-chunker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ft-core",
  "ft-hash",
@@ -1427,14 +1427,14 @@ dependencies = [
 
 [[package]]
 name = "ft-conflict"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ft-core",
 ]
 
 [[package]]
 name = "ft-coordinator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "convex",
  "ft-core",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "ft-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ciborium",
  "hex",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "ft-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ft-engine",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "ft-diff"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "ft-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "ft-fsmap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ft-core",
  "tempfile",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "ft-hash"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "ft-core",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "ft-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ciborium",
  "ft-core",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "ft-manifest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ciborium",
  "ft-core",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "ft-vault"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "ft-watcher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ft-core",
  "notify",

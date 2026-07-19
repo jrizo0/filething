@@ -60,6 +60,10 @@ url = "2"
 rand = { workspace = true }
 # Hex-encode the 32-byte escrow secrets when persisting them (credentials.json).
 hex = "0.4"
+# Self-update (`filething update`): the library behind cargo-dist's updater.
+# Reads the install receipt the shell installer writes, checks GitHub Releases,
+# and re-runs the matching installer. Only the GitHub backend — no axo Releases.
+axoupdater = { version = "0.10.0", default-features = false, features = ["github_releases"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

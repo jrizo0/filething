@@ -1135,6 +1135,61 @@ pub fn service(action: ServiceAction) -> anyhow::Result<()> {
     crate::service::run(action)
 }
 
+/// `update` — self-update this binary to the latest GitHub Release.
+///
+/// Uses axoupdater against the install receipt the shell installer wrote
+/// (`~/.config/filething/filething-receipt.json`), so it only works for
+/// installer-based installs — a `cargo install`/source build has no receipt and
+/// gets a pointer to the installer instead. The receipt's recorded version is
+/// overridden with this binary's own so a stale receipt can't mask an update.
+/// After a successful swap the daemon service (if installed) is restarted so
+/// the background sync runs the new binary, not the deleted old one.
+pub async fn update() -> anyhow::Result<()> {
+    let mut updater = axoupdater::AxoUpdater::new_for("filething");
+    updater.load_receipt().context(
+        "no install receipt found — `filething update` only works when filething was \
+         installed with the official installer. Re-run the installer from \
+         https://github.com/jrizo0/filething/releases to update (or reinstall)",
+    )?;
+    updater.set_current_version(
+        env!("CARGO_PKG_VERSION")
+            .parse()
+            .context("parsing this binary's own version")?,
+    )?;
+
+    match updater.run().await.context("running the self-update")? {
+        Some(result) => {
+            println!(
+                "filething updated: {} -> {} (installed at {})",
+                env!("CARGO_PKG_VERSION"),
+                result.new_version,
+                result.install_prefix
+            );
+            // The launchd/systemd service keeps the OLD binary running (the
+            // daemon process survives the file swap); restart it onto the new
+            // one. Best-effort, like ensure_background_daemon: the update
+            // itself already succeeded.
+            if crate::service::is_installed() {
+                match crate::service::restart() {
+                    Ok(()) => println!("daemon: restarted on the new binary"),
+                    Err(e) => {
+                        tracing::warn!("could not restart the daemon service: {e:#}");
+                        println!(
+                            "daemon: could not restart automatically; run \
+                             `filething service install` to restart it on the new binary"
+                        );
+                    }
+                }
+            }
+        }
+        None => println!(
+            "filething {} is already the latest version",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+    Ok(())
+}
+
 /// Makes sure the daemon keeps running in the background after a successful
 /// `init`/`clone`/`sync`, so day-to-day use never needs a separate `filething
 /// service install` step (`TODO.md` Fase 6, "daemon por defecto"). ALWAYS

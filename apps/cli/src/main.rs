@@ -173,6 +173,11 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Update filething itself to the latest release (GitHub Releases). Requires
+    /// an install made by the official installer; restarts the daemon service
+    /// afterwards so it runs the new binary.
+    Update,
 }
 
 #[tokio::main]
@@ -237,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         } => commands::gc(dir, apply, grace_secs).await,
         Command::Metrics { dir, json } => commands::metrics(dir, json),
         Command::Service { action } => commands::service(action),
+        Command::Update => commands::update().await,
     };
 
     // Render a failure ourselves so a typed Coordinator error becomes a human
@@ -637,5 +643,15 @@ mod tests {
         }
         // `unmap` with no dir is a parse error (the dir is required).
         assert!(Cli::try_parse_from(["filething", "unmap"]).is_err());
+    }
+
+    /// `update` takes no arguments; extras are a parse error.
+    #[test]
+    fn parse_update() {
+        match Cli::parse_from(["filething", "update"]).command {
+            Command::Update => {}
+            other => panic!("expected Update, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["filething", "update", "extra"]).is_err());
     }
 }

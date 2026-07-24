@@ -1,4 +1,5 @@
-//! ft-chunker — FastCDC content-defined chunking (16/64/256 KiB).
+//! ft-chunker — FastCDC content-defined chunking with code and large-binary
+//! profiles.
 //!
 //! Implements **FastCDC with normalized chunking level 2 (NC-2)** from scratch
 //! (`docs/format.md §3`). The rolling hash is the *gear* hash; the gear table of
@@ -7,7 +8,9 @@
 //! identically (a hard requirement: content-addressing means the same bytes must
 //! produce the same Blocks on every Device). The min/avg/max bounds are
 //! [`ft_core::CHUNK_MIN`] / [`ft_core::CHUNK_AVG`] / [`ft_core::CHUNK_MAX`]
-//! (16 / 64 / 256 KiB).
+//! (16 / 64 / 256 KiB). Large binary assets use
+//! [`LARGE_CHUNK_MIN`] / [`LARGE_CHUNK_AVG`] / [`LARGE_CHUNK_MAX`]
+//! (256 KiB / 1 MiB / 4 MiB) to reduce Vault object overhead.
 //!
 //! # Algorithm (NC-2)
 //!
@@ -54,6 +57,7 @@
 //! the choice is documented and frozen.
 
 use ft_core::{CHUNK_AVG, CHUNK_MAX, CHUNK_MIN};
+pub use ft_core::{LARGE_CHUNK_AVG, LARGE_CHUNK_MAX, LARGE_CHUNK_MIN};
 use ft_hash::gear_table;
 use thiserror::Error;
 
@@ -76,6 +80,12 @@ pub const MASK_S: u64 = 0x0005_7baa_0353_0000;
 /// Popcount = 14 (asserted in tests). A strict subset of [`MASK_S`], so matching
 /// `fp & MASK_L == 0` is strictly easier than `fp & MASK_S == 0`.
 pub const MASK_L: u64 = 0x0005_7b00_0353_0000;
+
+/// NC-2 masks for the 1 MiB target (`bits = 20`, strict/lax = 22/18 bits).
+/// Contiguous low-bit masks are valid for the uniformly distributed gear
+/// fingerprint and keep the strict mask a superset of the lax mask.
+const LARGE_MASK_S: u64 = (1u64 << 22) - 1;
+const LARGE_MASK_L: u64 = (1u64 << 18) - 1;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -182,11 +192,40 @@ impl Chunker {
     ///
     /// Deterministic: same `data` + same gear table ⇒ identical spans, always.
     pub fn chunk(&self, data: &[u8]) -> Vec<Span> {
+        self.chunk_with_profile(data, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX, MASK_S, MASK_L)
+    }
+
+    /// Cuts a large binary asset with the 256 KiB / 1 MiB / 4 MiB profile.
+    ///
+    /// This is the same deterministic FastCDC NC-2 algorithm and gear table as
+    /// [`Chunker::chunk`], only with a wider window. Callers choose the profile
+    /// deterministically from stable file properties (path extension and size).
+    pub fn chunk_large_binary(&self, data: &[u8]) -> Vec<Span> {
+        self.chunk_with_profile(
+            data,
+            LARGE_CHUNK_MIN,
+            LARGE_CHUNK_AVG,
+            LARGE_CHUNK_MAX,
+            LARGE_MASK_S,
+            LARGE_MASK_L,
+        )
+    }
+
+    fn chunk_with_profile(
+        &self,
+        data: &[u8],
+        min: usize,
+        avg: usize,
+        max: usize,
+        strict_mask: u64,
+        lax_mask: u64,
+    ) -> Vec<Span> {
         let mut spans = Vec::new();
         let mut offset = 0usize;
         let total = data.len();
         while offset < total {
-            let len = self.next_cut(&data[offset..]);
+            let len =
+                self.next_cut_with_profile(&data[offset..], min, avg, max, strict_mask, lax_mask);
             spans.push(Span { offset, len });
             offset += len;
         }
@@ -194,39 +233,47 @@ impl Chunker {
     }
 
     /// Returns the length of the next chunk starting at the front of `buf`,
-    /// applying the NC-2 algorithm with the ft-core min/avg/max bounds.
+    /// applying the NC-2 algorithm with the selected profile's bounds and masks.
     ///
     /// Invariants enforced here:
-    /// - returns `buf.len()` when the remaining input is `<= CHUNK_MIN`
+    /// - returns `buf.len()` when the remaining input is `<= min`
     ///   (the tail is one short chunk; we never cut below `min`);
-    /// - never cuts before `CHUNK_MIN` bytes (the hash isn't evaluated there);
-    /// - uses [`MASK_S`] in `[min, avg)` and [`MASK_L`] in `[avg, max)`;
-    /// - forces a cut at `CHUNK_MAX` if no mask matched.
-    fn next_cut(&self, buf: &[u8]) -> usize {
+    /// - never cuts before `min` bytes (the hash isn't evaluated there);
+    /// - uses the strict mask in `[min, avg)` and lax mask in `[avg, max)`;
+    /// - forces a cut at the profile's `max` if no mask matched.
+    fn next_cut_with_profile(
+        &self,
+        buf: &[u8],
+        min: usize,
+        avg: usize,
+        max: usize,
+        strict_mask: u64,
+        lax_mask: u64,
+    ) -> usize {
         let remaining = buf.len();
 
         // Tail / tiny input: nothing left to cut, the whole remainder is one
         // (possibly sub-min) chunk.
-        if remaining <= CHUNK_MIN {
+        if remaining <= min {
             return remaining;
         }
 
         // The normalized point and the hard ceiling, both clamped to what's
         // actually available so we never index past the end.
-        let normal = remaining.min(CHUNK_AVG);
-        let ceiling = remaining.min(CHUNK_MAX);
+        let normal = remaining.min(avg);
+        let ceiling = remaining.min(max);
 
         let mut fp: u64 = 0;
 
-        // Skip the first CHUNK_MIN bytes entirely: no cut may land before min,
+        // Skip the first `min` bytes entirely: no cut may land before min,
         // and FastCDC also does not feed them through the rolling hash. We start
-        // hashing at i = CHUNK_MIN.
-        let mut i = CHUNK_MIN;
+        // hashing at i = min.
+        let mut i = min;
 
         // Phase 1 — strict mask, lengths in [min, avg): suppress short cuts.
         while i < normal {
             fp = (fp << 1).wrapping_add(self.gear[buf[i] as usize]);
-            if fp & MASK_S == 0 {
+            if fp & strict_mask == 0 {
                 return i + 1;
             }
             i += 1;
@@ -235,7 +282,7 @@ impl Chunker {
         // Phase 2 — lax mask, lengths in [avg, max): cut sooner, before max.
         while i < ceiling {
             fp = (fp << 1).wrapping_add(self.gear[buf[i] as usize]);
-            if fp & MASK_L == 0 {
+            if fp & lax_mask == 0 {
                 return i + 1;
             }
             i += 1;
@@ -324,6 +371,14 @@ mod tests {
         // imposes is also imposed by the strict mask, so the lax mask matches
         // strictly more often. This is the load-bearing NC-2 invariant.
         assert_eq!(MASK_S & MASK_L, MASK_L, "MASK_L must be a subset of MASK_S");
+        assert_eq!(LARGE_CHUNK_AVG.trailing_zeros(), 20);
+        assert_eq!(LARGE_MASK_S.count_ones(), 22);
+        assert_eq!(LARGE_MASK_L.count_ones(), 18);
+        assert_eq!(
+            LARGE_MASK_S & LARGE_MASK_L,
+            LARGE_MASK_L,
+            "large-profile lax mask must be a subset of its strict mask"
+        );
     }
 
     #[test]
@@ -331,6 +386,44 @@ mod tests {
         assert_eq!(CHUNK_MIN, 16384);
         assert_eq!(CHUNK_AVG, 65536);
         assert_eq!(CHUNK_MAX, 262144);
+        assert_eq!(LARGE_CHUNK_MIN, 256 * 1024);
+        assert_eq!(LARGE_CHUNK_AVG, 1024 * 1024);
+        assert_eq!(LARGE_CHUNK_MAX, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn large_binary_profile_is_deterministic_and_uses_far_fewer_blocks() {
+        let data = corpus(0xB16B_00B5, 32 * 1024 * 1024);
+        let chunker = Chunker::new(&SECRET);
+
+        let code_spans = chunker.chunk(&data);
+        let large_a = chunker.chunk_large_binary(&data);
+        let large_b = Chunker::new(&SECRET).chunk_large_binary(&data);
+
+        assert_eq!(
+            large_a, large_b,
+            "two Devices must cut the same large binary identically"
+        );
+        assert_tiling(&large_a, data.len());
+        assert!(
+            large_a.len() * 4 <= code_spans.len(),
+            "the large-binary profile should reduce object count by at least 4x; \
+             code={} large={}",
+            code_spans.len(),
+            large_a.len()
+        );
+        for (i, span) in large_a.iter().enumerate() {
+            assert!(
+                span.len <= LARGE_CHUNK_MAX,
+                "large-binary span {i} exceeds its 4 MiB ceiling"
+            );
+            if i + 1 != large_a.len() {
+                assert!(
+                    span.len >= LARGE_CHUNK_MIN,
+                    "non-final large-binary span {i} is below 256 KiB"
+                );
+            }
+        }
     }
 
     // ---- (1) Determinism: same data + same secret -> same spans ----

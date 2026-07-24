@@ -4,10 +4,9 @@
 //! [`SpaceContext::commit`] runs the strict §7 order:
 //!
 //! 1. **scan** ([`SpaceContext::scan`]).
-//! 2. **dedup + upload Blocks**: for each unique `(cid, bytes)`, skip when the
-//!    index already records the Block or the Vault `HEAD`s it present; otherwise
-//!    `PUT` the encoded object and record it locally. (`HEAD` before `PUT` saves
-//!    bandwidth, `§7` step 2.)
+//! 2. **dedup + upload Blocks**: the first Revision uses idempotent direct PUTs;
+//!    later commits `HEAD` each unique `(cid, bytes)` and PUT only when absent.
+//!    Every confirmed Block is then recorded locally (`§7` step 2).
 //! 3. **build Manifest** ([`ft_manifest::build`]).
 //! 4. **upload** every Manifest page (`manifest/<aa>/<cid>`) and externalized
 //!    blocklist (`blocklist/<aa>/<cid>`) to the Vault. INVARIANT after this step:
@@ -29,6 +28,13 @@ use crate::context::{LastSynced, SpaceContext};
 use crate::error::{EngineError, Result};
 use crate::scan::ScanResult;
 use crate::secrets::{generate_chunk_secret, write_meta_blob};
+
+/// Block PUTs carry meaningful payload bytes, so keep their fan-out conservative
+/// enough not to swamp a Device's uplink.
+const BLOCK_UPLOAD_CONCURRENCY: usize = 16;
+/// Key sidecars are tiny (~100 B) and latency-bound; a wider fan-out hides the
+/// per-object R2 round trip without materially increasing bandwidth or memory.
+const SIDECAR_UPLOAD_CONCURRENCY: usize = 64;
 
 /// The result of a [`SpaceContext::commit`] (`§7`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +78,18 @@ pub struct StagedCommit {
     pub scan: ScanResult,
 }
 
+/// How the Vault-side write path establishes object presence.
+///
+/// A brand-new Space can write directly: Block PUTs are content-addressed and
+/// idempotent, while its `keys/<space_id>/` sidecar namespace is guaranteed to
+/// be empty. Later commits retain HEAD-before-PUT because GC may have removed an
+/// object that the local index still records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadStrategy {
+    Initial,
+    VerifyPresence,
+}
+
 impl SpaceContext {
     /// Runs the §7 commit protocol against `expected_base` (the Revision id the
     /// caller believes is the current head; `None` for the very first commit).
@@ -98,7 +116,12 @@ impl SpaceContext {
         // (b)/(c)/(d) stage everything to the Vault (Blocks, then pages +
         // blocklists). INVARIANT after this: everything is in the Vault, nothing
         // in Convex yet (§7).
-        self.upload_blocks(&scan).await?;
+        let strategy = if self.last_synced.seq < 0 {
+            UploadStrategy::Initial
+        } else {
+            UploadStrategy::VerifyPresence
+        };
+        self.upload_blocks(&scan, strategy).await?;
         self.upload_manifest(&manifest).await?;
 
         // (e) the atomic Space-head CAS. A context mounted only for staging has
@@ -143,9 +166,9 @@ impl SpaceContext {
     }
 
     /// Runs the Vault-side of a commit WITHOUT the Coordinator CAS: scan, build
-    /// the Manifest, then upload Blocks (HEAD-before-PUT dedup) and Manifest
-    /// pages/blocklists (`§7` steps 1–4). Returns a [`StagedCommit`] describing
-    /// what landed in the Vault.
+    /// the Manifest, then upload Blocks and Manifest pages/blocklists (`§7` steps
+    /// 1–4). A fresh Space uses direct PUTs; a synced Space uses HEAD-before-PUT.
+    /// Returns a [`StagedCommit`] describing what landed in the Vault.
     ///
     /// This is the network-free core that [`SpaceContext::commit`] wraps with the
     /// CAS; it is also the staging step Part 2 can reuse. It does NOT short-circuit
@@ -153,7 +176,12 @@ impl SpaceContext {
     pub async fn stage_to_vault(&self) -> Result<StagedCommit> {
         let scan = self.scan()?;
         let manifest = ft_manifest::build(scan.entries.clone());
-        let blocks_uploaded = self.upload_blocks(&scan).await?;
+        let strategy = if self.last_synced.seq < 0 {
+            UploadStrategy::Initial
+        } else {
+            UploadStrategy::VerifyPresence
+        };
+        let blocks_uploaded = self.upload_blocks(&scan, strategy).await?;
         self.upload_manifest(&manifest).await?;
         Ok(StagedCommit {
             root: manifest.root,
@@ -164,43 +192,46 @@ impl SpaceContext {
         })
     }
 
-    /// §7 step 2: for each unique scanned Block, `HEAD` the Vault and `PUT` only
-    /// when it is absent; record presence locally. Returns the number of objects
-    /// actually uploaded.
+    /// §7 step 2: direct-PUT each unique scanned Block for the initial Revision;
+    /// on later Revisions, `HEAD` and `PUT` only when absent. Record confirmed
+    /// presence locally. Returns the number of objects actually uploaded.
     ///
-    /// It deliberately does NOT trust the local block index (`has_block`) to skip
-    /// the `HEAD`: the GC (`gc.rs`) can delete a Block the local index still
-    /// records — its own Device's sweep, or another Device's account-wide sweep —
-    /// so skipping the presence check would let a commit publish a Manifest that
-    /// references an object no longer in the Vault (a dangling reference: every
-    /// other Device's pull would fail with `object not found`). §7 requires every
-    /// referenced Block to be in the Vault BEFORE the CAS, and the local cache is
-    /// not a trustworthy proxy for that once a destructive GC exists. The `HEAD`
-    /// per known Block is the price of that safety (commits are human-paced).
+    /// Later commits deliberately do NOT trust the local block index (`has_block`)
+    /// to skip `HEAD`: GC (`gc.rs`) can delete a Block the index still records.
+    /// The initial Revision is the safe exception: content-addressed PUT is
+    /// idempotent and establishes presence directly before the CAS.
     ///
     /// The network HEAD/PUT round-trips run CONCURRENTLY (`buffer_unordered`,
     /// bounded to 16 in flight) since each Block is independent; the local index
     /// writes (`self.index.put_block`) run AFTERWARDS, sequentially, over the
     /// collected results — `ft_index` is a local SQLite handle with no benefit
     /// from concurrency and no need to share it across the fan-out. Before the
-    /// fan-out, `Vault::warm` announces every upcoming HEAD/PUT in one batch so a
-    /// backend with per-operation setup cost can prepare them together (ADR
-    /// 0016); it is a pure hint and its failure never blocks the upload.
-    async fn upload_blocks(&self, scan: &ScanResult) -> Result<usize> {
+    /// fan-out, `Vault::warm` announces the exact upcoming operations so a backend
+    /// with per-operation setup cost can prepare them together (ADR 0016/0020);
+    /// it is a pure hint and its failure never blocks the upload.
+    async fn upload_blocks(&self, scan: &ScanResult, strategy: UploadStrategy) -> Result<usize> {
         use futures::stream::{self, StreamExt, TryStreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Instant;
 
         let space_id = self.space_id.as_str();
 
-        let mut warm_ops =
-            Vec::with_capacity(scan.blocks_to_upload.len() * 2 + scan.sidecars.len() * 2);
+        let operation_count = if strategy == UploadStrategy::Initial {
+            1
+        } else {
+            2
+        };
+        let mut warm_ops = Vec::with_capacity(
+            (scan.blocks_to_upload.len() + scan.sidecars.len()) * operation_count,
+        );
         for (cid, _) in &scan.blocks_to_upload {
             let key = ft_hash::block_key(cid);
-            warm_ops.push(ft_vault::WarmOp {
-                key: key.clone(),
-                method: ft_vault::WarmMethod::Head,
-            });
+            if strategy == UploadStrategy::VerifyPresence {
+                warm_ops.push(ft_vault::WarmOp {
+                    key: key.clone(),
+                    method: ft_vault::WarmMethod::Head,
+                });
+            }
             warm_ops.push(ft_vault::WarmOp {
                 key,
                 method: ft_vault::WarmMethod::Put,
@@ -208,10 +239,12 @@ impl SpaceContext {
         }
         for (cid, _) in &scan.sidecars {
             let key = ft_diff::keys_key(space_id, cid);
-            warm_ops.push(ft_vault::WarmOp {
-                key: key.clone(),
-                method: ft_vault::WarmMethod::Head,
-            });
+            if strategy == UploadStrategy::VerifyPresence {
+                warm_ops.push(ft_vault::WarmOp {
+                    key: key.clone(),
+                    method: ft_vault::WarmMethod::Head,
+                });
+            }
             warm_ops.push(ft_vault::WarmOp {
                 key,
                 method: ft_vault::WarmMethod::Put,
@@ -232,11 +265,19 @@ impl SpaceContext {
                 let completed = &completed;
                 async move {
                     let key = ft_hash::block_key(cid);
-                    let uploaded = if self.vault.head(&key).await? {
-                        false
-                    } else {
-                        self.vault.put(&key, encoded.clone()).await?;
-                        true
+                    let uploaded = match strategy {
+                        UploadStrategy::Initial => {
+                            self.vault.put(&key, encoded.clone()).await?;
+                            true
+                        }
+                        UploadStrategy::VerifyPresence => {
+                            if self.vault.head(&key).await? {
+                                false
+                            } else {
+                                self.vault.put(&key, encoded.clone()).await?;
+                                true
+                            }
+                        }
                     };
                     let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(25) {
@@ -245,7 +286,7 @@ impl SpaceContext {
                     Result::Ok((*cid, uploaded))
                 }
             })
-            .buffer_unordered(16)
+            .buffer_unordered(BLOCK_UPLOAD_CONCURRENCY)
             .try_collect()
             .await?;
 
@@ -271,19 +312,48 @@ impl SpaceContext {
         // Space needs its own sidecar there. Same HEAD-before-PUT skip: the wrap
         // uses a fresh nonce each call so the bytes differ run-to-run, but it
         // unwraps to the same data key, so writing it once is enough. Empty with
-        // encryption off. No index write here (sidecars are not tracked in the
-        // Block-presence table), so the network fan-out needs no sequential tail.
+        // encryption off. A new Space PUTs directly because its sidecar namespace
+        // is empty; later commits retain HEAD-before-PUT. No index write here
+        // (sidecars are not tracked in the Block-presence table).
+        let sidecar_total = scan.sidecars.len();
+        tracing::info!(total = sidecar_total, "uploading key sidecars");
+        let sidecar_started = Instant::now();
+        let sidecars_completed = AtomicUsize::new(0);
+
         stream::iter(scan.sidecars.iter())
-            .map(|(cid, sidecar)| async move {
-                let key = ft_diff::keys_key(space_id, cid);
-                if !self.vault.head(&key).await? {
-                    self.vault.put(&key, sidecar.clone()).await?;
+            .map(|(cid, sidecar)| {
+                let sidecars_completed = &sidecars_completed;
+                async move {
+                    let key = ft_diff::keys_key(space_id, cid);
+                    match strategy {
+                        UploadStrategy::Initial => {
+                            self.vault.put(&key, sidecar.clone()).await?;
+                        }
+                        UploadStrategy::VerifyPresence => {
+                            if !self.vault.head(&key).await? {
+                                self.vault.put(&key, sidecar.clone()).await?;
+                            }
+                        }
+                    }
+                    let n = sidecars_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(25) {
+                        tracing::info!(
+                            completed = n,
+                            total = sidecar_total,
+                            "uploading key sidecars"
+                        );
+                    }
+                    Result::Ok(())
                 }
-                Result::Ok(())
             })
-            .buffer_unordered(16)
+            .buffer_unordered(SIDECAR_UPLOAD_CONCURRENCY)
             .try_collect::<Vec<()>>()
             .await?;
+        tracing::info!(
+            total = sidecar_total,
+            elapsed_ms = sidecar_started.elapsed().as_millis() as u64,
+            "key sidecars uploaded"
+        );
 
         Ok(uploaded)
     }

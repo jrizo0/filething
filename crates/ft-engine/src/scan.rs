@@ -50,6 +50,19 @@ pub const CONTROL_DIR: &str = ".filething";
 /// The per-Space ignore-file name (`§Ignore file`). Empty by default.
 pub const IGNORE_FILE: &str = ".filethingignore";
 
+/// Files below this size keep the code-optimized 16/64/256 KiB FastCDC profile
+/// regardless of extension. The wider binary profile only pays off when enough
+/// Blocks exist to amortize a profile switch.
+const LARGE_BINARY_THRESHOLD: usize = 1024 * 1024;
+
+/// Extensions whose formats are already compressed, containerized, or commonly
+/// rewritten as opaque binary assets. Matching is ASCII case-insensitive.
+const LARGE_BINARY_EXTENSIONS: &[&str] = &[
+    "7z", "avi", "bin", "bmp", "bz2", "db", "docx", "flac", "gif", "gz", "ico", "jpeg", "jpg",
+    "mkv", "mov", "mp3", "mp4", "ogg", "parquet", "pdf", "png", "pptx", "rar", "sqlite", "sqlite3",
+    "tar", "tiff", "wav", "webm", "webp", "xlsx", "xz", "zip", "zst",
+];
+
 /// Platform-junk file names ALWAYS excluded from the Manifest, independent of
 /// the user's `.filethingignore` (ADR 0011). These are OS-generated sidecars
 /// (macOS Finder / Windows Explorer) that carry no user data and must never
@@ -281,7 +294,11 @@ impl SpaceContext {
         let whole_pcid = ft_hash::pcid_of(&bytes);
         let exec = self.fs.exec_bit(&item.meta);
 
-        let spans = self.chunker.chunk(&bytes);
+        let spans = if uses_large_binary_profile(&item.canonical, bytes.len()) {
+            self.chunker.chunk_large_binary(&bytes)
+        } else {
+            self.chunker.chunk(&bytes)
+        };
         let mut bk: Vec<Cid> = Vec::with_capacity(spans.len());
         let mut block_refs: Vec<BlockRef> = Vec::with_capacity(spans.len());
 
@@ -517,6 +534,23 @@ impl SpaceContext {
             Err(_) => 0,
         }
     }
+}
+
+/// Selects the large-binary FastCDC profile from stable properties shared by
+/// every Device. Keeping the decision path+size-only makes re-scans deterministic
+/// without adding a chunk-profile field to the Manifest.
+fn uses_large_binary_profile(path: &CanonicalPath, size: usize) -> bool {
+    if size < LARGE_BINARY_THRESHOLD {
+        return false;
+    }
+    Path::new(path.as_str())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            LARGE_BINARY_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
 }
 
 impl WalkItem {

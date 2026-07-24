@@ -6,12 +6,15 @@
 //! operator-only path used by `gc` (`docs/adr/`, `crates/ft-vault/src/lib.rs`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use convex::{ConvexClient, FunctionResult, Value};
 use ft_vault::{Vault, VaultError, VaultObject, VaultResult, WarmMethod, WarmOp};
+use futures::StreamExt;
 use tokio::sync::Mutex;
 
 /// The Convex action that mints presigned S3 URLs for the caller's Account.
@@ -35,6 +38,10 @@ const SIGN_URL_CACHE_TTL: Duration =
 /// Max ops per `vault:sign` call (the action's own batch limit,
 /// `packages/backend/convex/vault.ts`).
 const SIGN_BATCH_LIMIT: usize = 256;
+/// Independent Convex signing actions allowed in flight while warming a large
+/// transfer. This removes the O(number-of-batches) latency chain without
+/// flooding the Coordinator.
+const SIGN_BATCH_CONCURRENCY: usize = 4;
 
 /// A cached presigned URL plus the instant it stops being trusted.
 #[derive(Debug, Clone)]
@@ -198,8 +205,51 @@ fn signed_op_arg(key: &str, method: &str) -> Value {
 }
 
 /// Pairs each [`WarmOp`] with its `(key, method)` shape for [`SignedVault::sign_batch`].
+#[cfg(test)]
 fn batch_pairs(ops: &[WarmOp]) -> Vec<(&str, WarmMethod)> {
     ops.iter().map(|op| (op.key.as_str(), op.method)).collect()
+}
+
+type SignBatchFuture<'a> = Pin<Box<dyn Future<Output = VaultResult<Vec<SignedOp>>> + Send + 'a>>;
+type OwnedWarmOp = (String, WarmMethod);
+
+struct SignedWarmBatches {
+    signed: Vec<SignedOp>,
+    first_error: Option<VaultError>,
+}
+
+/// Signs independent warm batches with bounded concurrency. The callback is an
+/// internal seam: production passes the Convex signer, while tests can inject a
+/// deterministic latency adapter and verify the performance characteristic.
+async fn sign_warm_batches<'a, F>(ops: &[WarmOp], signer: F) -> SignedWarmBatches
+where
+    F: Fn(Vec<OwnedWarmOp>) -> SignBatchFuture<'a> + Clone + Send + Sync + 'a,
+{
+    let owned_batches: Vec<Vec<OwnedWarmOp>> = ops
+        .chunks(SIGN_BATCH_LIMIT)
+        .map(|chunk| chunk.iter().map(|op| (op.key.clone(), op.method)).collect())
+        .collect();
+    let batches: Vec<VaultResult<Vec<SignedOp>>> = futures::stream::iter(owned_batches)
+        .map(move |batch| {
+            let signer = signer.clone();
+            signer(batch)
+        })
+        .buffer_unordered(SIGN_BATCH_CONCURRENCY)
+        .collect()
+        .await;
+    let mut signed = Vec::new();
+    let mut first_error = None;
+    for batch in batches {
+        match batch {
+            Ok(mut batch) => signed.append(&mut batch),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    SignedWarmBatches {
+        signed,
+        first_error,
+    }
 }
 
 /// Parses a `vault:sign` [`FunctionResult`] into the [`SignedOp`]s it
@@ -341,28 +391,45 @@ impl Vault for SignedVault {
     }
 
     async fn warm(&self, ops: &[WarmOp]) -> VaultResult<()> {
-        for chunk in ops.chunks(SIGN_BATCH_LIMIT) {
-            let pairs = batch_pairs(chunk);
-            let signed = self.sign_batch(&pairs).await?;
-            for op in chunk {
-                let method_str = method_to_str(op.method);
-                let url = signed
+        let batches = sign_warm_batches(ops, |chunk| {
+            Box::pin(async move {
+                let pairs: Vec<(&str, WarmMethod)> = chunk
                     .iter()
-                    .find(|signed_op| {
-                        signed_op.key == op.key && signed_op.method.eq_ignore_ascii_case(method_str)
-                    })
-                    .map(|signed_op| signed_op.url.clone())
-                    .ok_or_else(|| VaultError::S3 {
-                        key: op.key.clone(),
-                        message: format!(
-                            "{SIGN_ACTION} did not return a presigned URL for {method_str} {} in warm batch",
-                            op.key
-                        ),
-                    })?;
+                    .map(|(key, method)| (key.as_str(), *method))
+                    .collect();
+                self.sign_batch(&pairs).await
+            })
+        })
+        .await;
+        let by_operation: HashMap<(String, String), String> = batches
+            .signed
+            .into_iter()
+            .map(|op| ((op.key, op.method.to_ascii_uppercase()), op.url))
+            .collect();
+
+        let mut warm_error = batches.first_error;
+        for op in ops {
+            let method_str = method_to_str(op.method);
+            if let Some(url) = by_operation
+                .get(&(op.key.clone(), method_str.to_string()))
+                .cloned()
+            {
                 self.cache_url(&op.key, op.method, url);
+            } else if warm_error.is_none() {
+                warm_error = Some(VaultError::S3 {
+                    key: op.key.clone(),
+                    message: format!(
+                        "{SIGN_ACTION} did not return a presigned URL for {method_str} {} in warm batch",
+                        op.key
+                    ),
+                });
             }
         }
-        Ok(())
+        if let Some(error) = warm_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -525,6 +592,91 @@ mod tests {
         // The chunk starts at global index 256 (even => Get).
         assert_eq!(pairs[0], ("blocks/aa/256", WarmMethod::Get));
         assert_eq!(pairs[1], ("blocks/aa/257", WarmMethod::Head));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_batches_are_signed_with_bounded_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let ops: Vec<WarmOp> = (0..(SIGN_BATCH_LIMIT * 4 + 1))
+            .map(|i| WarmOp {
+                key: format!("blocks/aa/{i}"),
+                method: WarmMethod::Put,
+            })
+            .collect();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let batches = sign_warm_batches(&ops, {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            move |chunk| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                Box::pin(async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let signed = chunk
+                        .iter()
+                        .map(|(key, method)| SignedOp {
+                            key: key.clone(),
+                            method: method_to_str(*method).to_string(),
+                            url: format!("https://example.invalid/{key}"),
+                        })
+                        .collect();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(signed)
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(batches.signed.len(), ops.len());
+        assert!(batches.first_error.is_none());
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            SIGN_BATCH_CONCURRENCY,
+            "warm must fill, but never exceed, its bounded signing window"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_batch_failure_preserves_other_successful_results() {
+        let ops: Vec<WarmOp> = (0..(SIGN_BATCH_LIMIT * 3))
+            .map(|i| WarmOp {
+                key: format!("blocks/aa/{i}"),
+                method: WarmMethod::Head,
+            })
+            .collect();
+
+        let batches = sign_warm_batches(&ops, |batch| {
+            Box::pin(async move {
+                if batch[0].0 == format!("blocks/aa/{SIGN_BATCH_LIMIT}") {
+                    return Err(VaultError::S3 {
+                        key: "injected batch".to_string(),
+                        message: "injected signing failure".to_string(),
+                    });
+                }
+                Ok(batch
+                    .into_iter()
+                    .map(|(key, method)| SignedOp {
+                        url: format!("https://example.invalid/{key}"),
+                        key,
+                        method: method_to_str(method).to_string(),
+                    })
+                    .collect())
+            })
+        })
+        .await;
+
+        assert_eq!(
+            batches.signed.len(),
+            SIGN_BATCH_LIMIT * 2,
+            "successful batches must remain available for caching"
+        );
+        assert!(batches.first_error.is_some());
     }
 
     // ----- signed URL cache expiration -----

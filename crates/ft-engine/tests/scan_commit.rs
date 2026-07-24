@@ -23,6 +23,7 @@ use ft_vault::{FsVault, Vault, VaultResult};
 /// (the "only changed Blocks move" claim, §7 / Gate 5).
 struct CountingVault {
     inner: FsVault,
+    head_calls: Arc<AtomicUsize>,
     block_puts: Arc<AtomicUsize>,
     manifest_puts: Arc<AtomicUsize>,
     total_puts: Arc<AtomicUsize>,
@@ -32,6 +33,7 @@ impl CountingVault {
     fn new(inner: FsVault) -> Self {
         Self {
             inner,
+            head_calls: Arc::new(AtomicUsize::new(0)),
             block_puts: Arc::new(AtomicUsize::new(0)),
             manifest_puts: Arc::new(AtomicUsize::new(0)),
             total_puts: Arc::new(AtomicUsize::new(0)),
@@ -45,11 +47,16 @@ impl CountingVault {
             self.total_puts.clone(),
         )
     }
+
+    fn head_calls(&self) -> Arc<AtomicUsize> {
+        self.head_calls.clone()
+    }
 }
 
 #[async_trait]
 impl Vault for CountingVault {
     async fn head(&self, key: &str) -> VaultResult<bool> {
+        self.head_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.head(key).await
     }
     async fn get(&self, key: &str) -> VaultResult<Vec<u8>> {
@@ -67,6 +74,61 @@ impl Vault for CountingVault {
     async fn list(&self, prefix: &str) -> VaultResult<Vec<ft_vault::VaultObject>> {
         self.inner.list(prefix).await
     }
+    async fn delete(&self, key: &str) -> VaultResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A Vault adapter that adds latency only to encrypted key-sidecar PUTs and
+/// records their peak concurrency. Block and Manifest writes remain immediate,
+/// isolating the latency-bound phase observed during large initial commits.
+struct SidecarLatencyVault {
+    inner: FsVault,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+impl SidecarLatencyVault {
+    fn new(inner: FsVault) -> Self {
+        Self {
+            inner,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn max_in_flight(&self) -> Arc<AtomicUsize> {
+        self.max_in_flight.clone()
+    }
+}
+
+#[async_trait]
+impl Vault for SidecarLatencyVault {
+    async fn head(&self, key: &str) -> VaultResult<bool> {
+        self.inner.head(key).await
+    }
+
+    async fn get(&self, key: &str) -> VaultResult<Vec<u8>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, body: Vec<u8>) -> VaultResult<()> {
+        if key.starts_with("keys/") {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let result = self.inner.put(key, body).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        } else {
+            self.inner.put(key, body).await
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> VaultResult<Vec<ft_vault::VaultObject>> {
+        self.inner.list(prefix).await
+    }
+
     async fn delete(&self, key: &str) -> VaultResult<()> {
         self.inner.delete(key).await
     }
@@ -254,6 +316,33 @@ fn scan_large_file_produces_multiple_blocks() {
 }
 
 #[test]
+fn scan_large_pdf_uses_fewer_blocks_than_same_sized_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let bytes = pseudo_random(2 * 1024 * 1024, 0xA11CE);
+    write_file(root, "documents/archive.pdf", &bytes, false);
+    write_file(root, "src/generated.rs", &bytes, false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-adaptive-chunking";
+    seed_space_state(&index, space_id, root, [0x23; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let scan = ctx.scan().unwrap();
+    let pdf = entry_for(&scan.entries, "documents/archive.pdf").unwrap();
+    let source = entry_for(&scan.entries, "src/generated.rs").unwrap();
+
+    assert!(
+        pdf.bk.len() * 4 <= source.bk.len(),
+        "large binary assets should create at least 4x fewer Vault objects than source files \
+         of the same size; pdf={} source={}",
+        pdf.bk.len(),
+        source.bk.len()
+    );
+}
+
+#[test]
 fn scan_symlink_preserve_vs_local_only_and_derived() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -395,6 +484,68 @@ async fn stage_uploads_blocks_and_pages_and_root_matches_build() {
 }
 
 #[tokio::test]
+async fn first_stage_puts_blocks_and_sidecars_without_presence_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a.txt", b"first encrypted payload", false);
+    write_file(root, "b.txt", b"second encrypted payload", false);
+
+    let vdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-first-stage";
+    seed_space_state(&index, space_id, root, [0x51; 32]);
+    let counting = CountingVault::new(FsVault::new(vdir.path()));
+    let head_calls = counting.head_calls();
+    let vault: Box<dyn Vault> = Box::new(counting);
+    let mut ctx = mount_ctx(index, vault, space_id);
+    ctx.attach_crypto(test_crypto(space_id));
+
+    let staged = ctx.stage_to_vault().await.unwrap();
+
+    assert_eq!(staged.blocks_uploaded, 2);
+    assert_eq!(staged.scan.sidecars.len(), 2);
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        0,
+        "a brand-new Space owns an empty sidecar namespace and content-addressed PUTs are \
+         idempotent, so its first stage must not pay a HEAD per object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initial_sidecar_upload_uses_high_concurrency_for_latency_bound_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..80 {
+        write_file(
+            root,
+            &format!("objects/{i:03}.bin"),
+            format!("unique encrypted payload {i:03}").as_bytes(),
+            false,
+        );
+    }
+
+    let vdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-sidecar-concurrency";
+    seed_space_state(&index, space_id, root, [0x52; 32]);
+    let latency = SidecarLatencyVault::new(FsVault::new(vdir.path()));
+    let max_in_flight = latency.max_in_flight();
+    let vault: Box<dyn Vault> = Box::new(latency);
+    let mut ctx = mount_ctx(index, vault, space_id);
+    ctx.attach_crypto(test_crypto(space_id));
+
+    let staged = ctx.stage_to_vault().await.unwrap();
+
+    assert_eq!(staged.scan.sidecars.len(), 80);
+    assert_eq!(
+        max_in_flight.load(Ordering::SeqCst),
+        64,
+        "small sidecar objects should use the full latency-hiding fan-out"
+    );
+}
+
+#[tokio::test]
 async fn restage_after_one_file_change_uploads_only_new_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -409,14 +560,24 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
     let space_id = "space-delta";
     seed_space_state(&index, space_id, root, [0x66; 32]);
     let counting = CountingVault::new(FsVault::new(vdir.path()));
+    let head_calls = counting.head_calls();
     let (block_puts, _manifest_puts, _total) = counting.counters();
     let vault: Box<dyn Vault> = Box::new(counting);
-    let ctx = mount_ctx(index, vault, space_id);
+    let mut ctx = mount_ctx(index, vault, space_id);
 
     // First stage uploads all three Blocks.
     let first = ctx.stage_to_vault().await.unwrap();
     assert_eq!(first.blocks_uploaded, 3);
     assert_eq!(block_puts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        0,
+        "the initial stage writes directly"
+    );
+
+    // Model the successful CAS that advances a real Space out of its initial
+    // state. Subsequent stages must HEAD-verify every referenced Block.
+    ctx.last_synced.seq = 0;
 
     // Change exactly one file; re-stage. Only the ONE new Block uploads (the
     // other two dedup against the local index — Gate 5).
@@ -431,6 +592,11 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
         block_puts.load(Ordering::SeqCst) - block_puts_before,
         1,
         "exactly one new blocks/ PUT after a one-file change"
+    );
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        3,
+        "a later stage must HEAD all three referenced Blocks before deciding which one to PUT"
     );
 
     // The new root differs from the first (the tree changed).

@@ -65,17 +65,20 @@ Lenguaje ubicuo (se usa en mayúscula inicial a lo largo del documento): **Space
 ## 3. Chunking FastCDC
 
 - Algoritmo: **FastCDC con normalized chunking nivel 2** (DOS máscaras alrededor del avg). Content-defined real, no chunking fijo. El normalized chunking es lo que estrecha la distribución alrededor del avg y respeta min/max sin sesgo geométrico hacia max — es parte normativa, no un detalle.
-- **Parámetros concretos:**
+- **Perfiles concretos:**
 
-  | Param | Valor | |
-  |---|---|---|
-  | `min` | **16 KiB** (16384) | suelo: evita explosión de micro-Blocks y acota el conteo de objetos; con header de 64 B el overhead queda < 0.4 %. |
-  | `avg` | **64 KiB** (65536, máscara objetivo) | sweet spot para sync de **código** (no backup): un archivo de fuente típico (1–50 KiB) cabe en 1 Block, y editar una línea re-chunkea solo ese archivo moviendo 1–2 Blocks. |
-  | `max` | **256 KiB** (262144) | techo de varianza; cada Block sube en un solo PUT de R2 sin multipart; acota memoria de buffering en la CLI Rust. |
+  | Perfil | Selección | `min` | `avg` | `max` |
+  |---|---|---:|---:|---:|
+  | código (default) | cualquier archivo no cubierto por el perfil binario | **16 KiB** | **64 KiB** | **256 KiB** |
+  | binario grande | tamaño ≥ **1 MiB** y extensión binaria conocida (comparación ASCII case-insensitive) | **256 KiB** | **1 MiB** | **4 MiB** |
 
-  Ratio 1:4:16 (min:avg:max), el clásico de FastCDC.
+  Ambos mantienen ratio 1:4:16 (min:avg:max), el clásico de FastCDC. La lista
+  normativa de extensiones vive en `ft-engine/src/scan.rs`
+  (`LARGE_BINARY_EXTENSIONS`) e incluye PDF/Office, imágenes, audio/video,
+  archives, SQLite/Parquet y contenedores binarios comunes. La selección usa
+  únicamente path y tamaño, así que es determinista entre Devices.
 
-- **Justificación del avg bajo (vs el ~1 MiB de restic):** `mvp-minimal` y `convex-first` eligieron 64 KiB; `restic-git` eligió 1 MiB con min 256 KiB, lo que —como señaló su propio juez— **elimina el delta intra-archivo para el corpus típico de código** (todo archivo < 256 KiB es 1 Block, editar 1 byte re-sube el archivo entero). Para un sync de código eso es inaceptable. Adoptamos **16/64/256 KiB**: hay delta real dentro de archivos de fuente medianos y el conteo de objetos sigue acotado por el min de 16 KiB. Trade-off aceptado: más objetos que con avg 1 MiB (ver nota de archivos chicos).
+- **Justificación adaptativa:** `mvp-minimal` y `convex-first` eligieron 64 KiB para no eliminar el delta intra-archivo del corpus típico de código. Ese perfil se conserva. Para un PDF/ZIP/video grande, en cambio, miles de Blocks pequeños multiplican HEAD/PUT, firmas y sidecars sin aportar el mismo valor; el perfil de 1 MiB reduce objetos manteniendo CDC real.
 
 - **chunk secret por-Space (constraint 4):** 32 bytes aleatorios generados al crear el Space, NO derivados de la Space key (rotar la Space key no debe re-chunkear el mundo). Siembra la gear table de 256 entradas `u64` vía `gear[i] = BLAKE3.derive_key("filething.cdc.gear.v1", chunk_secret)` expandido a 256·8 bytes (XOF). Vive en el blob de metadata del Space (en claro en MVP; opaco/cifrable en zero-knowledge). Consecuencia esperada y aceptada: el dedup NO cruza Spaces (el mismo archivo en dos Spaces produce cortes y `cid` distintos) — coherente con scope de dedup = Account/Space, no global.
 
@@ -515,5 +518,5 @@ Para leer el `pcid` del estado base, el Device usa la FileEntry del path en el M
 5. **Colisión por NFC tratada como conflicto**; NFC aplica solo a la key del Manifest, no al contenido ni al target de symlink.
 6. **Safety de GC reservada en el protocolo**: grace-period por antigüedad + `retentionFloorSeq = min(devices.baseSeqInUse)`.
 7. **`dedup` de Convex es caché, no fuente de verdad**; el dedup real vive local + HEAD al Vault.
-8. **FastCDC 16/64/256 KiB con normalized chunking nivel 2** (no el 256K/1M/4M de backup): hay delta intra-archivo para código.
+8. **FastCDC adaptativo con normalized chunking nivel 2**: 16/64/256 KiB para código y 256 KiB/1 MiB/4 MiB para binarios grandes.
 9. **Primitivas:** BLAKE3-256 (+ modo KDF), naming hex-lower con fan-out de 2 chars, CBOR canónico para páginas, XChaCha20-Poly1305 AEAD + wrap.

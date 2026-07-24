@@ -37,6 +37,7 @@ use tracing_subscriber::Layer;
 /// which materializes through the same code).
 const PHASES: &[&str] = &[
     "uploading blocks",
+    "uploading key sidecars",
     "uploading manifest pages and blocklists",
     "fast-forwarding changes",
     "applying changes",
@@ -47,6 +48,7 @@ const PHASES: &[&str] = &[
 /// line to `total/total` and terminates it with a newline. COUPLED to `ft-engine`.
 const DONE: &[&str] = &[
     "blocks uploaded",
+    "key sidecars uploaded",
     "manifest uploaded",
     "fast-forward applied",
     "reconcile materialized",
@@ -190,5 +192,11 @@ mod tests {
     #[test]
     fn fast_forward_done_terminator_is_present() {
         assert!(DONE.contains(&"fast-forward applied"));
+    }
+
+    #[test]
+    fn encrypted_key_sidecars_have_a_visible_phase_and_terminator() {
+        assert!(PHASES.contains(&"uploading key sidecars"));
+        assert!(DONE.contains(&"key sidecars uploaded"));
     }
 }

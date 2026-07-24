@@ -19,12 +19,18 @@ use thiserror::Error;
 // Constants — wire/format (docs/format.md §3, §4.3, §5.3; BUILD-PLAN §3)
 // ---------------------------------------------------------------------------
 
-/// FastCDC minimum chunk size (16 KiB). `docs/format.md §3`.
+/// Code-profile FastCDC minimum chunk size (16 KiB). `docs/format.md §3`.
 pub const CHUNK_MIN: usize = 16384;
-/// FastCDC average / target chunk size (64 KiB). `docs/format.md §3`.
+/// Code-profile FastCDC average / target chunk size (64 KiB). `docs/format.md §3`.
 pub const CHUNK_AVG: usize = 65536;
-/// FastCDC maximum chunk size (256 KiB). `docs/format.md §3`.
+/// Code-profile FastCDC maximum chunk size (256 KiB). `docs/format.md §3`.
 pub const CHUNK_MAX: usize = 262144;
+/// Large-binary FastCDC minimum chunk size (256 KiB). `docs/format.md §3`.
+pub const LARGE_CHUNK_MIN: usize = 256 * 1024;
+/// Large-binary FastCDC average / target chunk size (1 MiB). `docs/format.md §3`.
+pub const LARGE_CHUNK_AVG: usize = 1024 * 1024;
+/// Large-binary FastCDC maximum chunk size (4 MiB). `docs/format.md §3`.
+pub const LARGE_CHUNK_MAX: usize = 4 * 1024 * 1024;
 
 /// Maximum `FileEntry` count per Manifest leaf page. `docs/format.md §5.3`.
 pub const LEAF_FANOUT: usize = 256;
@@ -976,6 +982,9 @@ mod tests {
         assert_eq!(CHUNK_MIN, 16384);
         assert_eq!(CHUNK_AVG, 65536);
         assert_eq!(CHUNK_MAX, 262144);
+        assert_eq!(LARGE_CHUNK_MIN, 256 * 1024);
+        assert_eq!(LARGE_CHUNK_AVG, 1024 * 1024);
+        assert_eq!(LARGE_CHUNK_MAX, 4 * 1024 * 1024);
         assert_eq!(LEAF_FANOUT, 256);
         assert_eq!(INDEX_FANOUT, 256);
         assert_eq!(ENTRY_INLINE_MAX, 262144);

@@ -14,6 +14,8 @@ curl -fsSL https://github.com/jrizo0/filething/releases/latest/download/filethin
 
 Supported platforms: macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64). Windows is not supported yet.
 
+To upgrade later, run `filething update` — it replaces the binary with the latest GitHub release and restarts the daemon service. (It only works for installs made by the script above; a `cargo build` checkout upgrades with `git pull` + rebuild.)
+
 From source (requires [Rust](https://www.rust-lang.org/tools/install)):
 
 ```
@@ -36,7 +38,7 @@ filething login --email you@example.com --name my-desktop
 filething clone <space_id> ~/notes
 ```
 
-> Signup on the managed deployment is closed by default (invite-only for now). Self-hosting (see below) has no such restriction.
+> Signup on the managed deployment is closed by default: the operator opens it (`FILETHING_ALLOW_SIGNUP=1`) long enough to create an account, then closes it again. There is no per-invite gate yet — the flag is on or off for everyone. Self-hosting (see below) has no such restriction.
 
 The password is read from `$FILETHING_PASSWORD` (useful in scripts) or prompted for interactively.
 
@@ -64,8 +66,11 @@ filething metrics                 # sync counters (commits, pulls, conflicts, st
 | Command | What it does |
 |---|---|
 | `login` | Authenticate this Device (Better Auth) and register it with the account. `--signup` creates the account; a second Device just logs in to the existing one. |
+| `whoami` | Show who this Device is logged in as, its own name and id, and the Coordinator URL. Local config only, no network. |
+| `spaces` | List the account's Spaces, marking which are mapped to a folder on this Device — so a Space id never has to be copied by hand. |
 | `init <dir>` | Turn a local folder into a new Space and commit its first Revision. |
 | `clone <space_id> <dir>` | Materialize an existing Space into a local folder. |
+| `unmap <dir>` | Stop syncing a Space on this Device, keeping the local files. The Space and its history stay on the Coordinator and your other Devices. |
 | `status [dir]` | Show a Space's synced base and whether it has uncommitted local changes. |
 | `ls [dir]` | List a Space's synced paths, from the local index. |
 | `sync <dir>` | One-shot: pull the head, then commit local changes. |
@@ -73,6 +78,7 @@ filething metrics                 # sync counters (commits, pulls, conflicts, st
 | `gc <dir>` | Garbage-collect the account's Vault (dry-run by default; pass `--apply` to delete). |
 | `metrics [dir]` | Show sync metrics for a Space, or every mapped Space. |
 | `service <install\|uninstall\|status>` | Manage the daemon as an OS service (launchd on macOS, systemd --user on Linux). |
+| `update` | Upgrade filething itself to the latest GitHub release and restart the daemon service. Requires an install made by the installer script. |
 
 Run `filething <command> --help` for the full flag list.
 

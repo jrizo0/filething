@@ -65,6 +65,27 @@ pub enum EngineError {
     /// (e.g. a `chunk_secret` that is not exactly 32 bytes). `§9`.
     #[error("space state: {0}")]
     SpaceState(String),
+
+    /// A SAFETY GUARD refused to perform a destructive operation because its
+    /// preconditions did not hold — e.g. the GC found no reachability roots at all
+    /// (`gc.rs`), which would otherwise sweep the whole Vault. The message states
+    /// what was refused and why. Refusing is always the safe direction, so this is
+    /// an error rather than a warning.
+    #[error("refused: {0}")]
+    Refused(String),
+
+    /// Another process already holds this Space's exclusive lock. Two processes
+    /// driving one Space can commit a Revision built from a half-applied tree, so
+    /// the second one refuses rather than racing.
+    #[error(
+        "another filething process is syncing {root} ({holder}); wait for it to finish or stop it"
+    )]
+    SpaceLocked {
+        /// The Space root whose lock is held.
+        root: String,
+        /// A description of the holder (e.g. `pid 1234`).
+        holder: String,
+    },
 }
 
 /// Crate-wide `Result` alias over [`EngineError`].

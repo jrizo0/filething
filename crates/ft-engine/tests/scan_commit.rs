@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ft_core::{CanonicalPath, FileType};
-use ft_engine::SpaceContext;
+use ft_engine::{SkipReason, SpaceContext};
 use ft_fsmap::{LinuxFs, OsFs};
 use ft_index::{Index, SpaceState};
 use ft_vault::{FsVault, Vault, VaultResult};
@@ -134,6 +134,78 @@ impl Vault for SidecarLatencyVault {
     }
 }
 
+/// An [`OsFs`] decorator over [`LinuxFs`] that counts `read_bytes` per path and
+/// can be told to fail one path with EACCES — so a test can prove the §9 fast path
+/// really skips a re-read, and that one unreadable file no longer fails the scan,
+/// without depending on running as a non-root user.
+struct ScriptedFs {
+    reads: Arc<std::sync::Mutex<Vec<String>>>,
+    denied: Option<String>,
+}
+
+impl ScriptedFs {
+    fn new() -> Self {
+        Self {
+            reads: Arc::new(std::sync::Mutex::new(Vec::new())),
+            denied: None,
+        }
+    }
+
+    fn denying(path: &str) -> Self {
+        Self {
+            denied: Some(path.to_string()),
+            ..Self::new()
+        }
+    }
+
+    fn reads(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        self.reads.clone()
+    }
+}
+
+impl OsFs for ScriptedFs {
+    fn read_bytes(&self, path: &Path) -> ft_fsmap::Result<Vec<u8>> {
+        let shown = path.to_string_lossy().into_owned();
+        // Every scan probes `.filethingignore` through this adapter; that is not a
+        // content read, so leaving it out lets a test assert "this scan read nothing".
+        if !shown.ends_with(ft_engine::IGNORE_FILE) {
+            self.reads.lock().unwrap().push(shown.clone());
+        }
+        if self.denied.as_ref().is_some_and(|d| shown.ends_with(d)) {
+            return Err(ft_fsmap::FsMapError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied",
+            )));
+        }
+        LinuxFs.read_bytes(path)
+    }
+    fn write_bytes(&self, path: &Path, bytes: &[u8], exec: bool) -> ft_fsmap::Result<()> {
+        LinuxFs.write_bytes(path, bytes, exec)
+    }
+    fn read_symlink(&self, path: &Path) -> ft_fsmap::Result<String> {
+        LinuxFs.read_symlink(path)
+    }
+    fn create_symlink(&self, target: &str, path: &Path) -> ft_fsmap::Result<()> {
+        LinuxFs.create_symlink(target, path)
+    }
+    fn exec_bit(&self, meta: &std::fs::Metadata) -> bool {
+        LinuxFs.exec_bit(meta)
+    }
+    fn real_mtime(&self, path: &Path) -> ft_fsmap::Result<std::time::SystemTime> {
+        LinuxFs.real_mtime(path)
+    }
+}
+
+/// Backdates a file's mtime by `secs`, so the §9 fast path is allowed to trust the
+/// row: it deliberately refuses any mtime stamped in the CURRENT second (a further
+/// write in the same second would be invisible).
+fn backdate(path: &Path, secs: u64) {
+    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+}
+
 /// Seeds a `space_state` row for `space_id` (a fresh, never-synced Space) so a
 /// no-coordinator context can be `mount`ed for scan/stage tests.
 fn seed_space_state(index: &Index, space_id: &str, local_root: &Path, chunk_secret: [u8; 32]) {
@@ -154,10 +226,20 @@ fn seed_space_state(index: &Index, space_id: &str, local_root: &Path, chunk_secr
 /// Mounts a scan/stage-only [`SpaceContext`] (no Coordinator) over an in-memory
 /// index, a counting FsVault and the LinuxFs adapter.
 fn mount_ctx(index: Index, vault: Box<dyn Vault>, space_id: &str) -> SpaceContext {
+    mount_ctx_with_fs(index, vault, Box::new(LinuxFs), space_id)
+}
+
+/// [`mount_ctx`] with an explicit [`OsFs`] adapter (a [`ScriptedFs`] double).
+fn mount_ctx_with_fs(
+    index: Index,
+    vault: Box<dyn Vault>,
+    fs: Box<dyn OsFs + Send + Sync>,
+    space_id: &str,
+) -> SpaceContext {
     SpaceContext::mount(
         index,
         vault,
-        Box::new(LinuxFs),
+        fs,
         ft_engine::AccountId::new("acct-test"),
         ft_engine::DeviceId::new("dev-test"),
         ft_engine::SpaceId::new(space_id),
@@ -433,6 +515,392 @@ fn scan_drops_index_rows_for_deleted_files() {
 }
 
 // ---------------------------------------------------------------------------
+// A skip is not a deletion: one bad path must not stop the Space from syncing,
+// and must not tell the other Devices to delete a file that still exists.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_reports_an_unreadable_file_and_keeps_its_previous_manifest_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "keep.txt", b"keep", false);
+    write_file(root, "locked.txt", b"secret contents", false);
+
+    // A file-backed index so the same rows can be re-opened under a second adapter.
+    let side = tempfile::tempdir().unwrap();
+    let index_path = side.path().join("index.db");
+    let index = Index::open(&index_path).unwrap();
+    let space_id = "space-eacces";
+    seed_space_state(&index, space_id, root, [0x91; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(side.path().join("vault")));
+
+    // First scan reads both files, so `locked.txt` has an index row + entry.
+    let first = {
+        let ctx = mount_ctx(index, vault, space_id);
+        ctx.scan().unwrap()
+    };
+    let locked_before = entry_for(&first.entries, "locked.txt").unwrap().clone();
+    assert!(first.skipped.is_empty());
+
+    // Re-mount with an adapter that denies reading it (EACCES), as a root-owned
+    // mode-000 file does.
+    let ctx = mount_ctx_with_fs(
+        Index::open(&index_path).unwrap(),
+        Box::new(FsVault::new(side.path().join("vault"))),
+        Box::new(ScriptedFs::denying("locked.txt")),
+        space_id,
+    );
+    // The whole scan must SUCCEED: commit AND pull both start here, so failing
+    // would stop the Space from syncing in either direction.
+    let scan = ctx.scan().unwrap();
+    assert!(
+        ctx.index
+            .get_entry(space_id, &CanonicalPath("locked.txt".to_string()))
+            .unwrap()
+            .is_some(),
+        "a transient EACCES must not drop the index row"
+    );
+
+    // The readable file still syncs, and the unreadable one keeps EXACTLY the entry
+    // it published before — publishing its absence would delete it everywhere else.
+    assert!(entry_for(&scan.entries, "keep.txt").is_some());
+    let locked_after = entry_for(&scan.entries, "locked.txt")
+        .expect("an unreadable file must keep its previous Manifest entry");
+    assert_eq!(*locked_after, locked_before);
+
+    // And the reason is reported, WITH the offending path.
+    assert_eq!(scan.skipped.len(), 1, "{:?}", scan.skipped);
+    assert_eq!(scan.skipped[0].path, "locked.txt");
+    assert!(scan.skipped[0].retained);
+    let shown = scan.skipped[0].reason.to_string();
+    assert!(
+        shown.contains("locked.txt") && shown.contains("Permission denied"),
+        "the cause must name the path, not just the errno: {shown}"
+    );
+}
+
+#[test]
+fn scan_never_opens_a_fifo_and_reports_it_as_an_unsupported_file_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "keep.txt", b"keep", false);
+
+    // A FIFO (an editor/Postgres unix socket behaves the same): `fs::read` on it
+    // BLOCKS FOREVER, so the walk must never hand it to the File handler.
+    let fifo = root.join("pipe");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be available on this unix host");
+    assert!(made.success(), "mkfifo failed");
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-fifo";
+    seed_space_state(&index, space_id, root, [0x92; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let scan = ctx.scan().unwrap();
+
+    let paths: Vec<&str> = scan.entries.iter().map(|(_, e)| e.p.as_str()).collect();
+    assert_eq!(paths, vec!["keep.txt"], "a FIFO is not a syncable entry");
+    assert_eq!(scan.skipped.len(), 1, "{:?}", scan.skipped);
+    assert_eq!(scan.skipped[0].path, "pipe");
+    // Matched as the ENUM, not just the message: a caller outside the crate has to
+    // be able to tell a routine skip from one the user must act on.
+    assert_eq!(scan.skipped[0].reason, SkipReason::UnsupportedFileType);
+    assert!(scan.skipped[0]
+        .reason
+        .to_string()
+        .contains("FIFO, socket or device node"));
+    assert!(
+        ctx.index
+            .get_entry(space_id, &CanonicalPath("pipe".to_string()))
+            .unwrap()
+            .is_none(),
+        "an unsupported file type is never indexed"
+    );
+}
+
+#[test]
+fn scan_of_a_root_that_is_gone_retains_every_entry_instead_of_publishing_a_wholesale_deletion() {
+    // The failure a per-path skip cannot cover: the walk failed at the ROOT, so it
+    // learned nothing about ANY path and cannot say which rows the failure covers.
+    // A delete is an absence (§8), so inferring deletions from a tree the scan never
+    // saw would publish a Revision that wipes the Space on every other Device — the
+    // external volume that did not mount, or a root someone moved aside mid-sync.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    std::fs::create_dir_all(&root).unwrap();
+    write_file(&root, "a.txt", b"alpha", false);
+    write_file(&root, "b/c.txt", b"charlie", false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-gone-root";
+    seed_space_state(&index, space_id, &root, [0x94; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let before = ctx.scan().unwrap();
+    let mut published: Vec<&str> = before.entries.iter().map(|(_, e)| e.p.as_str()).collect();
+    published.sort_unstable();
+    assert_eq!(published, vec!["a.txt", "b", "b/c.txt"]);
+    assert!(before.skipped.is_empty());
+
+    // The root itself vanishes: the walk's very first read_dir fails, and the error
+    // names the root, so nothing can be attributed to a subtree.
+    std::fs::remove_dir_all(&root).unwrap();
+    let after = ctx.scan().unwrap();
+
+    let mut kept: Vec<&str> = after.entries.iter().map(|(_, e)| e.p.as_str()).collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept, published,
+        "every entry of the last good scan must be republished, byte-for-byte"
+    );
+    assert_eq!(after.entries, before.entries);
+    // The rows survive too, so the NEXT scan (once the volume is back) still has a
+    // base to compare against instead of re-hashing a tree it thinks is brand new.
+    for path in ["a.txt", "b", "b/c.txt"] {
+        assert!(
+            ctx.index
+                .get_entry(space_id, &CanonicalPath(path.to_string()))
+                .unwrap()
+                .is_some(),
+            "{path} lost its index row to a root that was merely unreachable"
+        );
+    }
+    // And it is loud: a Space that silently stops syncing is indistinguishable from
+    // data loss, so every retained path is reported with the cause.
+    let mut reported: Vec<&str> = after.skipped.iter().map(|s| s.path.as_str()).collect();
+    reported.sort_unstable();
+    assert_eq!(reported, published, "{:?}", after.skipped);
+    assert!(
+        after.skipped.iter().all(|s| s.retained),
+        "{:?}",
+        after.skipped
+    );
+}
+
+#[test]
+fn scan_keeps_a_derived_path_that_is_absent_on_disk_out_of_the_deletion_set() {
+    // A Device that RECEIVED a `t=2` derived entry has an index row for it but
+    // nothing on disk (materialize creates nothing for derived — ADR 0001). Its next
+    // scan must NOT publish that absence as a deletion: the origin would then apply
+    // it, `remove_dir` would fail ENOTEMPTY, and its pull would fail forever.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "package-lock.json", b"{}", false);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-derived-absent";
+    seed_space_state(&index, space_id, root, [0x93; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    // Exactly the row `pull` writes for a received derived entry.
+    for path in ["node_modules", "target"] {
+        ctx.index
+            .upsert_entry(
+                space_id,
+                &ft_index::LocalEntry {
+                    path: CanonicalPath(path.to_string()),
+                    casefold_key: ft_fsmap::casefold_key(&CanonicalPath(path.to_string())),
+                    file_type: FileType::Derived,
+                    exec: false,
+                    size: 0,
+                    mtime: 0,
+                    pcid: None,
+                    base_seq: 0,
+                    blocks: Vec::new(),
+                    local_only: true,
+                },
+            )
+            .unwrap();
+    }
+
+    let scan = ctx.scan().unwrap();
+
+    for path in ["node_modules", "target"] {
+        let entry = entry_for(&scan.entries, path)
+            .unwrap_or_else(|| panic!("{path} must stay in the Manifest as t=2"));
+        assert_eq!(entry.t, FileType::Derived);
+        assert!(entry.bk.is_empty(), "derived entries carry no Blocks");
+        assert!(
+            ctx.index
+                .get_entry(space_id, &CanonicalPath(path.to_string()))
+                .unwrap()
+                .is_some(),
+            "the derived row must survive a scan that does not see it on disk"
+        );
+    }
+    assert!(
+        scan.skipped.is_empty(),
+        "an absent derived path is the expected state, not a warning: {:?}",
+        scan.skipped
+    );
+}
+
+#[test]
+fn scan_publishes_only_one_of_two_casefold_colliding_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "Notes.md", b"upper", false);
+    write_file(root, "notes.md", b"lower", false);
+    if std::fs::read_dir(root).unwrap().count() < 2 {
+        // A case-insensitive filesystem (APFS, NTFS) collapsed the two writes into
+        // one file, so there is no collision to resolve here. The unit test in
+        // scan.rs covers the resolution itself on every host.
+        return;
+    }
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-collide";
+    seed_space_state(&index, space_id, root, [0x94; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let ctx = mount_ctx(index, vault, space_id);
+
+    let scan = ctx.scan().unwrap();
+
+    // §5.2/§5.3: exactly one entry per casefold key, or ft_manifest::build receives
+    // duplicate keys and a case-insensitive peer destroys one of the two files.
+    let mut keys: Vec<&str> = scan.entries.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort();
+    let deduped = {
+        let mut k = keys.clone();
+        k.dedup();
+        k
+    };
+    assert_eq!(keys, deduped, "duplicate Manifest keys: {keys:?}");
+    let paths: Vec<&str> = scan.entries.iter().map(|(_, e)| e.p.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["Notes.md"],
+        "the lexicographically first path keeps the key"
+    );
+    assert_eq!(scan.skipped.len(), 1, "{:?}", scan.skipped);
+    assert_eq!(scan.skipped[0].path, "notes.md");
+    assert!(scan.skipped[0].reason.to_string().contains("Notes.md"));
+    // Both files stay on disk and in the index: the loser is not synced, not lost.
+    assert!(root.join("notes.md").exists());
+}
+
+// ---------------------------------------------------------------------------
+// The §9 re-scan fast path: an unchanged file is not read again.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_reuses_the_stored_blocks_of_an_unchanged_file_instead_of_re_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "big.bin", &pseudo_random(300 * 1024, 0xFEED), false);
+    write_file(root, "small.txt", b"small", false);
+    backdate(&root.join("big.bin"), 120);
+    backdate(&root.join("small.txt"), 120);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-fastpath";
+    seed_space_state(&index, space_id, root, [0x95; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let scripted = ScriptedFs::new();
+    let reads = scripted.reads();
+    let ctx = mount_ctx_with_fs(index, vault, Box::new(scripted), space_id);
+
+    let first = ctx.scan().unwrap();
+    assert_eq!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("big.bin"))
+            .count(),
+        1,
+        "the first scan must read the file"
+    );
+
+    // A scan is only allowed to reuse a Block it has CONFIRMED is in the Vault
+    // (`local_block`), which the commit's upload step records. Model that.
+    for (_, entry) in &first.entries {
+        for cid in &entry.bk {
+            ctx.index.put_block(space_id, cid).unwrap();
+        }
+    }
+    reads.lock().unwrap().clear();
+
+    let second = ctx.scan().unwrap();
+
+    assert!(
+        reads.lock().unwrap().is_empty(),
+        "an unchanged tree must not be re-read, re-hashed and re-encrypted (§9): {:?}",
+        reads.lock().unwrap()
+    );
+    assert_eq!(
+        second.manifest_root(),
+        first.manifest_root(),
+        "the reused entries must reproduce the same manifestRoot"
+    );
+    assert!(
+        second.blocks_to_upload.is_empty(),
+        "nothing changed, so there is nothing to upload"
+    );
+
+    // Change one file: only THAT one is read again.
+    write_file(root, "small.txt", b"small, but edited", false);
+    reads.lock().unwrap().clear();
+    let third = ctx.scan().unwrap();
+    let read_paths = reads.lock().unwrap().clone();
+    assert_eq!(
+        read_paths
+            .iter()
+            .filter(|p| p.ends_with("small.txt"))
+            .count(),
+        1
+    );
+    assert!(
+        !read_paths.iter().any(|p| p.ends_with("big.bin")),
+        "the untouched file must stay untouched: {read_paths:?}"
+    );
+    assert_ne!(third.manifest_root(), first.manifest_root());
+}
+
+#[test]
+fn scan_refuses_the_fast_path_when_the_stored_blocks_were_never_uploaded() {
+    // A scan writes the index row even when the commit that follows it FAILS. If a
+    // later scan reused that row, it would publish a Manifest referencing Blocks the
+    // Vault never received and every other Device's pull would fail. `local_block`
+    // (populated only after a confirmed PUT/HEAD) is the guard.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "never-uploaded.txt", b"bytes that never left", false);
+    backdate(&root.join("never-uploaded.txt"), 120);
+
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-unuploaded";
+    seed_space_state(&index, space_id, root, [0x96; 32]);
+    let vault: Box<dyn Vault> = Box::new(FsVault::new(dir.path().join("__vault")));
+    let scripted = ScriptedFs::new();
+    let reads = scripted.reads();
+    let ctx = mount_ctx_with_fs(index, vault, Box::new(scripted), space_id);
+
+    let first = ctx.scan().unwrap();
+    assert_eq!(first.blocks_to_upload.len(), 1);
+    reads.lock().unwrap().clear();
+
+    // No `put_block`: the upload never happened.
+    let second = ctx.scan().unwrap();
+    assert_eq!(
+        reads.lock().unwrap().len(),
+        1,
+        "a file whose Blocks are not known to be in the Vault must be re-read"
+    );
+    assert_eq!(
+        second.blocks_to_upload.len(),
+        1,
+        "so the commit can still upload them"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // stage_to_vault (the network-free Vault side of commit, §7 steps 1-4)
 // ---------------------------------------------------------------------------
 
@@ -554,6 +1022,11 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
     write_file(root, "one.txt", b"file one contents\n", false);
     write_file(root, "two.txt", b"file two contents\n", false);
     write_file(root, "three.txt", b"file three contents\n", false);
+    // Backdate them out of the §9 fast path's "written this second" window, so the
+    // second stage deterministically reuses the two unchanged files.
+    for name in ["one.txt", "two.txt", "three.txt"] {
+        backdate(&root.join(name), 120);
+    }
 
     let vdir = tempfile::tempdir().unwrap();
     let index = Index::open_in_memory().unwrap();
@@ -576,8 +1049,11 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
     );
 
     // Model the successful CAS that advances a real Space out of its initial
-    // state. Subsequent stages must HEAD-verify every referenced Block.
+    // state: BOTH halves of the base move, seq and root. The root matters as much
+    // as the seq — it is what makes these three files head-reachable, which is the
+    // only thing that lets a later stage reference their Blocks without a HEAD.
     ctx.last_synced.seq = 0;
+    ctx.last_synced.root = first.root;
 
     // Change exactly one file; re-stage. Only the ONE new Block uploads (the
     // other two dedup against the local index — Gate 5).
@@ -595,12 +1071,164 @@ async fn restage_after_one_file_change_uploads_only_new_blocks() {
     );
     assert_eq!(
         head_calls.load(Ordering::SeqCst),
-        3,
-        "a later stage must HEAD all three referenced Blocks before deciding which one to PUT"
+        1,
+        "the §9 fast path keeps a BASE-REACHABLE unchanged file out of the upload set entirely, \
+         so a later stage HEADs only the changed file's Block — not every Block of the whole Space"
     );
 
     // The new root differs from the first (the tree changed).
     assert_ne!(first.root, second.root);
+}
+
+#[tokio::test]
+async fn a_row_the_published_base_does_not_cover_is_re_read_and_verified_before_it_is_referenced() {
+    // The other half of the fast path's bargain (the `gc.rs` invariant). A commit
+    // uploaded these Blocks and recorded them in `local_block`, but its CAS never
+    // landed — the Space was offline/quarantined past the GC grace — so no Revision
+    // references them and the GC is free to sweep them as orphans. Trusting
+    // `local_block` here would publish a head pointing at objects the Vault may no
+    // longer have, and every later scan would take the same fast path, so it would
+    // never self-heal. The file must be re-read and re-verified instead.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    for name in ["one.txt", "two.txt", "three.txt"] {
+        write_file(root, name, format!("body of {name}\n").as_bytes(), false);
+        backdate(&root.join(name), 120);
+    }
+
+    let vdir = tempfile::tempdir().unwrap();
+    let index = Index::open_in_memory().unwrap();
+    let space_id = "space-unpublished";
+    seed_space_state(&index, space_id, root, [0x67; 32]);
+    let counting = CountingVault::new(FsVault::new(vdir.path()));
+    let head_calls = counting.head_calls();
+    let (block_puts, _manifest_puts, _total) = counting.counters();
+    let vault: Box<dyn Vault> = Box::new(counting);
+    let mut ctx = mount_ctx(index, vault, space_id);
+
+    // Everything is uploaded and recorded locally...
+    let first = ctx.stage_to_vault().await.unwrap();
+    assert_eq!(first.blocks_uploaded, 3);
+
+    // ...but the head never advanced past the empty base: the Space has a `seq`
+    // (it is not brand new) and a base root that covers NONE of these paths.
+    ctx.last_synced.seq = 0;
+    let head_calls_before = head_calls.load(Ordering::SeqCst);
+    let block_puts_before = block_puts.load(Ordering::SeqCst);
+
+    let second = ctx.stage_to_vault().await.unwrap();
+
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst) - head_calls_before,
+        3,
+        "a row no Revision references must be HEAD-verified before its cids are published"
+    );
+    assert_eq!(
+        block_puts.load(Ordering::SeqCst) - block_puts_before,
+        0,
+        "the objects are still there, so verifying them costs a HEAD and no re-upload"
+    );
+    assert_eq!(second.blocks_uploaded, 0);
+    assert_eq!(
+        second.root, first.root,
+        "re-reading the files must produce exactly the same tree"
+    );
+}
+
+#[tokio::test]
+async fn a_file_whose_blocks_never_reached_the_vault_is_not_republished_when_it_becomes_unreadable()
+{
+    // The republish path's own version of the same hazard. scan1 hashes `secret.bin`
+    // and writes its index row; the commit that should have uploaded it fails, so
+    // the head still knows nothing about it. On scan2 the file is unreadable
+    // (EACCES), which is a SKIP, not a deletion — but rebuilding its entry from the
+    // stale row would publish cids the Vault never received, and every other
+    // Device's pull would then fail with "object not found". The path was never in
+    // any Revision, so leaving it out deletes nothing anywhere.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    std::fs::create_dir_all(&root).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let index_path = side.path().join("index.db");
+    let space_id = "space-unuploaded-republish";
+
+    // A published base that carries `keep.txt` and NOT `secret.bin`.
+    write_file(&root, "keep.txt", b"published\n", false);
+    let index = Index::open(&index_path).unwrap();
+    seed_space_state(&index, space_id, &root, [0x68; 32]);
+    let mut ctx = mount_ctx(
+        index,
+        Box::new(FsVault::new(side.path().join("vault"))),
+        space_id,
+    );
+    let base = ctx.stage_to_vault().await.unwrap();
+    ctx.last_synced.seq = 0;
+    ctx.last_synced.root = base.root;
+
+    // The file appears and is hashed into the index by a scan whose commit then
+    // failed: the row exists, `local_block` does not (only an upload writes it).
+    write_file(&root, "secret.bin", b"never uploaded\n", false);
+    let scan1 = ctx.scan().unwrap();
+    let staged_cids: Vec<ft_core::Cid> = entry_for(&scan1.entries, "secret.bin")
+        .expect("the local view still sees the file")
+        .bk
+        .clone();
+    assert!(!staged_cids.is_empty());
+    drop(ctx);
+
+    // Now it cannot be read at all.
+    let ctx = mount_ctx_with_fs(
+        Index::open(&index_path).unwrap(),
+        Box::new(FsVault::new(side.path().join("vault"))),
+        Box::new(ScriptedFs::denying("secret.bin")),
+        space_id,
+    );
+    let mut ctx = ctx;
+    ctx.last_synced.seq = 0;
+    ctx.last_synced.root = base.root;
+
+    let staged = ctx.stage_to_vault().await.unwrap();
+
+    assert!(
+        entry_for(&staged.scan.entries, "keep.txt").is_some(),
+        "the rest of the tree still publishes"
+    );
+    assert!(
+        entry_for(&staged.scan.entries, "secret.bin").is_none(),
+        "an entry whose Blocks never reached the Vault must not be published: {:?}",
+        staged.scan.entries
+    );
+    let referenced: Vec<ft_core::Cid> = staged
+        .scan
+        .entries
+        .iter()
+        .flat_map(|(_, e)| e.bk.clone())
+        .collect();
+    for cid in &staged_cids {
+        assert!(
+            !referenced.contains(cid),
+            "the Manifest references a Block the Vault never received: {cid}"
+        );
+    }
+    // The row survives, so the file resumes syncing the moment it is readable again.
+    assert!(
+        ctx.index
+            .get_entry(space_id, &CanonicalPath("secret.bin".to_string()))
+            .unwrap()
+            .is_some(),
+        "a skip must never drop the index row"
+    );
+    let skipped = staged
+        .scan
+        .skipped
+        .iter()
+        .find(|s| s.path == "secret.bin")
+        .expect("a path that stops syncing is always reported");
+    assert!(
+        !skipped.retained,
+        "nothing was retained for it — the base never carried it: {skipped:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

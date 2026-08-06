@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # filething — demo de los criterios de exito a-d via la CLI real contra la infra viva.
 # Dos "Devices" = dos FILETHING_HOME + dos carpetas en esta misma maquina Linux.
+#
+# Sin `-e` a propósito: cada gate decide su propio veredicto con `... || fail`, y
+# hay predicados que fallan como parte de la prueba (un `grep` sin match, un
+# `docker inspect` de un contenedor que se acaba de parar). Con `-e` el script
+# moriría a mitad de gate en vez de reportar.
 set -uo pipefail
 
 # Este gate corre sync one-shot y daemons de usar y tirar en FILETHING_HOME's
@@ -19,11 +24,20 @@ A_DIR="$WORK/dirA";       B_DIR="$WORK/dirB"
 # En un worktree, infra/.env (gitignored) no existe; usa FT_ENV_FILE para apuntar
 # al .env del checkout que tiene las credenciales de la infra local compartida.
 ENV_FILE="${FT_ENV_FILE:-$REPO/infra/.env}"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ERROR: no existe $ENV_FILE — corre infra/scripts/up.sh (lo genera) o fija FT_ENV_FILE." >&2
+  exit 1
+fi
 set -a; source "$ENV_FILE"; set +a
 export CONVEX_SELF_HOSTED_URL="${CONVEX_SELF_HOSTED_URL:-http://localhost:3210}"
 # El cliente usa S3_* y CONVEX_SELF_HOSTED_*; ya vienen de infra/.env.
+: "${S3_ACCESS_KEY:?falta en $ENV_FILE}"; : "${S3_SECRET_KEY:?falta en $ENV_FILE}"
+: "${S3_BUCKET:?falta en $ENV_FILE}"
 
-mc() { docker run --rm --network filething_default --entrypoint sh minio/mc:latest -c "mc alias set L http://minio:9000 ${S3_ACCESS_KEY} ${S3_SECRET_KEY} >/dev/null 2>&1; $1"; }
+# Las credenciales van entrecomilladas DENTRO del `sh -c`: ya no son el literal
+# minioadmin sino un valor generado (infra/scripts/up.sh), y sin comillas
+# cualquier metacaracter rompería el comando dentro del contenedor.
+mc() { docker run --rm --network filething_default --entrypoint sh minio/mc:latest -c "mc alias set L http://minio:9000 '${S3_ACCESS_KEY}' '${S3_SECRET_KEY}' >/dev/null 2>&1; $1"; }
 count_blocks() { mc "mc ls --recursive L/${S3_BUCKET}/blocks 2>/dev/null | wc -l" | tr -d '[:space:]'; }
 a() { FILETHING_HOME="$A_HOME" "$BIN" "$@"; }
 b() { FILETHING_HOME="$B_HOME" "$BIN" "$@"; }
@@ -49,13 +63,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rm -rf "$WORK"; mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
+# `${WORK:?}`: un `rm -rf` cuya variable se vacíe borraría `/` — el guard hace que
+# falle en vez de expandirse a nada (WORK es un literal hoy, no siempre lo será).
+rm -rf "${WORK:?}"; mkdir -p "$A_HOME" "$B_HOME" "$A_DIR" "$B_DIR"
 
 # Auth real (Better Auth): un email único por corrida (para poder repetir el gate
 # sin colisionar con cuentas previas) y una password por env var. El segundo
 # Device es el MISMO usuario logueando en otro FILETHING_HOME (ya no hay pairing).
 FT_EMAIL="${FILETHING_TEST_EMAIL:-demo-$(date +%s)-$$@example.com}"
-export FILETHING_PASSWORD="${FILETHING_PASSWORD:-test-password-12345}"
+export FILETHING_PASSWORD="${FILETHING_PASSWORD:-test-password-12345}"  # gitleaks:allow — cuenta de usar y tirar del gate, no es una credencial
 
 hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
 # Signup (Better Auth) está deshabilitado por defecto en el backend (Fase 3 Fix
@@ -63,8 +79,10 @@ hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
 # así que lo abrimos en el backend self-hosted de ESTE arbol y lo revertimos
 # al terminar (via el trap `cleanup`, éxito o fallo).
 ORIG_ALLOW_SIGNUP="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
-( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ) || fail "no se pudo fijar FILETHING_ALLOW_SIGNUP=1 (revisa CONVEX_SELF_HOSTED_ADMIN_KEY en $ENV_FILE)"
+# El flag se arma ANTES de mutar: un `env set` que aplica y devuelve != 0 dejaría
+# el signup abierto sin que el trap lo supiera (mismo criterio en cloud-smoke.sh).
 ALLOW_SIGNUP_TOUCHED=1
+( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ) || fail "no se pudo fijar FILETHING_ALLOW_SIGNUP=1 (revisa CONVEX_SELF_HOSTED_ADMIN_KEY en $ENV_FILE)"
 
 hr "SETUP — login A (signup) + login B (mismo usuario, otro Device)"
 a login --signup --email "$FT_EMAIL" --name device-a || fail "login --signup de A"
@@ -182,7 +200,7 @@ wait_for() {
     return 1
 }
 
-command rm -rf "$DWORK"; mkdir -p "$DA_HOME" "$DB_HOME" "$DA_DIR" "$DB_DIR"
+command rm -rf "${DWORK:?}"; mkdir -p "$DA_HOME" "$DB_HOME" "$DA_DIR" "$DB_DIR"
 
 hr "SETUP (e/f) — login A + login B (mismo usuario, otros Devices), init+clone"
 # Reusa la cuenta creada en el primer SETUP (mismo email); solo son dos Devices

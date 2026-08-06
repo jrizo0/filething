@@ -89,8 +89,23 @@ pub async fn write_meta_blob(vault: &dyn Vault, chunk_secret: &[u8; 32]) -> Resu
 /// Fetches and decodes the [`MetaBlob`] at `cid` from the Vault, returning the
 /// 32-byte chunk secret. The read path used when cloning a Space onto a new
 /// Device (Part 2), exposed here so both halves share one codec.
+///
+/// The object is re-hashed against `cid` before ANY of its contents are trusted,
+/// exactly as Blocks (`ft_block::verify`) and Manifest pages
+/// (`ft_manifest::decode_page_verified`) are. This blob is key material: its
+/// `chunk_secret` decides how every file of the Space is cut (`§3`) and, under
+/// `alg=1`, feeds key derivation (`§4.4`). Whoever could substitute the bytes
+/// would therefore choose this Device's chunking — and its keys — while the
+/// `metaBlobCid` the Coordinator recorded still said otherwise. There is no
+/// fallback: a mismatch is a hard error.
 pub async fn load_meta_blob(vault: &dyn Vault, cid: &Cid) -> Result<[u8; 32]> {
     let bytes = vault.get(&meta_key(cid)).await?;
+    let computed = ft_hash::cid_of(&bytes);
+    if computed != *cid {
+        return Err(EngineError::MetaBlob(format!(
+            "meta blob cid mismatch at {cid}: object hashes to {computed}"
+        )));
+    }
     let blob = decode_meta_blob(&bytes)?;
     blob.chunk_secret_array()
 }
@@ -161,6 +176,27 @@ mod tests {
 
         let loaded = load_meta_blob(&vault, &cid).await.unwrap();
         assert_eq!(loaded, secret);
+    }
+
+    #[tokio::test]
+    async fn load_meta_blob_rejects_an_object_that_does_not_hash_to_its_cid() {
+        // Substitution: a DIFFERENT chunk secret published under the `metaBlobCid`
+        // the Coordinator recorded. Accepting it would silently make this Device
+        // cut every file differently from its peers (`§3`) with key material the
+        // attacker chose (`§4.4`), so the load must fail rather than return it.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+        let real = [0x11u8; 32];
+        let cid = write_meta_blob(&vault, &real).await.unwrap();
+
+        let forged = encode_meta_blob(&MetaBlob::new(&[0x99u8; 32])).unwrap();
+        vault.put(&meta_key(&cid), forged).await.unwrap();
+
+        let err = load_meta_blob(&vault, &cid).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::MetaBlob(ref m) if m.contains("cid mismatch")),
+            "expected a cid-mismatch MetaBlob error, got {err}"
+        );
     }
 
     #[test]

@@ -93,8 +93,14 @@ pub fn canonicalize(space_root: &Path, target: &Path) -> Result<CanonicalPath> {
         .map_err(|_| FsMapError::EscapesRoot(display_lossy(target)))?;
 
     // Re-encode the relative path with forward slashes, validating UTF-8 per
-    // component (so the error names UTF-8 problems precisely, and we never let a
-    // backslash from a component leak through on the wire surface).
+    // component (so the error names UTF-8 problems precisely).
+    //
+    // Component BYTES are pushed verbatim: on unix a file may legitimately be
+    // named `foo\bar.txt` or `a:b.txt`, and this function's job is to describe
+    // what is on disk, not to judge it. Whether such a name can be SYNCED is a
+    // separate, shared rule — `ft_core::CanonicalPath::unsyncable_reason` — which
+    // the scanner consults to keep the name out of the Manifest and `ft_diff::apply`
+    // consults to skip (never fail on) an entry an older build already committed.
     let mut parts: Vec<&str> = Vec::new();
     for comp in rel.components() {
         match comp {

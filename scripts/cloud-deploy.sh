@@ -29,6 +29,12 @@ set +a
 echo ">> Desplegando packages/backend a Convex Cloud"
 echo "   CONVEX_URL = $CONVEX_URL"
 
+# Instalar DESDE el lockfile antes de desplegar: `bunx convex` resuelve el binario
+# del node_modules del workspace, así que sin esto el deploy podía correr con una
+# versión del CLI de Convex distinta de la que fija bun.lock (o descargarse una de
+# la red). --frozen-lockfile falla en vez de reescribir el lockfile en silencio.
+( cd "$REPO" && bun install --frozen-lockfile )
+
 # `convex deploy` toma el deployment del propio deploy key; lo exportamos y usamos
 # -y (no interactivo). Se ejecuta desde packages/backend, en un subshell para no
 # alterar el cwd del que invoca.

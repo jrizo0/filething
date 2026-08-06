@@ -55,6 +55,24 @@ pub enum ManifestError {
     /// The page `"k"` field was neither leaf (`0`) nor index (`1`).
     #[error("unknown page kind: {0}")]
     UnknownKind(u8),
+
+    /// A Manifest page carried a non-zero header `nonce`. Pages are always written
+    /// `alg=0` with a zero nonce, and the header is outside the `page_cid`, so this
+    /// means the object's header was altered. See [`decode_page`].
+    #[error("manifest page has a non-zero header nonce (pages are always alg=0)")]
+    NonZeroPageNonce,
+
+    /// The page object's bytes do not hash to the `page_cid` that referenced it —
+    /// the object was substituted or corrupted in the Vault. See
+    /// [`decode_page_verified`].
+    #[error("manifest page cid mismatch at {expected}: object hashes to {computed}")]
+    PageCidMismatch {
+        /// The cid the referrer (a Revision's `manifestRoot`, or a parent index
+        /// page) promised.
+        expected: Cid,
+        /// What the bytes actually hash to.
+        computed: Cid,
+    },
 }
 
 /// Crate `Result` alias over [`ManifestError`].
@@ -301,13 +319,67 @@ fn push_page(pages: &mut Vec<(Cid, Vec<u8>)>, cid: Cid, obj: Vec<u8>) {
 // decode_page
 // ---------------------------------------------------------------------------
 
+/// Decodes a Manifest page AFTER verifying its bytes against the `page_cid` that
+/// referenced it — the Merkle check that makes the Manifest tree tamper-evident.
+///
+/// Every other content-addressed object on the read path is re-hashed before use
+/// (Blocks via `ft_block::verify`, externalized blocklists via an explicit
+/// `cid_of` check), so pages must be too: a page is what names every OTHER
+/// object, so accepting substituted page bytes voids the integrity of the whole
+/// tree. A tampered page can rename an entry to `../../.ssh/authorized_keys`,
+/// point an entry at different Blocks, or simply omit thousands of entries — which
+/// the diff then applies as mass deletion.
+///
+/// Prefer this over [`decode_page`] everywhere the expected cid is known (it
+/// always is: a page is reached either as a Revision's `manifestRoot` or as a
+/// child pointer in its parent index page).
+pub fn decode_page_verified(obj: &[u8], expected: &Cid) -> Result<Page> {
+    // Hash the PAYLOAD, matching how `build` addresses a page (`cid_of(payload)`,
+    // see `encode_page`): the 64-byte header is framing, not content.
+    let header = BlockHeader::decode(obj)?;
+    let payload = &obj[ft_core::BLOCK_HEADER_LEN..];
+    let payload = if (header.payload_len as usize) <= payload.len() {
+        &payload[..header.payload_len as usize]
+    } else {
+        payload
+    };
+    let computed = ft_hash::cid_of(payload);
+    if computed != *expected {
+        return Err(ManifestError::PageCidMismatch {
+            expected: *expected,
+            computed,
+        });
+    }
+    decode_page(obj)
+}
+
 /// Decodes a Manifest page object (`header || canonical CBOR`) into a [`Page`].
 ///
 /// Validates the 64-byte header (length, magic, version) via
 /// [`BlockHeader::decode`], then deserializes the CBOR payload and discriminates
 /// leaf vs index by the page's `"k"` field (`§5.3`).
+///
+/// This does NOT check the object against its `page_cid`; use
+/// [`decode_page_verified`] on any read path where the bytes came from the Vault.
 pub fn decode_page(obj: &[u8]) -> Result<Page> {
     let header = BlockHeader::decode(obj)?;
+
+    // The page_cid covers the PAYLOAD only (`cid_of(payload)`, see `encode_page`),
+    // so the 64 header bytes are content-addressed by nothing and can be edited by
+    // anyone with Vault write access without invalidating the cid. Tampering with
+    // `payload_len` is caught anyway — `decode_page_verified` hashes the slice this
+    // length selects, so shortening it changes the computed cid — but the `nonce`
+    // is both cid-invisible and semantically loaded, and `§5.5` reserves it for
+    // future Manifest-page encryption. A page written by this build is always
+    // `alg=0` with a zero nonce (`BlockHeader::new_manifest`), so a non-zero one
+    // means the bytes were altered; rejecting it now stops those 24 bytes from
+    // becoming a channel the moment some later version starts reading them.
+    // (`flags`/`reserved` are deliberately NOT checked: they are reserved for
+    // forward use and `header_version` is what gates a real format change.)
+    if header.nonce != [0u8; 24] {
+        return Err(ManifestError::NonZeroPageNonce);
+    }
+
     let payload = &obj[ft_core::BLOCK_HEADER_LEN..];
     // The header records the payload length; trust it as the authoritative slice
     // length when the buffer is longer (it never is for a well-framed object).
@@ -774,6 +846,60 @@ mod tests {
         let b = build(vec![file_entry("a.rs", 1)]);
         let payload = &b.pages[0].1[ft_core::BLOCK_HEADER_LEN..];
         assert_eq!(b.pages[0].0, ft_hash::cid_of(payload));
+    }
+
+    /// The header is outside the `page_cid`, so a planted `nonce` would otherwise
+    /// ride along undetected even through `decode_page_verified`.
+    #[test]
+    fn decode_page_rejects_a_planted_header_nonce() {
+        let b = build(vec![file_entry("a.rs", 1)]);
+        let (cid, obj) = (&b.pages[0].0, &b.pages[0].1);
+        // Byte 16 starts the 24-byte nonce field (`§4.3`).
+        let mut tampered = obj.clone();
+        tampered[16] = 0x01;
+        assert!(matches!(
+            decode_page(&tampered),
+            Err(ManifestError::NonZeroPageNonce)
+        ));
+        // The cid still matches — which is exactly why the header needs its own
+        // rule rather than relying on the content check.
+        assert!(matches!(
+            decode_page_verified(&tampered, cid),
+            Err(ManifestError::NonZeroPageNonce)
+        ));
+        // The untouched object is unaffected.
+        assert!(decode_page_verified(obj, cid).is_ok());
+    }
+
+    /// `decode_page_verified` accepts a page under its own cid and rejects one
+    /// whose bytes were substituted — the Merkle guarantee for the tree.
+    #[test]
+    fn decode_page_verified_accepts_matching_and_rejects_substituted_bytes() {
+        let good = build(vec![file_entry("a.rs", 1)]);
+        let (cid, obj) = (&good.pages[0].0, &good.pages[0].1);
+        // The honest object under its own cid decodes.
+        assert!(decode_page_verified(obj, cid).is_ok());
+
+        // A DIFFERENT, well-formed page served under the first one's cid is
+        // rejected (the substitution an attacker with bucket write access makes).
+        let other = build(vec![file_entry("b.rs", 2)]);
+        let err = decode_page_verified(&other.pages[0].1, cid).unwrap_err();
+        match err {
+            ManifestError::PageCidMismatch { expected, computed } => {
+                assert_eq!(expected, *cid);
+                assert_eq!(computed, other.pages[0].0);
+            }
+            other => panic!("expected PageCidMismatch, got {other:?}"),
+        }
+
+        // A single flipped payload byte is caught too.
+        let mut tampered = obj.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(matches!(
+            decode_page_verified(&tampered, cid),
+            Err(ManifestError::PageCidMismatch { .. }) | Err(ManifestError::Cbor(_))
+        ));
     }
 
     #[test]

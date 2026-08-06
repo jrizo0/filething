@@ -6,3 +6,13 @@
 - name: Bake managed Coordinator URL into the release binary
   shell: bash
   run: echo "FILETHING_DEFAULT_CONVEX_URL=https://knowing-giraffe-699.convex.cloud" >> "$GITHUB_ENV"
+
+# `dist build` shells out to `cargo build` and offers no way to pass `--locked`,
+# so a tagged release could otherwise resolve dependency versions that differ
+# from the ones CI tested (CI itself does use `--locked`). `cargo fetch --locked`
+# fails when Cargo.lock is not already consistent with Cargo.toml, which turns
+# that silent drift into a failed release — and it warms the dependency cache the
+# build is about to use anyway.
+- name: Verify Cargo.lock is current (release must build what CI tested)
+  shell: bash
+  run: cargo fetch --locked

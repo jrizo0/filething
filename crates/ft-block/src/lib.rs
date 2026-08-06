@@ -19,7 +19,9 @@
 //!
 //! so that `cid == pcid` (`§4.3`: "en MVP nonce=ceros => cid=pcid"). The header
 //! still carries 24 nonce bytes — all zero, a reserved field — but those bytes
-//! do NOT enter the hash for `alg=0`.
+//! do NOT enter the hash for `alg=0`. Being outside the hash they are also
+//! unauthenticated for `alg=0` (there is no AEAD to cover them), so [`decode`]
+//! requires them to be exactly the 24 zeros `§4.3` reserves.
 //!
 //! ## Encryption (`alg=1`, XChaCha20-Poly1305)
 //!
@@ -41,6 +43,31 @@
 //! (which actually recovers the cleartext) needs the `data_key`. The wrapped
 //! data key itself never lives in the Block object; it lives in a
 //! `keys/<space_id>/<aa>/<cid>` sidecar (`§4.5`), encoded/decoded by [`sidecar`].
+//!
+//! ## What [`verify`] guarantees — and what it does not
+//!
+//! [`verify`] proves that the object's bytes hash to the expected `cid` *under
+//! the `alg` its own header CLAIMS*, and nothing more. `alg` is NOT
+//! domain-separated into the hash in format v1 (`§4.3`: `BLAKE3(payload)` for
+//! `alg=0`; `§4.4`: `BLAKE3(nonce || ciphertext)` for `alg=1`), so the two
+//! branches share a preimage space: a genuine `alg=1` object can be re-framed as
+//! an `alg=0` object whose payload is `nonce || ciphertext`, and it hashes to the
+//! very same `cid`. Such an object passes [`verify`], never invokes the AEAD, and
+//! a caller that trusts the header hands raw ciphertext back as if it were
+//! cleartext. [`decode`]'s zero-nonce rule rejects the cheap form of that forgery
+//! (the header nonce left in place from the encrypted object), but the nonce is
+//! outside the `alg=0` hash, so a forger free to rewrite the header can zero it
+//! too. The end-to-end defense belongs to the caller: check the reassembled file
+//! against the Manifest's `pcid` (`§5.1`) — a cleartext frame of ciphertext cannot
+//! satisfy it.
+//!
+//! A format v2 could close it at the source with `cid = BLAKE3(alg || nonce ||
+//! payload)`: a contained change (this crate's [`cid_for`] /
+//! [`cid_for_encrypted`], plus `ft-manifest`'s page hash) that makes the two
+//! branches disjoint by construction. It is deliberately NOT done here — the `cid`
+//! is the object's name, so changing the formula renames every Block and every
+//! Manifest page of every existing Space. It belongs to a format-version bump with
+//! a migration, not to a hardening patch.
 //!
 //! [`cid_of_object`] / [`verify`] return [`Error::UnsupportedAlg`] for any `alg`
 //! other than `0` or `1` — a third algorithm is not a format this crate knows.
@@ -82,6 +109,14 @@ pub enum Error {
     /// [`ft_core::ALG_XCHACHA20_POLY1305`] — not a format this crate knows.
     #[error("unsupported alg {0}: only cleartext (alg=0) and XChaCha20-Poly1305 (alg=1) are implemented")]
     UnsupportedAlg(u8),
+
+    /// A cleartext (`alg=0`) object carried a non-zero header nonce. `§4.3`
+    /// reserves those 24 bytes as zeros for cleartext and keeps them out of the
+    /// hash, so a non-zero value is both off-spec and unauthenticated — and it is
+    /// the signature of an `alg=1` object re-framed as `alg=0` (crate docs, "What
+    /// [`verify`] guarantees").
+    #[error("cleartext (alg=0) object carries a non-zero header nonce: §4.3 reserves it as 24 zero bytes")]
+    NonZeroCleartextNonce,
 
     /// Integrity check failed: the recomputed `cid` did not equal the expected
     /// one (a corrupt or wrong object).
@@ -153,6 +188,10 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
 /// rejects any non-Block magic with [`Error::WrongMagic`] so that only a true
 /// `FTB1` object is treated as a Block. (Manifest pages are decoded by
 /// `ft-manifest::decode_page`, not here.)
+///
+/// For `alg=0` it additionally requires the header nonce to be the 24 zero bytes
+/// `§4.3` reserves for cleartext ([`Error::NonZeroCleartextNonce`]) — see the
+/// crate docs, "What [`verify`] guarantees".
 pub fn decode(obj: &[u8]) -> Result<(BlockHeader, Vec<u8>)> {
     let header = BlockHeader::decode(obj)?;
     if header.magic != ft_core::MAGIC_BLOCK {
@@ -160,6 +199,13 @@ pub fn decode(obj: &[u8]) -> Result<(BlockHeader, Vec<u8>)> {
             expected: ft_core::MAGIC_BLOCK,
             got: header.magic,
         });
+    }
+    // `§4.3`: for cleartext the nonce is a reserved field of 24 zeros that does
+    // NOT enter the `cid`. Nothing else covers those bytes for `alg=0` — no AEAD,
+    // no hash — so accepting a non-zero one would accept an unauthenticated field
+    // and, worse, the leftover nonce of an `alg=1` object re-framed as cleartext.
+    if header.alg == ft_core::ALG_CLEARTEXT && header.nonce != [0u8; 24] {
+        return Err(Error::NonZeroCleartextNonce);
     }
     // `decode` already guaranteed `obj.len() >= BLOCK_HEADER_LEN`.
     let payload = &obj[BLOCK_HEADER_LEN..];
@@ -201,6 +247,10 @@ pub fn cid_for_encrypted(nonce: &[u8; 24], ciphertext: &[u8]) -> Cid {
 /// - `alg=1` ([`ft_core::ALG_XCHACHA20_POLY1305`]): hashes `nonce || ciphertext`
 ///   — matching [`cid_for_encrypted`]. No key required.
 /// - any other value: [`Error::UnsupportedAlg`].
+///
+/// The branch is taken on the `alg` the header CLAIMS, and v1 does not
+/// domain-separate `alg` into the hash, so the returned `cid` says nothing about
+/// which branch produced it (crate docs, "What [`verify`] guarantees").
 pub fn cid_of_object(obj: &[u8]) -> Result<Cid> {
     let (header, payload) = decode(obj)?;
     match header.alg {
@@ -217,6 +267,12 @@ pub fn cid_of_object(obj: &[u8]) -> Result<Cid> {
 /// recompute the addressing hash from the object's own bytes and reject any
 /// object that does not hash to the `cid` the Manifest referenced. A single
 /// corrupted payload byte changes the BLAKE3 digest and is caught here.
+///
+/// What it does NOT do: it is not evidence that the object was written with the
+/// `alg` its header claims, because v1 folds no `alg` byte into the hash. A caller
+/// that treats the payload as cleartext on the strength of `alg=0` must still
+/// check the reassembled file against the Manifest's `pcid` (crate docs, "What
+/// [`verify`] guarantees").
 pub fn verify(obj: &[u8], expected: &Cid) -> Result<()> {
     let computed = cid_of_object(obj)?;
     if &computed != expected {
@@ -333,6 +389,27 @@ pub fn decode_encrypted(obj: &[u8], data_key: &[u8; 32]) -> Result<Vec<u8>> {
 /// RFC 8949 §4.2.1's canonical map-key order for this type — no explicit
 /// reordering pass is needed (contrast `ft-manifest`, whose page structs are NOT
 /// naturally in that order and do need one).
+///
+/// ## The wrap is not bound to its object (v1 limitation)
+///
+/// The AEAD wrap covers the 32-byte data key with EMPTY associated data, so no
+/// authenticated byte of the sidecar names the `cid` or the Space it belongs to —
+/// the only binding is its object key, which is Vault metadata rather than
+/// authenticated content. Anyone with Vault write access can therefore swap two
+/// sidecars of the same Space: [`unwrap_data_key`] happily returns whichever data
+/// key that sidecar carries (same Space key ⇒ same KEK), and the wrong data key
+/// then fails AEAD authentication in [`decode_encrypted`]. The blast radius is a
+/// denial of service on that Block, not a disclosure: the `cid` check and the
+/// Block's own AEAD still hold, and neither the data key nor any cleartext leaks.
+///
+/// Binding the `cid` in as the wrap's AAD is the fix, and it is deliberately NOT
+/// done here because it cannot be done compatibly. Every sidecar already written
+/// was wrapped with empty AAD: an unwrap that REQUIRED the AAD could not open them
+/// and would strand the Blocks they key, and an unwrap that fell back to empty AAD
+/// on failure would leave the attacker the old path anyway. Doing it safely means a
+/// new `wrap_alg` (`2` = "…with the `cid` as AAD") that only new Devices write,
+/// plus a `cid` argument on both functions here and at every call site — a format
+/// change, hence a format-v2 item (`§4.5`, ADR-0004), not a hardening patch.
 pub mod sidecar {
     use chacha20poly1305::aead::Aead;
     use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
@@ -367,7 +444,8 @@ pub mod sidecar {
     /// Wraps `data_key` with `space_key` (via the derived wrap subkey) into the
     /// canonical CBOR sidecar payload described at the module level. Uses a
     /// fresh random 24-byte nonce every call (wraps are not required to be
-    /// deterministic — only the underlying `data_key`, per `§4.4`, is).
+    /// deterministic — only the underlying `data_key`, per `§4.4`, is) and empty
+    /// associated data (see the module docs on the missing `cid` binding).
     pub fn wrap_data_key(data_key: &[u8; 32], space_key: &[u8; 32]) -> Vec<u8> {
         let kek = derive_wrap_key(space_key);
         let mut nonce_bytes = [0u8; 24];
@@ -599,6 +677,15 @@ mod tests {
                 actual: 4
             })
         ));
+    }
+
+    #[test]
+    fn decode_rejects_cleartext_object_with_non_zero_header_nonce() {
+        // §4.3: for alg=0 the nonce is a reserved field of 24 zeros and does not
+        // enter the cid, so nothing else would ever notice a value planted there.
+        let mut obj = encode(b"cleartext payload");
+        obj[16] = 0x01; // first nonce byte (offset 16..40).
+        assert!(matches!(decode(&obj), Err(Error::NonZeroCleartextNonce)));
     }
 
     #[test]
@@ -839,6 +926,77 @@ mod tests {
         assert!(verify(&obj, &cid).is_ok());
         assert_eq!(decode_encrypted(&obj, &data_key).unwrap(), b"");
         assert_eq!(pcid, ft_hash::pcid_of(b""));
+    }
+
+    // ----- alg downgrade: an alg=1 object re-framed as alg=0 -----
+    //
+    // v1 folds no `alg` byte into the cid (§4.3/§4.4), so BLAKE3(nonce ||
+    // ciphertext) is reachable from the alg=0 branch as well: an encrypted object
+    // whose payload becomes `nonce || ciphertext` hashes to its own cid while
+    // claiming to need no AEAD. See the crate docs, "What verify guarantees".
+
+    /// Re-frames a genuine `alg=1` object as an `alg=0` object whose payload is
+    /// `nonce || ciphertext` — the alg-downgrade forgery. `keep_nonce` picks the
+    /// cheap variant (the encrypted header's nonce left in place) or the careful
+    /// one (nonce zeroed like a real cleartext header).
+    fn reframe_encrypted_as_cleartext(obj: &[u8], keep_nonce: bool) -> Vec<u8> {
+        let encrypted = BlockHeader::decode(obj).unwrap();
+        let mut payload = encrypted.nonce.to_vec();
+        payload.extend_from_slice(&obj[BLOCK_HEADER_LEN..]);
+
+        let mut forged = BlockHeader::new_block(payload.len() as u64);
+        if keep_nonce {
+            forged.nonce = encrypted.nonce;
+        }
+        let mut out = forged.encode().to_vec();
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn verify_rejects_an_encrypted_object_reframed_as_cleartext_with_its_nonce_left_in_place() {
+        let plaintext = b"secret bytes that must never reach the file as ciphertext";
+        let (cid, _, obj, _) = encode_encrypted(plaintext, &DEDUP_SECRET_A).unwrap();
+        let forged = reframe_encrypted_as_cleartext(&obj, true);
+
+        // The forgery genuinely hashes to the encrypted object's cid: the cid check
+        // alone cannot tell the two apart.
+        assert_eq!(cid_for(&forged[BLOCK_HEADER_LEN..]), cid);
+        // The leftover nonce is off-spec for alg=0, and that is what catches it.
+        assert!(matches!(
+            verify(&forged, &cid),
+            Err(Error::NonZeroCleartextNonce)
+        ));
+    }
+
+    #[test]
+    fn verify_cannot_detect_an_alg_downgrade_that_also_zeroes_the_header_nonce() {
+        // Locks in the residual v1 gap so it is not mistaken for a solved problem:
+        // with the nonce zeroed the forgery is a well-formed cleartext Block by
+        // every check this crate can make without a key, and `decode` hands the
+        // ciphertext back as "payload". Only the caller's pcid check on the
+        // reassembled file (§5.1) rejects it.
+        let plaintext = b"secret bytes that must never reach the file as ciphertext";
+        let (cid, _, obj, _) = encode_encrypted(plaintext, &DEDUP_SECRET_A).unwrap();
+        let forged = reframe_encrypted_as_cleartext(&obj, false);
+
+        assert!(verify(&forged, &cid).is_ok());
+        let (header, payload) = decode(&forged).unwrap();
+        assert_eq!(header.alg, ALG_CLEARTEXT);
+        assert_ne!(payload, plaintext.to_vec());
+        assert_ne!(ft_hash::pcid_of(&payload), ft_hash::pcid_of(plaintext));
+    }
+
+    #[test]
+    fn decode_accepts_the_non_zero_nonce_of_a_genuine_encrypted_object() {
+        // The zero-nonce rule is scoped to alg=0: an alg=1 object carries the
+        // deterministic per-content nonce of §4.4 and must be unaffected.
+        let plaintext = b"encrypted objects keep their nonce in the header";
+        let (cid, _, obj, data_key) = encode_encrypted(plaintext, &DEDUP_SECRET_A).unwrap();
+        let (header, _) = decode(&obj).unwrap();
+        assert_ne!(header.nonce, [0u8; 24]);
+        assert!(verify(&obj, &cid).is_ok());
+        assert_eq!(decode_encrypted(&obj, &data_key).unwrap(), plaintext);
     }
 
     // ----- sidecar: wrap / unwrap the data key -----

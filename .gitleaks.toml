@@ -1,0 +1,59 @@
+# gitleaks config — used by the `secrets` job in .github/workflows/ci.yml and
+# picked up automatically by a local `gitleaks dir .` (gitleaks reads
+# ./.gitleaks.toml when no --config is given).
+#
+# Why a custom config at all: the default ruleset does NOT know the shape of a
+# Convex admin/deploy key, and that is precisely the credential that leaked into
+# diary/2026-06-25.md — a verbatim terminal transcript of a real session. The
+# rules below are anchored on the credential formats this project actually
+# handles (infra/.env.example, docs/PRODUCTION-SETUP.md §3).
+#
+# Note for local runs: `gitleaks dir` takes ONE path and does NOT honour
+# .gitignore, so `gitleaks dir .` crawls target/ and flags your real infra/.env
+# and infra/.env.cloud (correctly — they do hold credentials). CI scans a fresh
+# checkout, where neither exists. To reproduce the CI gate exactly:
+#     d=$(mktemp -d) && git archive HEAD | tar -x -C "$d" && gitleaks dir "$d"
+
+[extend]
+useDefault = true
+
+# Convex self-hosted admin key: `<instance-name>|<hex secret>` (the leaked one
+# was `filething-local|<70 hex>`). Anchored on the `|` + long-hex tail so it
+# does not fire on markdown tables (a table cell always has a space after `|`).
+[[rules]]
+id = "convex-self-hosted-admin-key"
+description = "Convex self-hosted admin key (<instance-name>|<hex secret>)"
+regex = '''[a-z][a-z0-9]*(?:-[a-z0-9]+)*\|[0-9a-f]{32,}'''
+entropy = 3.0
+
+# Convex Cloud deploy key: `prod:<deployment-name>|<secret>`. Root credential —
+# it can impersonate any user of the deployment (docs/PRODUCTION-SETUP.md,
+# "Riesgos conocidos").
+[[rules]]
+id = "convex-deploy-key"
+description = "Convex Cloud deploy key (prod|dev|preview:<name>|<secret>)"
+regex = '''(?:prod|dev|preview):[a-z0-9][a-z0-9-]*\|[A-Za-z0-9+/=_-]{16,}'''
+entropy = 3.0
+
+# Secrets pasted as an env assignment. Keyed on the variable NAME (not on the
+# value's shape) because most of these are plain hex/base64 that is
+# indistinguishable from a Block CID — docs/format.md is full of those.
+[[rules]]
+id = "filething-env-secret"
+description = "A filething/infra secret assigned inline (env file, transcript, script)"
+regex = '''(?i)\b(?:CONVEX_INSTANCE_SECRET|CONVEX_SELF_HOSTED_ADMIN_KEY|CONVEX_ADMIN_KEY|CONVEX_DEPLOY_KEY|BETTER_AUTH_SECRET|MINIO_ROOT_PASSWORD|S3_SECRET_KEY|FILETHING_PASSWORD)\s*[:=]\s*['"]?([A-Za-z0-9+/=|_-]{16,})'''
+secretGroup = 1
+entropy = 2.5
+
+[allowlist]
+description = "Placeholders and prose that are not credentials"
+regexTarget = "secret"
+regexes = [
+  # The sentinels infra/.env.example ships and up.sh replaces / refuses to boot with.
+  '''REPLACE_ME''',
+  '''replace-me''',
+  # `<PLACEHOLDER>`-style values in the *.example templates and the runbooks.
+  '''^<[^>]+>$''',
+  # docs/format.md §4.5 spells the KDF call in prose: `BLAKE3.derive_key(...)`.
+  '''^BLAKE3\.''',
+]

@@ -8,18 +8,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${INFRA_DIR}/.env"
 
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set +a
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "ERROR: ${ENV_FILE} not found — run infra/scripts/up.sh first (it generates it)." >&2
+  exit 1
 fi
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
 
-# Defaults mirror infra/.env.example.
+# Endpoint/region/bucket keep their defaults (they are not secrets); the
+# credentials do not — the whole point of up.sh generating them is that no value
+# here is guessable.
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:9000}"
 S3_REGION="${S3_REGION:-us-east-1}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-minioadmin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-minioadmin}"
+: "${S3_ACCESS_KEY:?not set in ${ENV_FILE} — delete it and re-run infra/scripts/up.sh}"
+: "${S3_SECRET_KEY:?not set in ${ENV_FILE} — delete it and re-run infra/scripts/up.sh}"
 S3_BUCKET="${S3_BUCKET:-filething}"
 CONVEX_URL="${CONVEX_URL:-http://localhost:3210}"
 MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-9001}"
@@ -45,7 +49,7 @@ Vault (MinIO, S3 data plane)
   S3 endpoint   : ${S3_ENDPOINT}   (path-style)
   Region        : ${S3_REGION}
   Access key    : ${S3_ACCESS_KEY}
-  Secret key    : ${S3_SECRET_KEY}
+  Secret key    : (hidden — infra/.env, or --exports below)
   Bucket        : ${S3_BUCKET}
   Web console   : http://localhost:${MINIO_CONSOLE_PORT}
 

@@ -24,11 +24,22 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/jrizo0/filething"
 
-# Release binaries (dist / GitHub Releases): small and fast over compile time.
+# Release binaries (dist / GitHub Releases): small and fast over compile time,
+# but still debuggable — this ships a long-running daemon whose only forensic
+# artifact is a panic backtrace from a user's machine.
 [profile.release]
 lto = true
 codegen-units = 1
-strip = "symbols"
+# `symbols` stripped the function names too, so a user's backtrace was a list of
+# hex addresses. `debuginfo` keeps the symbol table (line numbers go, names stay)
+# and costs a few hundred KB.
+strip = "debuginfo"
+# On in release as well as debug: the chunker/manifest arithmetic runs on
+# attacker-influenced sizes and offsets, and a silent wrap there corrupts a
+# Manifest instead of failing. The tests only ever exercise the checked
+# behaviour (debug has this on by default), so leaving it off in release shipped
+# an arithmetic mode nothing had tested.
+overflow-checks = true
 
 # The profile that 'dist' will build with
 [profile.dist]

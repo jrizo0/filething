@@ -31,9 +31,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ft_core::{CasefoldKey, Cid, FileEntry, SpaceCrypto};
+use ft_core::{CasefoldKey, Cid, FileEntry, Pcid, SpaceCrypto};
 use ft_fsmap::OsFs;
-use ft_manifest::{decode_page, Page};
+use ft_manifest::{decode_page_verified, Page};
 use ft_vault::Vault;
 use thiserror::Error;
 
@@ -120,6 +120,86 @@ pub enum Error {
         /// The underlying IO error.
         source: std::io::Error,
     },
+
+    /// An entry decoded from a Manifest page fetched from the Vault is not safe to
+    /// act on: [`ft_core::FileEntry::validate_untrusted`] rejected its path, or a
+    /// symlink target that would let a later write escape the Space
+    /// (`§5.1`/`§5.2`). Everything this crate reads is remote-controlled, so a `p`
+    /// like `../../.ssh/authorized_keys` is a HARD error, never a sanitization —
+    /// quietly rewriting it would apply the wrong bytes to the wrong file. Kept
+    /// separate from [`Error::Core`] so a hostile Manifest is distinguishable from
+    /// an ordinary decode failure.
+    #[error("unsafe manifest entry: {0}")]
+    UnsafeEntry(ft_core::Error),
+
+    /// Joining an entry's canonical path onto the Space root did not land strictly
+    /// INSIDE the root. Unreachable through [`materialize`]/[`apply`], which both
+    /// validate first: this is depth-in-defense so a future caller that forgets the
+    /// trust boundary still cannot write outside the Space.
+    #[error("manifest path {path:?} does not resolve inside the Space root {root}")]
+    OutsideSpaceRoot {
+        /// The entry's canonical path, verbatim as it arrived.
+        path: String,
+        /// The Space root it failed to resolve under.
+        root: String,
+    },
+
+    /// An existing INTERMEDIATE component of a destination path is a symlink, so
+    /// acting there would travel THROUGH the link and land wherever it points.
+    /// [`ft_core::FileEntry::validate_untrusted`] cannot catch this: the link is
+    /// typically the user's OWN local-only symlink, which the scanner deliberately
+    /// keeps out of the Manifest (`§5.1`), so nothing in the incoming entry set
+    /// mentions it. Removing it silently would destroy the link, so the operation
+    /// is refused instead.
+    ///
+    /// Raised by DELETES as well as writes: an unlink does not follow its final
+    /// component, but the kernel follows every intermediate one, so a peer's
+    /// delete of `docs/notes.md` under a local `<root>/docs -> ~/real-docs` would
+    /// destroy `~/real-docs/notes.md` — a file outside the Space that no Revision
+    /// ever mentioned.
+    #[error(
+        "refusing to write or delete {path}: the intermediate component {component} is a symlink"
+    )]
+    SymlinkedParent {
+        /// The destination whose write was refused.
+        path: String,
+        /// The intermediate component that is a symlink.
+        component: String,
+    },
+
+    /// The bytes reassembled from a File entry's Blocks are not the content the
+    /// Manifest itself declared (`sz`/`pcid`, `§5.1`).
+    ///
+    /// Every Block already cid-checks, so this catches what a per-Block check
+    /// structurally cannot: an `alg=1` -> `alg=0` DOWNGRADE. `cid` folds in no
+    /// `alg` byte (`§4.3`), so an object whose header claims `alg=0` with payload
+    /// `nonce || ciphertext` hashes to the genuine encrypted object's `cid`, passes
+    /// [`ft_block::verify`], skips the AEAD, and would otherwise put raw ciphertext
+    /// in the user's file (`ft_block`'s own docs make this the caller's duty).
+    #[error(
+        "content mismatch for {path}: the Manifest declares {expected_sz} bytes hashing to \
+         {expected}, the reassembled Blocks are {computed_sz} bytes hashing to {computed}"
+    )]
+    ContentMismatch {
+        /// The entry's canonical path.
+        path: String,
+        /// The `pcid` the entry declared.
+        expected: Pcid,
+        /// The `pcid` the reassembled bytes actually hash to.
+        computed: Pcid,
+        /// The `sz` the entry declared.
+        expected_sz: u64,
+        /// The length of the reassembled bytes.
+        computed_sz: u64,
+    },
+
+    /// The Manifest page tree nested deeper than [`MAX_PAGE_DEPTH`] levels — a
+    /// corrupt or hostile tree, since a real one is shallow (see the const).
+    #[error("manifest page tree deeper than {max} levels")]
+    PageDepthExceeded {
+        /// The cap that was exceeded ([`MAX_PAGE_DEPTH`]).
+        max: usize,
+    },
 }
 
 /// Crate `Result` alias over [`Error`].
@@ -151,6 +231,15 @@ pub enum Change {
 // diff
 // ---------------------------------------------------------------------------
 
+/// Maximum number of Manifest page levels [`diff`] will descend (`§5.3`).
+///
+/// The page-tree walk recurses over child pointers that came out of pages fetched
+/// from the Vault, so without a cap a hostile tree — index pages chained one child
+/// per level — recurses until the stack overflows, which is a crash rather than a
+/// typed error. A real B-tree is shallow: at the `§5.3` fan-out, 10^9 entries fit
+/// in under 8 levels, so 64 is far above anything a real Space can produce.
+pub const MAX_PAGE_DEPTH: usize = 64;
+
 /// Counts the Manifest pages downloaded during a [`diff`], so a test can assert
 /// that hash pruning kept the walk to `O(log n)` pages (`§8.3`).
 ///
@@ -165,7 +254,7 @@ pub struct DiffStats {
 /// Diffs two Manifest trees and returns the per-file [`Change`]s (`§8.3`).
 ///
 /// `root_a` is the base/local root, `root_b` is the new/remote root. Both roots
-/// are fetched (via `manifest_key` + [`decode_page`]); thereafter any two pages —
+/// are fetched (via `manifest_key` + [`decode_page_verified`]); thereafter any two pages —
 /// at any level — that share a `page_cid` name a byte-identical subtree and are
 /// PRUNED (not fetched). Leaves that differ are merge-joined linearly by
 /// [`CasefoldKey`].
@@ -205,6 +294,7 @@ pub async fn diff_counted(
         &mut a_entries,
         &mut b_entries,
         &mut stats,
+        0,
     )
     .await?;
 
@@ -213,11 +303,19 @@ pub async fn diff_counted(
 }
 
 /// Fetches and decodes a single Manifest page, bumping the download counter.
+///
+/// Decoding goes through [`decode_page_verified`]: the bytes came from the Vault,
+/// so they are re-hashed against the `cid` that referenced them before anything is
+/// read out of them (`§4.3`). Blocks and externalized blocklists are re-hashed on
+/// this path too, and a page is what NAMES every other object — an unverified page
+/// voids the integrity of the whole subtree under it (it can omit thousands of
+/// entries, which the diff then applies as mass deletion, or point an entry at a
+/// path that escapes the Space root).
 async fn fetch_page(vault: &dyn Vault, cid: &Cid, stats: &mut DiffStats) -> Result<Page> {
     let key = ft_hash::manifest_key(cid);
     let obj = vault.get(&key).await?;
     stats.pages_fetched += 1;
-    Ok(decode_page(&obj)?)
+    Ok(decode_page_verified(&obj, cid)?)
 }
 
 /// Recursively collects, into `a_out`/`b_out`, the leaf entries that are
@@ -226,6 +324,10 @@ async fn fetch_page(vault: &dyn Vault, cid: &Cid, stats: &mut DiffStats) -> Resu
 ///
 /// `a`/`b` are `Option<Cid>` so one side can be absent (a child range that exists
 /// on only one side): its entries are all collected as additions/deletions.
+///
+/// `depth` is the level of the pages this call fetches, capped at
+/// [`MAX_PAGE_DEPTH`] so a hostile tree cannot recurse the walk into a stack
+/// overflow.
 ///
 /// The recursion is written without `async fn` recursion sugar (which Rust does
 /// not allow directly) by boxing the returned future.
@@ -236,8 +338,14 @@ fn collect_diff<'a>(
     a_out: &'a mut Vec<FileEntry>,
     b_out: &'a mut Vec<FileEntry>,
     stats: &'a mut DiffStats,
+    depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        if depth >= MAX_PAGE_DEPTH {
+            return Err(Error::PageDepthExceeded {
+                max: MAX_PAGE_DEPTH,
+            });
+        }
         match (a, b) {
             // Identical subtree -> prune (32-byte compare, no fetch). `§8.3`.
             (Some(ca), Some(cb)) if ca == cb => Ok(()),
@@ -246,15 +354,15 @@ fn collect_diff<'a>(
             (Some(ca), Some(cb)) => {
                 let pa = fetch_page(vault, &ca, stats).await?;
                 let pb = fetch_page(vault, &cb, stats).await?;
-                reconcile_pages(vault, pa, pb, a_out, b_out, stats).await
+                reconcile_pages(vault, pa, pb, a_out, b_out, stats, depth).await
             }
 
             // Only the base side has this range: every entry under it is a
             // deletion candidate.
-            (Some(ca), None) => collect_all(vault, ca, a_out, stats).await,
+            (Some(ca), None) => collect_all(vault, ca, a_out, stats, depth).await,
 
             // Only the new side has this range: every entry is an addition.
-            (None, Some(cb)) => collect_all(vault, cb, b_out, stats).await,
+            (None, Some(cb)) => collect_all(vault, cb, b_out, stats, depth).await,
 
             (None, None) => Ok(()),
         }
@@ -267,6 +375,8 @@ fn collect_diff<'a>(
 /// mismatch (different tree heights for the same key range) is handled by
 /// collecting both sides fully into their runs, which still merge-joins
 /// correctly.
+///
+/// `depth` is the level of `pa`/`pb` themselves; children are walked at `depth + 1`.
 fn reconcile_pages<'a>(
     vault: &'a dyn Vault,
     pa: Page,
@@ -274,6 +384,7 @@ fn reconcile_pages<'a>(
     a_out: &'a mut Vec<FileEntry>,
     b_out: &'a mut Vec<FileEntry>,
     stats: &'a mut DiffStats,
+    depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         match (pa, pb) {
@@ -302,6 +413,7 @@ fn reconcile_pages<'a>(
                                     a_out,
                                     b_out,
                                     stats,
+                                    depth + 1,
                                 )
                                 .await?;
                                 i += 1;
@@ -309,23 +421,57 @@ fn reconcile_pages<'a>(
                             }
                             std::cmp::Ordering::Less => {
                                 // This child range exists only on the base side.
-                                collect_diff(vault, Some(left.cid), None, a_out, b_out, stats)
-                                    .await?;
+                                collect_diff(
+                                    vault,
+                                    Some(left.cid),
+                                    None,
+                                    a_out,
+                                    b_out,
+                                    stats,
+                                    depth + 1,
+                                )
+                                .await?;
                                 i += 1;
                             }
                             std::cmp::Ordering::Greater => {
                                 // This child range exists only on the new side.
-                                collect_diff(vault, None, Some(right.cid), a_out, b_out, stats)
-                                    .await?;
+                                collect_diff(
+                                    vault,
+                                    None,
+                                    Some(right.cid),
+                                    a_out,
+                                    b_out,
+                                    stats,
+                                    depth + 1,
+                                )
+                                .await?;
                                 j += 1;
                             }
                         },
                         (Some(left), None) => {
-                            collect_diff(vault, Some(left.cid), None, a_out, b_out, stats).await?;
+                            collect_diff(
+                                vault,
+                                Some(left.cid),
+                                None,
+                                a_out,
+                                b_out,
+                                stats,
+                                depth + 1,
+                            )
+                            .await?;
                             i += 1;
                         }
                         (None, Some(right)) => {
-                            collect_diff(vault, None, Some(right.cid), a_out, b_out, stats).await?;
+                            collect_diff(
+                                vault,
+                                None,
+                                Some(right.cid),
+                                a_out,
+                                b_out,
+                                stats,
+                                depth + 1,
+                            )
+                            .await?;
                             j += 1;
                         }
                         (None, None) => break,
@@ -337,13 +483,13 @@ fn reconcile_pages<'a>(
             (Page::Leaf(la), Page::Index(ib)) => {
                 a_out.extend(la.e);
                 for child in ib.children {
-                    collect_all(vault, child.cid, b_out, stats).await?;
+                    collect_all(vault, child.cid, b_out, stats, depth + 1).await?;
                 }
                 Ok(())
             }
             (Page::Index(ia), Page::Leaf(lb)) => {
                 for child in ia.children {
-                    collect_all(vault, child.cid, a_out, stats).await?;
+                    collect_all(vault, child.cid, a_out, stats, depth + 1).await?;
                 }
                 b_out.extend(lb.e);
                 Ok(())
@@ -354,13 +500,21 @@ fn reconcile_pages<'a>(
 
 /// Collects EVERY [`FileEntry`] under the subtree rooted at `cid` into `out`
 /// (used for a key range present on only one side — a whole-subtree add/delete).
+///
+/// `depth` is the level of the page at `cid`, capped at [`MAX_PAGE_DEPTH`].
 fn collect_all<'a>(
     vault: &'a dyn Vault,
     cid: Cid,
     out: &'a mut Vec<FileEntry>,
     stats: &'a mut DiffStats,
+    depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        if depth >= MAX_PAGE_DEPTH {
+            return Err(Error::PageDepthExceeded {
+                max: MAX_PAGE_DEPTH,
+            });
+        }
         match fetch_page(vault, &cid, stats).await? {
             Page::Leaf(leaf) => {
                 out.extend(leaf.e);
@@ -368,7 +522,7 @@ fn collect_all<'a>(
             }
             Page::Index(index) => {
                 for child in index.children {
-                    collect_all(vault, child.cid, out, stats).await?;
+                    collect_all(vault, child.cid, out, stats, depth + 1).await?;
                 }
                 Ok(())
             }
@@ -506,6 +660,14 @@ const BLOCK_DOWNLOAD_CONCURRENCY: usize = 16;
 /// an empty directory (dir->file transition) has that dir removed first; a
 /// non-empty dir there surfaces an error rather than being force-removed.
 ///
+/// The entry is the INBOUND trust boundary: it was decoded from a Manifest page
+/// fetched from the Vault, so [`ft_core::FileEntry::validate_untrusted`] runs
+/// FIRST and an entry whose `p` (or symlink `lt`) would escape the Space root is
+/// refused with [`Error::UnsafeEntry`] before any path is joined or byte written
+/// (`§5.2`). A destination whose intermediate components include a symlink is
+/// refused too ([`Error::SymlinkedParent`]) — `create_dir_all` and the tmp write
+/// both FOLLOW such a link.
+///
 /// `crypto` carries the Space's key material when runtime encryption is ON:
 /// `alg=1` Block objects are decrypted with it (unwrapping each data key from its
 /// `keys/<space_id>/<cid>` sidecar, where the Space id also comes from `crypto`).
@@ -519,7 +681,18 @@ pub async fn materialize(
     entry: &FileEntry,
     crypto: Option<&SpaceCrypto>,
 ) -> Result<()> {
-    let dest = join_canonical(space_root, entry);
+    // The trust boundary (`§5.2`). `apply` validates its whole batch up front, but
+    // `materialize` is a pub entry point of its own and must not rely on that.
+    entry.validate_untrusted().map_err(Error::UnsafeEntry)?;
+    let dest = join_canonical(space_root, entry)?;
+
+    // Every arm below writes through `dest`, and both `create_dir_all` and the tmp
+    // write FOLLOW a symlinked parent — so refuse before touching the fs. Derived
+    // is exempt: it materializes nothing, and failing it would abort a batch over a
+    // path no byte is ever written to.
+    if entry.t != ft_core::FileType::Derived {
+        assert_no_symlinked_parent(space_root, &dest)?;
+    }
 
     match entry.t {
         ft_core::FileType::Symlink => {
@@ -594,6 +767,10 @@ pub async fn materialize(
 /// than panicking. A single corrupt object aborts the fan-out at the first error
 /// with [`Error::Block`], returning nothing.
 ///
+/// For a `File` entry the reassembly is finally checked against the Manifest's own
+/// `sz`/`pcid` ([`Error::ContentMismatch`]) — the check that closes the
+/// `alg=1` -> `alg=0` downgrade the per-Block `cid` cannot see (`§4.3`).
+///
 /// Only meaningful for [`ft_core::FileType::File`] entries — symlinks/derived
 /// carry no Blocks; called on such an entry it returns an empty `Vec` (their `bk`
 /// is empty).
@@ -652,9 +829,34 @@ pub async fn fetch_file_bytes(
         })
         .buffered(BLOCK_DOWNLOAD_CONCURRENCY);
 
-    let mut contents: Vec<u8> = Vec::with_capacity(entry.sz as usize);
+    // `entry.sz` is remote-declared, so it only ever seeds a HINT: a Manifest
+    // claiming `sz: u64::MAX` would otherwise abort the process on a capacity
+    // overflow before a single byte is downloaded. `extend_from_slice` grows as
+    // needed, and the identity check below catches an `sz` that was a lie.
+    const CAPACITY_HINT_MAX: u64 = 64 * 1024 * 1024;
+    let mut contents: Vec<u8> = Vec::with_capacity(entry.sz.min(CAPACITY_HINT_MAX) as usize);
     while let Some(chunk) = stream.next().await {
         contents.extend_from_slice(&chunk?);
+    }
+
+    // The reassembly must be the content the Manifest itself declared (`§5.1`).
+    // Per-Block cid checks cannot establish this: the object under `blocks/<cid>`
+    // may honestly hash to `cid` and still be an `alg=1` ciphertext relabelled
+    // `alg=0` (`cid` folds in no `alg` byte, `§4.3`) — see [`Error::ContentMismatch`].
+    // Symlink/derived/dir entries carry no content, so their zeroed `pcid` is not a
+    // claim about bytes and is not checked.
+    if entry.t == ft_core::FileType::File {
+        let computed = ft_hash::pcid_of(&contents);
+        let computed_sz = contents.len() as u64;
+        if computed != entry.pcid || computed_sz != entry.sz {
+            return Err(Error::ContentMismatch {
+                path: entry.p.as_str().to_string(),
+                expected: entry.pcid,
+                computed,
+                expected_sz: entry.sz,
+                computed_sz,
+            });
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -671,10 +873,26 @@ pub async fn fetch_file_bytes(
     Ok(contents)
 }
 
+/// Suffix of the sibling temporary file [`materialize`] writes before the atomic
+/// rename that publishes a File: the tmp is `.<file_name><TMP_SUFFIX>` in the
+/// file's OWN directory (`§8.4`).
+///
+/// Public because the SCANNER MUST EXCLUDE this pattern. A crash mid-apply — or a
+/// scan racing an apply in progress — otherwise leaves the tmp on disk, where the
+/// next commit picks it up as an ordinary file and replicates it to every Device
+/// forever.
+pub const TMP_SUFFIX: &str = ".ft-tmp";
+
 /// Writes `bytes` to `dest` via a sibling temporary file + atomic `rename`, so a
 /// stale symlink at `dest` is never followed and the final path is unambiguously
 /// a regular file (`BUG 1b`). The exec bit is set on the tmp before the rename so
 /// the published file has the right mode the instant it appears.
+///
+/// The tmp is fsynced BEFORE the rename: `rename` is atomic for the directory
+/// ENTRY but says nothing about the data behind it, so a crash right after a pull
+/// could otherwise leave a zero-length or partial file at `dest` while the index
+/// already recorded the new base as durable (`§8.4`) — divergence no later scan
+/// detects, because the index believes that path is up to date.
 fn write_file_atomic(fs: &dyn OsFs, dest: &Path, bytes: &[u8], exec: bool) -> Result<()> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dest
@@ -683,12 +901,28 @@ fn write_file_atomic(fs: &dyn OsFs, dest: &Path, bytes: &[u8], exec: bool) -> Re
         .unwrap_or_default();
     // A deterministic, collision-resistant sibling name; the materialize is the
     // sole writer of this path within a batch.
-    let tmp = dir.join(format!(".{file_name}.ft-tmp"));
-    // Best-effort clear of any leftover tmp, then write + rename.
+    let tmp = dir.join(format!(".{file_name}{TMP_SUFFIX}"));
+    // Best-effort clear of any leftover tmp, then write + fsync + rename.
     remove_path(&tmp)?;
     fs.write_bytes(&tmp, bytes, exec)?;
+    // Opened for WRITE rather than read: `FlushFileBuffers` (what `sync_all` maps
+    // to off-unix) needs write access, and the tmp is ours and mode 0o644/0o755.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|source| Error::Fs(ft_fsmap::FsMapError::Io(source)))?;
     match std::fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Then the directory, so the rename itself survives the crash — the
+            // data is already durable above. Best-effort: opening a directory as a
+            // `File` is a unix affordance, and a filesystem that refuses it is no
+            // reason to fail a write that has already landed.
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
         Err(source) => {
             // Don't leak the tmp if the rename failed.
             let _ = std::fs::remove_file(&tmp);
@@ -734,12 +968,76 @@ async fn resolve_blocklist(vault: &dyn Vault, entry: &FileEntry) -> Result<Vec<C
 }
 
 /// Joins `space_root` with an entry's canonical (forward-slash) path.
-fn join_canonical(space_root: &Path, entry: &FileEntry) -> PathBuf {
+///
+/// Depth-in-defense behind [`ft_core::FileEntry::validate_untrusted`], which every
+/// caller here runs first: `p` is remote-controlled (`§5.2`), a `..` component
+/// walks out of the Space, an absolute component makes `PathBuf::push` REPLACE the
+/// root outright, and an empty `p` resolves to the root itself (which the File arm
+/// would then try to remove and replace with a regular file). So the components are
+/// re-checked here and the joined path is re-anchored under `space_root` — no
+/// future caller can bypass the boundary by forgetting to validate.
+fn join_canonical(space_root: &Path, entry: &FileEntry) -> Result<PathBuf> {
+    let outside = || Error::OutsideSpaceRoot {
+        path: entry.p.as_str().to_string(),
+        root: space_root.display().to_string(),
+    };
     let mut dest = space_root.to_path_buf();
     for part in entry.p.as_str().split('/').filter(|s| !s.is_empty()) {
+        if part == ".." || part == "." {
+            return Err(outside());
+        }
         dest.push(part);
     }
-    dest
+    if dest == space_root || !dest.starts_with(space_root) {
+        return Err(outside());
+    }
+    Ok(dest)
+}
+
+/// Refuses to touch `dest` when an EXISTING intermediate component between
+/// `space_root` and `dest` is a symlink (`§5.1`).
+///
+/// Neither `create_dir_all` nor the tmp write is symlink-aware, so without this a
+/// peer's `docs/x.md` lands wherever the local `<root>/docs -> /elsewhere` link
+/// points. Note the link is usually the USER'S OWN and entirely legitimate: the
+/// scanner keeps an absolute/escaping symlink out of the Manifest as local-only, so
+/// no entry in the incoming set names it and no ordering of `apply` can fix it up.
+/// `dest` ITSELF is not checked — a symlink there is the path being replaced, which
+/// `materialize` removes deliberately.
+///
+/// DELETES need this exactly as much as writes do, and are the more dangerous
+/// half: `remove_path`/`remove_dir_if_empty` read `dest` with the non-following
+/// `symlink_metadata`, which protects the FINAL component only — the kernel still
+/// resolves every intermediate one. A user who replaced `<root>/docs` with a
+/// local-only link to `~/real-docs` after `docs/notes.md` had synced would
+/// otherwise see the next pull of a peer's delete silently unlink
+/// `~/real-docs/notes.md`: destruction of data outside the Space, with no copy
+/// anywhere. So `apply`'s phase-2 and phase-3 delete paths call this before
+/// removing anything, and the FAILURE SEMANTICS match the write path exactly —
+/// a typed [`Error::SymlinkedParent`] that aborts the batch, never a silent skip.
+/// Refusing is what makes the situation visible and fixable (remove or rename the
+/// link); half-deleting under it is not.
+fn assert_no_symlinked_parent(space_root: &Path, dest: &Path) -> Result<()> {
+    let Ok(rel) = dest.strip_prefix(space_root) else {
+        // `join_canonical` already rejects a `dest` outside the root.
+        return Ok(());
+    };
+    let comps: Vec<_> = rel.components().collect();
+    let mut cur = space_root.to_path_buf();
+    for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+        cur.push(comp);
+        // An absent component is fine: `ensure_parent` will create it as a real
+        // directory. Any other error is left to the write itself to report.
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return Err(Error::SymlinkedParent {
+                    path: dest.display().to_string(),
+                    component: cur.display().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Creates the parent directory of `dest` if it does not exist, mapping any IO
@@ -762,7 +1060,11 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 /// - [`Change::Deleted`] -> remove the file (or symlink) from disk.
 ///
 /// Removing an already-absent path is a no-op (a delete is idempotent), so a
-/// re-apply does not fail.
+/// re-apply does not fail. A delete whose destination sits under a SYMLINKED
+/// intermediate component is refused with [`Error::SymlinkedParent`], exactly as a
+/// write to that destination is: unlinking under the user's own local-only
+/// `<root>/docs -> ~/real-docs` link would destroy a file outside the Space (see
+/// [`assert_no_symlinked_parent`]).
 ///
 /// `crypto` is forwarded to [`materialize`] for every Added/Modified change so an
 /// `alg=1` Block can be decrypted; `None` keeps the cleartext path (see
@@ -772,13 +1074,19 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 /// directory and a non-directory at one path race the child changes of that dir
 /// unless deletes and transitions are sequenced around the concurrent bulk, so:
 ///
-/// - **Phase 1** (SEQUENTIAL, path depth ASCENDING): every `Modified` that turns
-///   a file/symlink INTO a dir (`old.t != Dir && new.t == Dir`). Shallowest-first
-///   so a parent dir exists before a child's transition; `materialize` removes the
-///   occupant and `create_dir_all`s the directory.
-/// - **Phase 2** (CONCURRENT, `buffer_unordered` bounded to 8): every `Added`,
-///   every `Modified` where NEITHER side is a `Dir`, and every `Deleted` of a
-///   NON-`Dir` entry. `changes` comes from a single [`diff`], whose merge-join
+/// - **Phase 1** (SEQUENTIAL, path depth ASCENDING): every `Added` of a `Dir`, and
+///   every `Modified` that turns a file/symlink INTO a dir
+///   (`old.t != Dir && new.t == Dir`). Shallowest-first so a parent dir exists —
+///   and exists as a REAL directory — before any child is written; `materialize`
+///   removes any occupant and `create_dir_all`s the directory. Added dirs belong
+///   here rather than in the concurrent bulk because otherwise a child's write
+///   races its own parent: where the local path is a symlink the scanner kept out
+///   of the Manifest (an absolute `docs -> /elsewhere`, `§5.1`), the outcome would
+///   depend on which ran first — the dir entry replacing the link, or the child
+///   aborting the batch on [`Error::SymlinkedParent`].
+/// - **Phase 2** (CONCURRENT, `buffer_unordered` bounded to 8): every `Added` of a
+///   NON-`Dir`, every `Modified` where NEITHER side is a `Dir`, and every `Deleted`
+///   of a NON-`Dir` entry. `changes` comes from a single [`diff`], whose merge-join
 ///   emits at most one `Change` per [`CasefoldKey`](ft_core::CasefoldKey), so each
 ///   targets a DIFFERENT path and `materialize` creates parents idempotently — no
 ///   intra-phase ordering is needed.
@@ -797,6 +1105,29 @@ fn ensure_parent(_fs: &dyn OsFs, dest: &Path) -> Result<()> {
 /// (A `Modified` with `old.t == Dir && new.t == Dir` never occurs: `same_identity`
 /// for a `Dir` is type-only, so two dir entries at one key are never a change.)
 ///
+/// Before ANY phase runs, every entry the batch acts on is checked with
+/// [`ft_core::FileEntry::validate_untrusted`] (`§5.2`): the whole change set came
+/// out of Manifest pages fetched from the Vault, and a `Deleted` whose `p` is
+/// `../../something` would delete outside the Space just as surely as an `Added`
+/// would write outside it. Validating up front rather than per phase means a
+/// hostile or corrupt batch aborts with NOTHING half-applied.
+///
+/// # Unsyncable names are SKIPPED, not fatal
+///
+/// The same pre-pass drops (never fails on) an entry whose path
+/// [`ft_core::CanonicalPath::unsyncable_reason`] flags — a name carrying a `\` or
+/// a Windows drive prefix. Those are legal file names on Linux/macOS that the
+/// scanner canonicalizes verbatim and commits, so making them a batch error meant
+/// ONE such file published by one Device deterministically aborted every other
+/// Device's entire pull, forever, with nothing applied — and upgrading a binary
+/// could brick pulls of a Space whose history already contains one. Skipping the
+/// individual entry lets the rest of the batch converge; each skip is logged at
+/// WARN (the same mechanism the phases already use for progress and the scanner
+/// uses for its own skips), naming the path and the rule, because a path that
+/// silently stops syncing is indistinguishable from data loss. The scanner
+/// refuses to publish such names going forward (`ft_engine`'s
+/// `SkipReason::UnsyncableName`), so the Space converges by deletion.
+///
 /// Aborts on the first error (a later change may still be in flight when that
 /// happens; `apply` is not resumable mid-batch either way).
 pub async fn apply(
@@ -809,6 +1140,39 @@ pub async fn apply(
     use futures::stream::{self, StreamExt, TryStreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    // The inbound trust boundary for the whole batch, before any side effect (see
+    // the fn doc). `old` of a `Modified` is not checked: no phase acts on its path.
+    //
+    // Two outcomes, deliberately different (see "Unsyncable names" in the fn doc):
+    // a path the scanner could never emit (`..`, absolute, empty component, NUL)
+    // is a HARD batch error — the Manifest is corrupt or hostile; a path that is
+    // merely unsyncable (`\`, drive prefix) is dropped from the batch with a WARN,
+    // because one such legally-committed file used to wedge every peer's pull.
+    let mut acted: Vec<&Change> = Vec::with_capacity(changes.len());
+    let mut skipped_unsyncable = 0usize;
+    for change in changes {
+        let entry = match change {
+            Change::Added(e) | Change::Modified { new: e, .. } | Change::Deleted(e) => e,
+        };
+        entry.validate_untrusted().map_err(Error::UnsafeEntry)?;
+        if let Some(reason) = entry.p.unsyncable_reason() {
+            tracing::warn!(
+                path = %entry.p.as_str(),
+                "skipping a Manifest entry this platform cannot sync: {reason}"
+            );
+            skipped_unsyncable += 1;
+            continue;
+        }
+        acted.push(change);
+    }
+    let changes: Vec<&Change> = acted;
+    if skipped_unsyncable > 0 {
+        tracing::warn!(
+            skipped = skipped_unsyncable,
+            "some Manifest entries were skipped as unsyncable; the rest of the batch is applied"
+        );
+    }
 
     let total = changes.len();
     tracing::info!(total, "applying changes");
@@ -825,11 +1189,11 @@ pub async fn apply(
     let is_dir = ft_core::FileType::Dir;
 
     // Partition into the four phases (see the fn doc).
-    let mut phase1_to_dir: Vec<&Change> = Vec::new(); // Modified: *->Dir
+    let mut phase1_to_dir: Vec<&Change> = Vec::new(); // Added(Dir) + Modified: *->Dir
     let mut phase2_concurrent: Vec<&Change> = Vec::new(); // adds/mods(non-dir)/non-dir deletes
     let mut phase3_dir_deletes: Vec<&FileEntry> = Vec::new(); // Deleted(Dir)
     let mut phase4_from_dir: Vec<&Change> = Vec::new(); // Modified: Dir->*
-    for change in changes {
+    for &change in &changes {
         match change {
             Change::Modified { old, new } if new.t == is_dir && old.t != is_dir => {
                 phase1_to_dir.push(change);
@@ -837,20 +1201,30 @@ pub async fn apply(
             Change::Modified { old, new } if old.t == is_dir && new.t != is_dir => {
                 phase4_from_dir.push(change);
             }
+            // An ADDED directory belongs in phase 1 with the *->Dir transitions, not
+            // in the concurrent bulk: a child's write must find its parent already
+            // present AND already a real directory. Left in phase 2, the two race —
+            // and when the local path is a symlink the scanner kept out of the
+            // Manifest (an absolute `docs -> /elsewhere`, §5.1), whether the pull
+            // succeeds depends on which of the two happens to run first: the dir
+            // entry replaces the link, or the child hits `assert_no_symlinked_parent`
+            // and aborts the whole batch. Sequencing dirs first makes it converge on
+            // the first attempt instead of the second.
+            Change::Added(entry) if entry.t == is_dir => phase1_to_dir.push(change),
             Change::Deleted(entry) if entry.t == is_dir => phase3_dir_deletes.push(entry),
             _ => phase2_concurrent.push(change),
         }
     }
 
-    // Phase 1 — file/symlink -> dir transitions, shallowest-first so a parent dir
-    // exists before a child's transition.
+    // Phase 1 — directory creations and file/symlink -> dir transitions,
+    // shallowest-first so a parent dir exists before its children.
     phase1_to_dir.sort_by_key(|c| match c {
-        Change::Modified { new, .. } => path_depth(&new.p),
-        _ => 0,
+        Change::Added(entry) | Change::Modified { new: entry, .. } => path_depth(&entry.p),
+        Change::Deleted(_) => 0,
     });
     for change in &phase1_to_dir {
-        if let Change::Modified { new, .. } = change {
-            materialize(vault, fs, space_root, new, crypto).await?;
+        if let Change::Added(entry) | Change::Modified { new: entry, .. } = change {
+            materialize(vault, fs, space_root, entry, crypto).await?;
             bump(&completed);
         }
     }
@@ -865,7 +1239,16 @@ pub async fn apply(
                         materialize(vault, fs, space_root, entry, crypto).await?;
                     }
                     Change::Deleted(entry) => {
-                        let dest = join_canonical(space_root, entry);
+                        let dest = join_canonical(space_root, entry)?;
+                        // A delete traverses its parents exactly like a write does:
+                        // `remove_path`'s `symlink_metadata(dest)` does not follow
+                        // `dest` itself, but every INTERMEDIATE component is
+                        // followed by the kernel. With a local-only
+                        // `<root>/docs -> /elsewhere`, a peer's delete of
+                        // `docs/notes.md` would unlink `/elsewhere/notes.md` —
+                        // outside the Space, and unrecoverable. Same guard, same
+                        // semantics as the write path (`materialize`): refuse.
+                        assert_no_symlinked_parent(space_root, &dest)?;
                         remove_path(&dest)?;
                     }
                 }
@@ -881,7 +1264,11 @@ pub async fn apply(
     // (now-deleted) children.
     phase3_dir_deletes.sort_by_key(|d| std::cmp::Reverse(path_depth(&d.p)));
     for entry in phase3_dir_deletes {
-        let dest = join_canonical(space_root, entry);
+        let dest = join_canonical(space_root, entry)?;
+        // Same reason as the phase-2 deletes above: `remove_dir` follows every
+        // intermediate component, so a symlinked parent would aim the rmdir at a
+        // directory outside the Space.
+        assert_no_symlinked_parent(space_root, &dest)?;
         remove_dir_if_empty(&dest)?;
         bump(&completed);
     }
@@ -1355,7 +1742,10 @@ mod tests {
             t: FileType::File,
             x: false,
             sz: (c1.len() + c2.len()) as u64,
-            pcid: Pcid::new([0u8; 32]),
+            // A real `pcid`: the reassembly is checked against the entry's own
+            // declared identity, so a zeroed placeholder is no longer a valid
+            // fixture for a materialize that is supposed to SUCCEED.
+            pcid: ft_hash::pcid_of(b"alpha-omega!"),
             bk: vec![],
             bk_ref: Some(bl_cid),
             lt: None,
@@ -1394,8 +1784,11 @@ mod tests {
         let space_dir = tempfile::tempdir().unwrap();
         let fs = LinuxFs;
 
+        // The link sits at depth 1, so a literal `../target/x.md` still resolves
+        // INSIDE the Space — a symlink that escapes the root never enters the
+        // Manifest at all (`§5.1`), so it is not a fixture the read path can see.
         let entry = FileEntry {
-            p: CanonicalPath("link".to_string()),
+            p: CanonicalPath("docs/link".to_string()),
             t: FileType::Symlink,
             x: false,
             sz: 0,
@@ -1408,7 +1801,9 @@ mod tests {
         materialize(&vault, &fs, space_dir.path(), &entry, None)
             .await
             .unwrap();
-        let target = fs.read_symlink(&space_dir.path().join("link")).unwrap();
+        let target = fs
+            .read_symlink(&space_dir.path().join("docs").join("link"))
+            .unwrap();
         assert_eq!(target, "../target/x.md");
     }
 
@@ -1557,7 +1952,9 @@ mod tests {
         let dest = space_dir.path().join("shifter");
         assert!(dest.is_file());
 
-        // Now the same path is a symlink in the new tree.
+        // Now the same path is a symlink in the new tree. Its target stays inside
+        // the Space: a root-level link to `../elsewhere` escapes, so the scanner
+        // would have kept it local-only and it could never arrive here (`§5.1`).
         let link_entry = FileEntry {
             p: CanonicalPath("shifter".to_string()),
             t: FileType::Symlink,
@@ -1566,7 +1963,7 @@ mod tests {
             pcid: Pcid::new([0u8; 32]),
             bk: vec![],
             bk_ref: None,
-            lt: Some("../elsewhere".to_string()),
+            lt: Some("elsewhere".to_string()),
             wu: None,
         };
         // Plus a second, unrelated addition AFTER it: if the batch aborts on the
@@ -1597,7 +1994,7 @@ mod tests {
             "path must be a symlink after File->Symlink, got {:?}",
             meta.file_type()
         );
-        assert_eq!(fs.read_symlink(&dest).unwrap(), "../elsewhere");
+        assert_eq!(fs.read_symlink(&dest).unwrap(), "elsewhere");
 
         // The batch did NOT abort: the later addition landed.
         let on_disk = std::fs::read(space_dir.path().join("sentinel.txt")).unwrap();
@@ -2496,6 +2893,507 @@ mod tests {
         assert!(!space_dir.path().join("corrupt.bin").exists());
     }
 
+    // -----------------------------------------------------------------------
+    // (INBOUND TRUST BOUNDARY) Everything this crate consumes — page bytes, entry
+    // paths, symlink targets, Block payloads, declared sizes — arrives from the
+    // Vault and is remote-controlled. A hostile Manifest must never write, delete
+    // or read outside the Space root, and must never put bytes on disk that the
+    // Manifest itself did not declare.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn materialize_refuses_an_entry_whose_path_escapes_the_space_root() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let fs = LinuxFs;
+
+        // The classic traversal: `..` climbs out of the Space, so the write lands
+        // in the user's home on EVERY device that pulls this Manifest. The Blocks
+        // are real, so nothing but the boundary check stands in the way.
+        let (mut entry, _content) =
+            upload_multiblock_file(&vault, "x", &[b"ssh-rsa AAAA pwned" as &[u8]]).await;
+        entry.p = CanonicalPath("../.ssh/authorized_keys".to_string());
+
+        let err = materialize(&vault, &fs, &space, &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeEntry(ft_core::Error::UnsafePath { .. })),
+            "a `..` path must be refused at the trust boundary, got {err:?}"
+        );
+        assert!(
+            !outer.path().join(".ssh").exists(),
+            "nothing outside the Space root may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_an_empty_path_that_would_resolve_to_the_space_root() {
+        // A degenerate `p: ""` joins to the Space ROOT itself, which the File arm
+        // would then `remove_path` and replace with a regular file.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (mut entry, _content) =
+            upload_multiblock_file(&vault, "x", &[b"i replace your Space" as &[u8]]).await;
+        entry.p = CanonicalPath(String::new());
+
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeEntry(_)),
+            "an empty path must be refused, got {err:?}"
+        );
+        assert!(
+            space_dir.path().is_dir(),
+            "the Space root must still be a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_delete_whose_path_escapes_the_space_root() {
+        // A `Deleted` needs no Blocks and no write permission to do damage: the
+        // same `..` path removes a file outside the Space.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        std::fs::write(outer.path().join("precious.txt"), b"do not delete me").unwrap();
+        let fs = LinuxFs;
+
+        let mut victim = file_entry("precious.txt", 3).1;
+        victim.p = CanonicalPath("../precious.txt".to_string());
+
+        let err = apply(&vault, &fs, &space, &[Change::Deleted(victim)], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeEntry(_)),
+            "a delete outside the Space root must be refused, got {err:?}"
+        );
+        assert!(
+            outer.path().join("precious.txt").exists(),
+            "a delete must never reach outside the Space root"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_validates_the_whole_batch_before_applying_anything() {
+        // The hostile entry is LAST: validating the batch UP FRONT rather than per
+        // phase is what keeps the earlier legitimate change from landing first.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let fs = LinuxFs;
+
+        let (good, _content) =
+            upload_multiblock_file(&vault, "good.txt", &[b"legit bytes" as &[u8]]).await;
+        let mut hostile = file_entry("h", 2).1;
+        hostile.p = CanonicalPath("../escape.txt".to_string());
+
+        let err = apply(
+            &vault,
+            &fs,
+            &space,
+            &[Change::Added(good), Change::Added(hostile)],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::UnsafeEntry(_)), "got {err:?}");
+        assert!(
+            !space.join("good.txt").exists(),
+            "a batch holding a hostile entry must apply NOTHING"
+        );
+        assert!(!outer.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn join_canonical_refuses_to_leave_the_space_root_even_without_validation() {
+        // The depth-in-defense layer: called DIRECTLY, bypassing
+        // `validate_untrusted`, it still refuses to resolve outside the root.
+        let root = Path::new("/space");
+        let mut e = dir_entry("ok/here");
+        assert_eq!(
+            join_canonical(root, &e).unwrap(),
+            Path::new("/space/ok/here")
+        );
+
+        for bad in ["../escape", "a/../../escape", "..", ".", ""] {
+            e.p = CanonicalPath(bad.to_string());
+            let got = join_canonical(root, &e);
+            assert!(
+                matches!(got, Err(Error::OutsideSpaceRoot { .. })),
+                "{bad:?} must not resolve inside the Space root, got {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_a_symlink_whose_target_is_absolute() {
+        // The link half of the escape: `tools -> /Users/victim/.ssh` plus a
+        // `tools/authorized_keys` in the same batch writes THROUGH the link.
+        // Refusing the absolute target keeps the link from ever being created.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let entry = FileEntry {
+            p: CanonicalPath("tools".to_string()),
+            t: FileType::Symlink,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: vec![],
+            bk_ref: None,
+            lt: Some("/etc".to_string()),
+            wu: None,
+        };
+
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeEntry(_)),
+            "an absolute symlink target must be refused, got {err:?}"
+        );
+        assert!(
+            !space_dir.path().join("tools").exists(),
+            "no link may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_to_write_through_a_symlinked_parent_directory() {
+        // No attacker required: the scanner keeps the user's own absolute
+        // `<root>/docs -> /elsewhere` OUT of the Manifest as local-only (`§5.1`), so
+        // no incoming entry names it and no ordering of `apply` can fix it up — a
+        // peer's real `docs/notes.md` would be written straight through the link.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let fs = LinuxFs;
+        fs.create_symlink(elsewhere.to_str().unwrap(), &space.join("docs"))
+            .unwrap();
+
+        let (entry, _content) =
+            upload_multiblock_file(&vault, "docs/notes.md", &[b"peer bytes" as &[u8]]).await;
+
+        let err = materialize(&vault, &fs, &space, &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::SymlinkedParent { .. }),
+            "writing through a symlinked parent must be refused, got {err:?}"
+        );
+        assert!(
+            !elsewhere.join("notes.md").exists(),
+            "nothing may be written through the link"
+        );
+        // The link is the USER'S: refusing must not destroy it either. (A symlink
+        // at the DESTINATION is a different case — that one materialize replaces
+        // deliberately; see apply_symlink_to_file_transition_*.)
+        assert!(std::fs::symlink_metadata(space.join("docs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// An `Added` dir and a child file in ONE batch must converge on the FIRST
+    /// apply, even when a local-only symlink occupies the dir's path. Both used to
+    /// land in the concurrent phase 2, so the outcome depended on which ran first:
+    /// the dir replacing the link (success) or the child hitting the symlinked-parent
+    /// guard (whole batch aborts). Phase 1 now creates dirs shallowest-first, so the
+    /// link is always replaced by a real directory before its children are written.
+    #[tokio::test]
+    async fn apply_creates_an_added_dir_before_its_children_even_over_a_local_symlink() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let fs = LinuxFs;
+        // The user's own local-only symlink at the path the peer sends as a real dir.
+        fs.create_symlink(elsewhere.to_str().unwrap(), &space.join("docs"))
+            .unwrap();
+
+        let dir_entry = FileEntry {
+            p: ft_core::CanonicalPath("docs".to_string()),
+            t: ft_core::FileType::Dir,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: Vec::new(),
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+        let (file_entry, content) =
+            upload_multiblock_file(&vault, "docs/notes.md", &[b"peer bytes" as &[u8]]).await;
+
+        // Child listed FIRST, so a phase-2-only implementation would be free to run
+        // it before its parent — the ordering must come from the phasing, not luck.
+        let changes = vec![Change::Added(file_entry), Change::Added(dir_entry)];
+        apply(&vault, &fs, &space, &changes, None)
+            .await
+            .expect("dir-before-child ordering must make this converge in one pass");
+
+        // The link was replaced by a real directory and the child landed INSIDE the
+        // Space, not through the link.
+        assert!(std::fs::symlink_metadata(space.join("docs"))
+            .unwrap()
+            .file_type()
+            .is_dir());
+        assert_eq!(std::fs::read(space.join("docs/notes.md")).unwrap(), content);
+        assert!(
+            !elsewhere.join("notes.md").exists(),
+            "nothing may be written through the replaced link"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_a_substituted_manifest_page() {
+        // A page NAMES every other object, so an unverified page voids the whole
+        // subtree's integrity: substituting one can omit thousands of entries (the
+        // diff then applies mass deletion) or inject a hostile path. Here tree B's
+        // page bytes are stored under tree A's root KEY.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+
+        let a = build(vec![file_entry("a.txt", 1), file_entry("b.txt", 2)]);
+        let b = build(vec![file_entry("a.txt", 1)]);
+        upload_manifest(&vault, &a).await;
+        upload_manifest(&vault, &b).await;
+        vault
+            .put(&ft_hash::manifest_key(&a.root), b.pages[0].1.clone())
+            .await
+            .unwrap();
+
+        let err = diff(&vault, &a.root, &b.root).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Manifest(ft_manifest::ManifestError::PageCidMismatch { .. })
+            ),
+            "a substituted page must fail the Merkle check, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_bytes_that_do_not_match_the_manifests_own_pcid() {
+        // Every Block honestly hashes to its own `cid` and can STILL be the wrong
+        // block for this entry (a substituted Block list). The entry's `pcid` is the
+        // only thing that says so (`§5.1`).
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (mut entry, _content) =
+            upload_multiblock_file(&vault, "doc.txt", &[b"real bytes" as &[u8]]).await;
+        entry.pcid = ft_hash::pcid_of(b"some other content entirely");
+
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ContentMismatch { .. }),
+            "content that is not what the Manifest declared must be refused, got {err:?}"
+        );
+        assert!(
+            !space_dir.path().join("doc.txt").exists(),
+            "nothing may be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_an_alg0_object_forged_from_an_alg1_ciphertext() {
+        // `cid` folds in no `alg` byte (`§4.3`): for `alg=0` it is
+        // `BLAKE3(payload)`, for `alg=1` it is `BLAKE3(nonce || ciphertext)`. So an
+        // object whose header CLAIMS `alg=0` with payload `nonce || ciphertext`
+        // hashes to the genuine encrypted object's cid — `ft_block::verify` passes,
+        // the AEAD is skipped, and raw ciphertext would land in the user's file.
+        // Only the `pcid` check catches this downgrade.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let cleartext: &[u8] = b"SECRET-payload-that-must-stay-secret";
+        let (cid, pcid, obj, _data_key) =
+            ft_block::encode_encrypted(cleartext, &DEDUP_SECRET).unwrap();
+        let (header, ciphertext) = ft_block::decode(&obj).unwrap();
+
+        let mut forged_payload = header.nonce.to_vec();
+        forged_payload.extend_from_slice(&ciphertext);
+        assert_eq!(
+            ft_block::cid_for(&forged_payload),
+            cid,
+            "the forgery must address to the SAME cid — that is the whole downgrade"
+        );
+        vault
+            .put(&ft_hash::block_key(&cid), ft_block::encode(&forged_payload))
+            .await
+            .unwrap();
+
+        let entry = FileEntry {
+            p: CanonicalPath("secret.bin".to_string()),
+            t: FileType::File,
+            x: false,
+            sz: cleartext.len() as u64,
+            pcid,
+            bk: vec![cid],
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+
+        // No key material is even needed: the forged header says `alg=0`, so the
+        // decrypt path is never entered.
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ContentMismatch { .. }),
+            "an alg=1 -> alg=0 downgrade must be caught, got {err:?}"
+        );
+        let on_disk = space_dir.path().join("secret.bin");
+        assert!(
+            !on_disk.exists(),
+            "raw ciphertext must never reach the user's file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_declared_size_does_not_drive_the_allocation() {
+        // `Vec::with_capacity(entry.sz as usize)` on a `sz: u64::MAX` aborts the
+        // process before a single byte is downloaded. `sz` is only a hint; the
+        // identity check is what actually enforces it.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (mut entry, content) =
+            upload_multiblock_file(&vault, "liar.bin", &[b"twelve bytes" as &[u8]]).await;
+        entry.sz = u64::MAX;
+
+        let err = materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap_err();
+        match err {
+            Error::ContentMismatch {
+                expected_sz,
+                computed_sz,
+                ..
+            } => {
+                assert_eq!(expected_sz, u64::MAX);
+                assert_eq!(computed_sz, content.len() as u64);
+            }
+            other => panic!("expected ContentMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_publish_temporary_file_is_named_from_the_public_tmp_suffix() {
+        // The scanner has to exclude this exact pattern (see [`TMP_SUFFIX`]), so pin
+        // the const to the path the write path really uses: a decoy planted there is
+        // cleared by the write, and nothing is left behind to be replicated.
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let fs = LinuxFs;
+
+        let (entry, content) =
+            upload_multiblock_file(&vault, "sub/doc.txt", &[b"final bytes" as &[u8]]).await;
+        let tmp = space_dir
+            .path()
+            .join("sub")
+            .join(format!(".doc.txt{TMP_SUFFIX}"));
+        std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+        std::fs::write(&tmp, b"stale leftover from a crashed apply").unwrap();
+
+        materialize(&vault, &fs, space_dir.path(), &entry, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(space_dir.path().join("sub").join("doc.txt")).unwrap(),
+            content
+        );
+        assert!(
+            !tmp.exists(),
+            "the tmp must be consumed by the rename, never left for the scanner"
+        );
+    }
+
+    /// Frames a single-child index page into the `(cid, object_bytes)` pair the
+    /// Vault serves — the shape `ft-manifest` builds internally, rebuilt here so a
+    /// test can stack pages far deeper than `build` ever would.
+    fn index_page_over(child: &Cid, min: &CasefoldKey) -> (Cid, Vec<u8>) {
+        let page = ft_core::IndexPage {
+            k: ft_manifest::KIND_INDEX,
+            v: ft_manifest::PAGE_VERSION,
+            children: vec![ft_core::ChildRef {
+                min: min.clone(),
+                cid: *child,
+            }],
+        };
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&page, &mut payload).unwrap();
+        let cid = ft_hash::cid_of(&payload);
+        let mut obj = ft_core::BlockHeader::new_manifest(payload.len() as u64)
+            .encode()
+            .to_vec();
+        obj.extend_from_slice(&payload);
+        (cid, obj)
+    }
+
+    #[tokio::test]
+    async fn diff_refuses_a_page_tree_deeper_than_the_depth_cap() {
+        // A tree of index pages chained one child per level recurses the walk until
+        // the stack overflows. Every page here hashes to the cid that points at it,
+        // so the Merkle check cannot tell it from a real tree — only the cap can.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path());
+
+        let leaf = build(vec![file_entry("deep.txt", 9)]);
+        upload_manifest(&vault, &leaf).await;
+        let min = ft_fsmap::casefold_key(&CanonicalPath("deep.txt".to_string()));
+
+        let mut cid = leaf.root;
+        for _ in 0..(MAX_PAGE_DEPTH + 4) {
+            let (next, obj) = index_page_over(&cid, &min);
+            vault.put(&ft_hash::manifest_key(&next), obj).await.unwrap();
+            cid = next;
+        }
+
+        let empty = build(vec![]);
+        upload_manifest(&vault, &empty).await;
+
+        let err = diff(&vault, &empty.root, &cid).await.unwrap_err();
+        assert!(
+            matches!(err, Error::PageDepthExceeded { max } if max == MAX_PAGE_DEPTH),
+            "a pathologically deep page tree must be a typed error, got {err:?}"
+        );
+    }
+
     /// A latency-bound benchmark for the concurrent download path. Ignored by
     /// default (it sleeps for hundreds of ms). Run with:
     /// `cargo test -p ft-diff -- --ignored bench_materialize`.
@@ -2555,5 +3453,203 @@ mod tests {
             "concurrent download must be far faster than the {sequential_ms}ms sequential \
              floor; got {elapsed:?} (regression to a sequential loop?)"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Deletes never travel through a symlinked parent (data loss OUTSIDE the Space)
+    // -----------------------------------------------------------------------
+
+    /// The scenario, with no attacker in it: `docs/notes.md` synced normally, then
+    /// the user replaced `<root>/docs` with a link to `~/real-docs` (the scanner
+    /// keeps that link out of the Manifest as local-only, `§5.1`). A peer deletes
+    /// `docs/notes.md`; `remove_file` does not follow its FINAL component but the
+    /// kernel follows every intermediate one, so the pull used to unlink
+    /// `~/real-docs/notes.md` — a file outside the Space that no Revision has a
+    /// copy of. The delete must be refused exactly like a write is.
+    #[tokio::test]
+    async fn apply_refuses_to_delete_through_a_symlinked_parent_directory() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let real_docs = outer.path().join("real-docs");
+        std::fs::create_dir_all(&real_docs).unwrap();
+        std::fs::write(real_docs.join("notes.md"), b"the user's only copy").unwrap();
+        let fs = LinuxFs;
+        fs.create_symlink(real_docs.to_str().unwrap(), &space.join("docs"))
+            .unwrap();
+
+        let (entry, _content) =
+            upload_multiblock_file(&vault, "docs/notes.md", &[b"peer bytes" as &[u8]]).await;
+
+        let err = apply(&vault, &fs, &space, &[Change::Deleted(entry)], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::SymlinkedParent { .. }),
+            "deleting through a symlinked parent must be refused, got {err:?}"
+        );
+        assert!(
+            real_docs.join("notes.md").exists(),
+            "the file OUTSIDE the Space must survive the pull"
+        );
+        // And the user's own link is left alone, as on the write path.
+        assert!(std::fs::symlink_metadata(space.join("docs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The phase-3 half of the same hole: a `Deleted` of a `Dir` entry goes through
+    /// `remove_dir`, which follows intermediate components just as happily.
+    #[tokio::test]
+    async fn apply_refuses_to_rmdir_through_a_symlinked_parent_directory() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let outer = tempfile::tempdir().unwrap();
+        let space = outer.path().join("space");
+        std::fs::create_dir_all(&space).unwrap();
+        let real_docs = outer.path().join("real-docs");
+        std::fs::create_dir_all(real_docs.join("sub")).unwrap();
+        let fs = LinuxFs;
+        fs.create_symlink(real_docs.to_str().unwrap(), &space.join("docs"))
+            .unwrap();
+
+        let err = apply(
+            &vault,
+            &fs,
+            &space,
+            &[Change::Deleted(dir_entry("docs/sub"))],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::SymlinkedParent { .. }),
+            "rmdir through a symlinked parent must be refused, got {err:?}"
+        );
+        assert!(
+            real_docs.join("sub").is_dir(),
+            "the directory OUTSIDE the Space must survive the pull"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unsyncable names: skipped per entry, never a batch abort (the sync wedge)
+    // -----------------------------------------------------------------------
+
+    /// `foo\bar.txt` and `a:b.txt` are legal file names on Linux/macOS that the
+    /// scanner canonicalized verbatim and committed. Making them a batch error at
+    /// the inbound trust boundary meant ONE such file wedged every other Device's
+    /// pull — deterministically, forever, with nothing applied. They must be
+    /// skipped per entry so the rest of the batch converges.
+    #[tokio::test]
+    async fn apply_skips_unsyncable_names_and_applies_the_rest_of_the_batch() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let space = space_dir.path();
+        let fs = LinuxFs;
+
+        let (backslash, _) =
+            upload_multiblock_file(&vault, "foo\\bar.txt", &[b"legal here" as &[u8]]).await;
+        let (drive, _) = upload_multiblock_file(&vault, "a:b.txt", &[b"also legal" as &[u8]]).await;
+        // The same file name one directory down: the old whole-path drive check
+        // looked at byte 1 of the WHOLE path, so this one passed while `a:b.txt`
+        // failed. Per component, both are unsyncable — and neither is fatal.
+        let (nested_drive, _) =
+            upload_multiblock_file(&vault, "docs/a:b.txt", &[b"legal too" as &[u8]]).await;
+        let (good, content) =
+            upload_multiblock_file(&vault, "docs/notes.md", &[b"peer bytes" as &[u8]]).await;
+
+        apply(
+            &vault,
+            &fs,
+            space,
+            &[
+                Change::Added(backslash),
+                Change::Added(drive),
+                Change::Added(nested_drive),
+                Change::Added(good),
+            ],
+            None,
+        )
+        .await
+        .expect("an unsyncable name must not fail the batch");
+
+        assert_eq!(
+            std::fs::read(space.join("docs").join("notes.md")).unwrap(),
+            content,
+            "the rest of the batch must apply"
+        );
+        assert!(!space.join("foo\\bar.txt").exists());
+        assert!(!space.join("a:b.txt").exists());
+        assert!(!space.join("docs").join("a:b.txt").exists());
+    }
+
+    /// The skip covers `Deleted` too: the entry never materialized anywhere, so
+    /// acting on its removal has nothing to do — and must not abort the batch that
+    /// carries real deletions with it.
+    #[tokio::test]
+    async fn apply_skips_a_delete_of_an_unsyncable_name() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vault_dir.path());
+        let space_dir = tempfile::tempdir().unwrap();
+        let space = space_dir.path();
+        let fs = LinuxFs;
+
+        std::fs::write(space.join("gone.txt"), b"bytes").unwrap();
+        let (unsyncable, _) =
+            upload_multiblock_file(&vault, "foo\\bar.txt", &[b"x" as &[u8]]).await;
+        let (gone, _) = upload_multiblock_file(&vault, "gone.txt", &[b"bytes" as &[u8]]).await;
+
+        apply(
+            &vault,
+            &fs,
+            space,
+            &[Change::Deleted(unsyncable), Change::Deleted(gone)],
+            None,
+        )
+        .await
+        .expect("an unsyncable name must not fail a delete batch");
+        assert!(!space.join("gone.txt").exists(), "the real delete applied");
+    }
+
+    /// The rules the SCANNER can never produce stay hard batch errors: `..`,
+    /// absolute paths, empty components and NUL still mean the Manifest is corrupt
+    /// or hostile, and nothing at all may be applied.
+    #[tokio::test]
+    async fn apply_still_hard_fails_on_traversal_and_absolute_entries() {
+        for bad in ["../escape.txt", "/etc/passwd", "a//b.txt", "a\0b.txt", ".."] {
+            let vault_dir = tempfile::tempdir().unwrap();
+            let vault = FsVault::new(vault_dir.path());
+            let outer = tempfile::tempdir().unwrap();
+            let space = outer.path().join("space");
+            std::fs::create_dir_all(&space).unwrap();
+            let fs = LinuxFs;
+
+            let (good, _) =
+                upload_multiblock_file(&vault, "good.txt", &[b"legit bytes" as &[u8]]).await;
+            let mut hostile = file_entry("h", 2).1;
+            hostile.p = CanonicalPath(bad.to_string());
+
+            let err = apply(
+                &vault,
+                &fs,
+                &space,
+                &[Change::Added(good), Change::Added(hostile)],
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::UnsafeEntry(_)),
+                "{bad:?} must be a hard batch error, got {err:?}"
+            );
+            assert!(
+                !space.join("good.txt").exists(),
+                "{bad:?}: a batch holding a hostile entry must apply NOTHING"
+            );
+        }
     }
 }

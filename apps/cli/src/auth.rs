@@ -83,23 +83,74 @@ fn client() -> anyhow::Result<reqwest::Client> {
         .context("building the HTTP client for Better Auth")
 }
 
+/// How much of a failed response body may be quoted back to the user. A
+/// misconfigured `CONVEX_SITE_URL` reaches a proxy or dev server that answers with
+/// a whole HTML page; dumping it on the terminal buries the useful line.
+const MAX_QUOTED_BODY: usize = 200;
+
+/// The most useful human text for a FAILED response: Better Auth's `{message}`
+/// (or `{error}`) field when the body is JSON, else a bounded quote of the body.
+///
+/// Never assumes JSON. A rate-limit 429 and a proxy 502 are both plain text in
+/// practice, and turning those into "response was not JSON" (as this path used to)
+/// hides the ONE thing the user needed: the status and what to do about it.
+fn failure_message(body: &str) -> String {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = json
+            .get("message")
+            .or_else(|| json.get("error"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return "(empty response body)".to_string();
+    }
+    match body.char_indices().nth(MAX_QUOTED_BODY) {
+        Some((i, _)) => format!("{}…", &body[..i]),
+        None => body.to_string(),
+    }
+}
+
+/// The error for a failed Better Auth call: what failed, the status, the best
+/// message the body yields, and the caller's next step.
+fn failed(what: &str, status: reqwest::StatusCode, body: &str, next_step: &str) -> anyhow::Error {
+    let detail = failure_message(body);
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // The backend rate-limits `/sign-in/email` (5/60s) and `/sign-up/email`
+        // (5/3600s). Its own 429 body says little, so state the remedy ourselves —
+        // and NOT the caller's next step, which would tell the user to retype the
+        // password they are being throttled for.
+        return anyhow!(
+            "{what} was throttled after too many attempts (HTTP 429): {detail} — wait a minute \
+             (an hour for sign-up) and retry"
+        );
+    }
+    anyhow!("{what} failed (HTTP {status}): {detail} — {next_step}")
+}
+
 /// Extracts the `token` (session token) from a sign-up / sign-in response body,
-/// surfacing a Better Auth error `{message}` when the call failed.
+/// surfacing a Better Auth error when the call failed.
+///
+/// The body is NEVER echoed on the success path: on that path it contains the
+/// session token itself, and this string ends up on stderr and in the daemon log.
 fn session_token_from(
     status: reqwest::StatusCode,
     body: &str,
     what: &str,
+    next_step: &str,
 ) -> anyhow::Result<String> {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .with_context(|| format!("{what}: response was not JSON (HTTP {status}): {body}"))?;
     if !status.is_success() {
-        let msg = json.get("message").and_then(|m| m.as_str()).unwrap_or(body);
-        return Err(anyhow!("{what} failed (HTTP {status}): {msg}"));
+        return Err(failed(what, status, body, next_step));
     }
+    let json: serde_json::Value = serde_json::from_str(body)
+        .with_context(|| format!("{what}: response was not JSON (HTTP {status})"))?;
     json.get("token")
         .and_then(|t| t.as_str())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("{what}: response had no session token: {body}"))
+        .ok_or_else(|| anyhow!("{what}: response carried no session `token` field"))
 }
 
 /// `POST /sign-up/email` — create an Account and return its session token.
@@ -117,7 +168,12 @@ pub async fn sign_up(
         .context("POST /sign-up/email (is Better Auth reachable? check CONVEX_SITE_URL)")?;
     let status = resp.status();
     let body = resp.text().await.context("reading sign-up response body")?;
-    session_token_from(status, &body, "sign-up")
+    session_token_from(
+        status,
+        &body,
+        "sign-up",
+        "if the Account already exists, run `filething login` without `--signup`",
+    )
 }
 
 /// `POST /sign-in/email` — authenticate an existing Account, return its session
@@ -131,11 +187,20 @@ pub async fn sign_in(base_url: &str, email: &str, password: &str) -> anyhow::Res
         .context("POST /sign-in/email (is Better Auth reachable? check CONVEX_SITE_URL)")?;
     let status = resp.status();
     let body = resp.text().await.context("reading sign-in response body")?;
-    session_token_from(status, &body, "sign-in")
+    session_token_from(
+        status,
+        &body,
+        "sign-in",
+        "check the email and password (`filething login --signup` creates the Account)",
+    )
 }
 
 /// `GET /convex/token` (Bearer `session_token`) — mint a fresh Convex-audience
 /// JWT. Called at startup and again to refresh (the JWT expires in ~15 min).
+///
+/// A 401 here is the session having expired mid-operation — the one failure the
+/// user can act on — so it must never be reported as a parse error just because
+/// the body was not JSON, and never quote the body on success (it holds the JWT).
 pub async fn convex_token(base_url: &str, session_token: &str) -> anyhow::Result<String> {
     let resp = client()?
         .get(format!("{base_url}/convex/token"))
@@ -148,22 +213,20 @@ pub async fn convex_token(base_url: &str, session_token: &str) -> anyhow::Result
         .text()
         .await
         .context("reading convex/token response body")?;
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("convex/token: response was not JSON (HTTP {status}): {body}"))?;
     if !status.is_success() {
-        let msg = json
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or(&body);
-        return Err(anyhow!(
-            "minting the Convex JWT failed (HTTP {status}): {msg} — has the session expired? \
-             re-run `filething login`"
+        return Err(failed(
+            "minting the Convex JWT",
+            status,
+            &body,
+            "your session has probably expired: re-run `filething login`",
         ));
     }
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("convex/token: response was not JSON (HTTP {status})"))?;
     json.get("token")
         .and_then(|t| t.as_str())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("convex/token: response had no jwt: {body}"))
+        .ok_or_else(|| anyhow!("convex/token: response carried no jwt `token` field"))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +425,76 @@ mod tests {
                 "https://auth.example.com/api/auth"
             );
         });
+    }
+
+    // ----- failed-response rendering -----
+
+    /// A non-2xx must be reported as what it is, even when the body is not JSON.
+    /// It used to be parsed FIRST, so a plain-text 401 (an expired session, the
+    /// one thing the user can fix) surfaced as "response was not JSON".
+    #[test]
+    fn a_non_json_failure_body_still_reports_the_status_and_next_step() {
+        let err = failed(
+            "minting the Convex JWT",
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "your session has probably expired: re-run `filething login`",
+        )
+        .to_string();
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("Unauthorized"), "{err}");
+        assert!(err.contains("`filething login`"), "{err}");
+        assert!(!err.contains("not JSON"), "{err}");
+    }
+
+    /// Better Auth's `{message}` is preferred over the raw body when present.
+    #[test]
+    fn a_json_failure_body_is_reduced_to_its_message() {
+        assert_eq!(
+            failure_message(r#"{"message":"Invalid email or password","code":"X"}"#),
+            "Invalid email or password"
+        );
+        assert_eq!(failure_message(r#"{"error":"boom"}"#), "boom");
+    }
+
+    /// A gateway/proxy HTML page must not be dumped whole onto the terminal.
+    #[test]
+    fn an_html_failure_body_is_quoted_but_bounded() {
+        let html = format!("<html><body>{}</body></html>", "x".repeat(5_000));
+        let quoted = failure_message(&html);
+        assert!(quoted.chars().count() <= MAX_QUOTED_BODY + 1, "{quoted}");
+        assert!(quoted.ends_with('…'));
+        assert_eq!(failure_message("   "), "(empty response body)");
+    }
+
+    /// The rate limiter the backend now applies to `/sign-in/email` (5/60s) and
+    /// `/sign-up/email` (5/3600s) must read as "throttled, wait" — NOT as bad
+    /// credentials, and without telling the user to retype them into the throttle.
+    #[test]
+    fn a_429_says_to_wait_instead_of_repeating_the_credential_advice() {
+        let err = failed(
+            "sign-in",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "check the email and password (`filething login --signup` creates the Account)",
+        )
+        .to_string();
+        assert!(err.contains("throttled"), "{err}");
+        assert!(err.contains("wait a minute"), "{err}");
+        assert!(!err.contains("password"), "{err}");
+    }
+
+    /// The success path must never echo the body: it carries the session token
+    /// (and, on `/convex/token`, the JWT), and this text reaches stderr and the
+    /// daemon log.
+    #[test]
+    fn a_successful_body_without_a_token_field_is_not_echoed() {
+        let body = r#"{"user":{"id":"u1"},"sessionToken":"secret-token-value"}"#;
+        let err = session_token_from(reqwest::StatusCode::OK, body, "sign-in", "next step")
+            .expect_err("no `token` field");
+        let err = err.to_string();
+        assert!(err.contains("no session `token` field"), "{err}");
+        assert!(!err.contains("secret-token-value"), "{err}");
     }
 
     // ----- proactive JWT refresh (issue #12) -----

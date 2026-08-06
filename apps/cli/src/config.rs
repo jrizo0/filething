@@ -16,6 +16,7 @@
 //!
 //! The file itself is `<config_dir>/config.json`.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,15 @@ const APP_DIR: &str = "filething";
 /// The config file basename.
 const CONFIG_FILE: &str = "config.json";
 
+/// Appended to every "your `config.json` is unreadable" error. Spelled out
+/// because the alternative — starting from an empty config — silently forgets
+/// which folders are Spaces, and the user has no way to tell that happened.
+const RECOVER_HINT: &str = " This file holds this Device's identity and every \
+                            Space ↔ folder mapping, so filething will not \
+                            overwrite it automatically: fix the JSON, or move it \
+                            aside and re-run `filething login` (then re-map each \
+                            Space folder).";
+
 impl Config {
     /// Resolves the config DIRECTORY for this run (`docs/BUILD-PLAN.md §3`):
     /// `$FILETHING_HOME`, else `${XDG_CONFIG_HOME:-$HOME/.config}/filething`.
@@ -101,13 +111,21 @@ impl Config {
     }
 
     /// Loads the config from an explicit path (the testable core of [`load`]).
+    ///
+    /// A file that exists but does not parse is an ERROR, never a silent reset to
+    /// [`Config::default`]: this file is the only record of every Space ↔ folder
+    /// mapping on the Device, so defaulting would quietly unmap every Space (and
+    /// the next `save` would make that permanent). The message names the file and
+    /// the way out instead.
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => {
-                let cfg = serde_json::from_slice(&bytes)
-                    .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
-                Ok(cfg)
-            }
+            Ok(bytes) if bytes.is_empty() => Err(anyhow::anyhow!(
+                "{} is empty — this looks like a torn write from an interrupted \
+                 command.{RECOVER_HINT}",
+                path.display()
+            )),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("parsing {}: {e}.{RECOVER_HINT}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         }
@@ -120,15 +138,37 @@ impl Config {
     }
 
     /// Persists the config to an explicit path (the testable core of [`save`]).
+    ///
+    /// ATOMIC by construction: write a sibling temp file, fsync it, then
+    /// `rename(2)` it over the target, so a reader only ever sees the whole old file
+    /// or the whole new one. A plain truncate-and-write can be interrupted (crash,
+    /// SIGKILL, a full disk) or interleaved with another process saving at the same
+    /// time — `init`/`clone`/`unmap` restart the daemon, which loads this same file
+    /// — and a torn `config.json` loses the identity AND every Space mapping at
+    /// once, i.e. it bricks every Space on the Device.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+        // A bare filename has a `Some("")` parent, which is no directory at all —
+        // leave the cwd's own mode alone in that case, as the previous
+        // `create_dir_all` did.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            ensure_private_dir(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
-        Ok(())
+        // The temp file must live in the SAME directory, or the rename would cross
+        // a filesystem boundary and stop being atomic. The pid keeps two processes
+        // saving concurrently from writing each other's temp file.
+        let name = format!(".{CONFIG_FILE}.{}.tmp", std::process::id());
+        let tmp = match parent {
+            Some(parent) => parent.join(name),
+            None => PathBuf::from(name),
+        };
+        let out = write_then_rename(&tmp, path, &json);
+        if out.is_err() {
+            // Never leave a half-written temp file behind for the next run to trip on.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        out
     }
 
     /// Records (or replaces) the identity learned from a `login`, including the
@@ -172,6 +212,61 @@ impl Config {
         self.spaces.retain(|m| m.local_root != local_root);
         self.spaces.len() != before
     }
+}
+
+/// Writes `bytes` to `tmp`, fsyncs it, and renames it over `path`.
+///
+/// The fsync is not paranoia: `rename(2)` is atomic with respect to concurrent
+/// READERS, but on a crash the new name can still be left pointing at a
+/// zero-length file if the data never reached the disk. The directory fsync
+/// afterwards is what makes the rename itself durable, and is best-effort because
+/// not every platform lets a directory be opened for syncing.
+fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut f = std::fs::File::create(tmp)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", tmp.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
+    f.sync_all()
+        .map_err(|e| anyhow::anyhow!("fsync {}: {e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(tmp, path)
+        .map_err(|e| anyhow::anyhow!("renaming {} over {}: {e}", tmp.display(), path.display()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Creates `dir` (with its parents) and, on Unix, tightens it to `0700`.
+///
+/// The config dir holds `credentials.json` (the Better Auth session + the Account
+/// escrow `dedup_secret`) and the daemon's log; a Space's control dir holds that
+/// Space's `space_key`. `create_dir_all` alone leaves both at `0755` minus the
+/// umask, i.e. readable by every other account on the machine. The mode is
+/// re-asserted on an existing dir so a home created by an older build is tightened
+/// on the next write.
+///
+/// Tightening is best-effort: some filesystems (exFAT/FAT sticks, some network
+/// mounts) reject `chmod` outright, and failing the whole command over
+/// defense-in-depth would be worse than warning — the SECRET FILES themselves are
+/// still created `0600` (see `crate::credentials`).
+pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "could not restrict this directory to 0700; it may be readable by other \
+                 accounts on this machine"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reads an environment variable, treating an empty value as unset.
@@ -255,6 +350,87 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.device_id.as_deref(), Some("dev_1"));
         assert_eq!(cfg.device_name, None);
+    }
+
+    /// A `config.json` that does not parse must ERROR (naming the file and the way
+    /// out), never fall back to `Config::default` — defaulting would silently
+    /// forget every Space mapping and the next `save` would make that permanent.
+    #[test]
+    fn unparseable_config_errors_instead_of_resetting_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, br#"{"account_id": "acc_1", "spaces": [ trunc"#).unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("config.json"), "must name the file: {err}");
+        assert!(
+            err.contains("filething login"),
+            "must say what to do: {err}"
+        );
+    }
+
+    /// The shape a torn write leaves behind (a zero-length file) gets its own
+    /// message rather than serde's "EOF while parsing a value at line 1 column 0".
+    #[test]
+    fn empty_config_file_reports_a_torn_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"").unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("empty"), "unexpected message: {err}");
+        assert!(err.contains("torn write"), "unexpected message: {err}");
+    }
+
+    /// `save_to` must not truncate the live file: the previous config has to stay
+    /// readable until the new one is complete, and the replacement has to happen in
+    /// one step. Asserted by checking the target's inode/dev is REPLACED (a rename)
+    /// rather than reused (an in-place rewrite), and that no temp file is left over.
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_the_config_atomically_and_leaves_no_temp_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut first = Config::default();
+        first.upsert_space("sp_1", "/a");
+        first.save_to(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        let mut second = first.clone();
+        second.upsert_space("sp_2", "/b");
+        second.save_to(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().ino();
+
+        assert_ne!(
+            before, after,
+            "the config must be replaced by a rename, not rewritten in place"
+        );
+        assert_eq!(Config::load_from(&path).unwrap(), second);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n != "config.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// The directory holding `credentials.json` (and the daemon log) must be 0700,
+    /// not the 0755 `create_dir_all` leaves — the files inside are 0600, but a
+    /// world-readable directory still leaks their names and sizes.
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_the_config_dir_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("nested").join("filething");
+        Config::default()
+            .save_to(&home.join("config.json"))
+            .unwrap();
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "config dir must be 0700, got {mode:o}");
     }
 
     #[test]

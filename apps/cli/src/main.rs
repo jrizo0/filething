@@ -31,9 +31,11 @@ use crate::service::ServiceAction;
 #[derive(Debug, Parser)]
 #[command(name = "filething", version, about, long_about = None)]
 struct Cli {
-    /// Show the internal debug logging that one-shot commands hide by default
-    /// (equivalent to `RUST_LOG=info`) and the full technical detail of an error.
-    /// An explicit `RUST_LOG` always takes precedence over this flag.
+    /// Show the internal logging that one-shot commands hide by default
+    /// (equivalent to `FILETHING_LOG=info`) and the full technical detail of an
+    /// error. `RUST_LOG`, then `FILETHING_LOG`, take precedence over this flag.
+    /// Third-party crates are capped at `info` whatever you ask for: their debug
+    /// logs print your session token and Space keys in cleartext.
     #[arg(short, long, global = true)]
     verbose: bool,
 
@@ -71,7 +73,9 @@ enum Command {
     /// second Device, so the Space id no longer has to be copied by hand.
     Spaces,
 
-    /// Make a local folder a new Space and commit its first Revision.
+    /// Make a local folder a new Space and commit its first Revision, then install
+    /// (or restart) the background daemon service so the folder keeps syncing —
+    /// pass `--no-daemon` to skip that.
     Init {
         /// The folder to turn into a Space.
         dir: PathBuf,
@@ -84,7 +88,9 @@ enum Command {
         no_daemon: bool,
     },
 
-    /// Materialize an existing Space into a local folder.
+    /// Materialize an existing Space into a local folder, then install (or restart)
+    /// the background daemon service so it keeps syncing — pass `--no-daemon` to
+    /// skip that.
     Clone {
         /// The Space id to clone (printed by `init`).
         space_id: String,
@@ -110,6 +116,8 @@ enum Command {
 
     /// Show a Space's synced base and whether it has uncommitted local changes.
     /// With no dir, outside a Space, reports every mapped Space (like `metrics`).
+    /// The local half works offline; comparing against the remote head is
+    /// best-effort and degrades to "unavailable" with no Coordinator.
     Status {
         /// The Space folder (defaults to the current directory).
         dir: Option<PathBuf>,
@@ -121,8 +129,10 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
-    /// One-shot sync: pull the head, then commit local changes. Does not run the
-    /// daemon — handy for scripts and the integration gates.
+    /// One-shot sync: pull the head, then commit local changes, then exit — handy
+    /// for scripts and the integration gates. It does not WATCH the folder itself,
+    /// but it does install (or restart) the background daemon service that does;
+    /// pass `--no-daemon` for a sync that touches nothing but this Space.
     Sync {
         /// The Space folder.
         dir: PathBuf,
@@ -144,7 +154,10 @@ enum Command {
     /// Garbage-collect the account's Vault: delete ORPHANED objects that no
     /// Revision of any of your Spaces references. Dry-run by default (prints what
     /// WOULD be deleted); pass --apply to delete. Selecting a Space `dir` only
-    /// picks the account/Vault — the sweep is account-wide.
+    /// picks the account/Vault — the sweep is account-wide. OPERATOR-ONLY: it needs
+    /// direct `S3_*` storage credentials (a sweep has to list and delete, which
+    /// presigned URLs cannot do), so on the managed data plane it fails instead of
+    /// pretending to have collected anything.
     Gc {
         /// A Space folder (selects the account whose Vault to GC).
         dir: PathBuf,
@@ -199,11 +212,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.command, cli.verbose);
 
-    // The verbose signal for error rendering: the `-v` flag OR an explicit
-    // `RUST_LOG` at debug/trace. A plain `RUST_LOG=error` must NOT flip us
+    // The verbose signal for error rendering: the `-v` flag OR an explicit log
+    // filter asking for debug/trace. A plain `RUST_LOG=error` must NOT flip us
     // verbose — that user asked for LESS noise, not more (issue #11/#16).
     let verbose_errors = cli.verbose
-        || std::env::var("RUST_LOG")
+        || log_env()
             .map(|v| {
                 let v = v.to_ascii_lowercase();
                 v.contains("debug") || v.contains("trace")
@@ -248,39 +261,202 @@ async fn main() -> anyhow::Result<()> {
     // Render a failure ourselves so a typed Coordinator error becomes a human
     // message + next step (issue #11) instead of anyhow's raw Debug chain. The
     // raw detail (and the Convex Request ID) is shown only when verbose (the
-    // `-v` flag or RUST_LOG at debug/trace). We still exit non-zero so scripts
-    // and the integration gates see the failure.
+    // `-v` flag or an explicit log filter at debug/trace). We still exit non-zero
+    // so scripts and the integration gates see the failure.
     if let Err(err) = result {
         // Close any open one-shot progress line so the error does not land on
         // the same terminal row (issue #16).
         progress::finish();
         errors::report(&err, verbose_errors);
-        std::process::exit(1);
+        std::process::exit(exit_code(&err));
     }
     Ok(())
 }
 
-/// The log filter for this run.
+// ---------------------------------------------------------------------------
+// Exit codes
+// ---------------------------------------------------------------------------
+//
+// A CLI is an API for scripts, and "every failure is 1" forces a caller to grep
+// human prose to tell "not logged in" from "the network is down" from "someone
+// else already holds this Space". These are the codes; treat them as a contract:
+//
+//   0  success
+//   1  generic failure (anything not classified below — the safe default)
+//   2  usage error (clap's own code for a bad command line; never returned here)
+//   3  not authenticated — log in and retry
+//   4  the Coordinator or its Vault could not be reached — transient, retryable
+//   5  the Space head moved under us (a commit CAS conflict) — sync and retry
+//   6  a safety guard REFUSED a destructive operation — needs a human decision
+//   7  another process holds this Space's lock — wait for it, or stop it
+//
+// New codes may be added; existing ones keep their meaning.
+
+/// Generic failure. Also the fallback for anything unclassified, so adding a
+/// classification can only ever narrow an existing 1 — never break a caller.
+const EXIT_FAILURE: i32 = 1;
+/// Not authenticated (no session, or the Coordinator rejected it).
+const EXIT_NOT_AUTHENTICATED: i32 = 3;
+/// The Coordinator (or its Vault) is unreachable/unavailable: retryable.
+const EXIT_UNAVAILABLE: i32 = 4;
+/// The Space head moved while we worked (commit CAS conflict).
+const EXIT_CONFLICT: i32 = 5;
+/// A safety guard declined a destructive operation.
+const EXIT_REFUSED: i32 = 6;
+/// Another filething process holds this Space's lock.
+const EXIT_SPACE_LOCKED: i32 = 7;
+
+/// Classifies a failure into one of the documented exit codes.
 ///
-/// - An explicit `RUST_LOG` ALWAYS wins (verbatim), for both the daemon and
-///   one-shot commands.
+/// Typed errors first — that is the part that cannot rot. The one text match is
+/// for the CLI's own "not logged in" preconditions, which are plain `anyhow!`
+/// messages in `commands.rs`; it is a narrow, exact-sentence match, and a reworded
+/// message degrades to [`EXIT_FAILURE`] rather than misclassifying.
+fn exit_code(err: &anyhow::Error) -> i32 {
+    use ft_coordinator::CoordinatorError as CE;
+
+    if let Some(ce) = errors::find_coordinator_error(err) {
+        return match ce {
+            CE::NotAuthenticated { .. } => EXIT_NOT_AUTHENTICATED,
+            CE::Transport(..) | CE::VaultUnavailable { .. } => EXIT_UNAVAILABLE,
+            CE::Conflict { .. } => EXIT_CONFLICT,
+            _ => EXIT_FAILURE,
+        };
+    }
+    if let Some(engine) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<ft_engine::EngineError>())
+    {
+        return match engine {
+            ft_engine::EngineError::Refused(..) => EXIT_REFUSED,
+            ft_engine::EngineError::SpaceLocked { .. } => EXIT_SPACE_LOCKED,
+            _ => EXIT_FAILURE,
+        };
+    }
+    if err
+        .chain()
+        .any(|c| c.downcast_ref::<env::CoordinatorUnreachable>().is_some())
+    {
+        return EXIT_UNAVAILABLE;
+    }
+    // `require_identity` / `require_credentials` in `commands.rs`.
+    if err
+        .chain()
+        .any(|c| c.to_string().contains("run `filething login` first"))
+    {
+        return EXIT_NOT_AUTHENTICATED;
+    }
+    EXIT_FAILURE
+}
+
+/// The env var that requests a log level for THIS project's crates. Preferred over
+/// `RUST_LOG` because it cannot be mistaken for a request to make the whole
+/// dependency tree verbose.
+const ENV_LOG: &str = "FILETHING_LOG";
+
+/// The explicit log-filter request for this run, if any: `RUST_LOG` (kept for
+/// habit and for the crates.io convention), else [`ENV_LOG`]. An empty value is
+/// treated as unset.
+fn log_env() -> Option<String> {
+    ["RUST_LOG", ENV_LOG]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
+/// The base log filter for this run — see [`log_filter`], which caps it.
+///
+/// - An explicit `RUST_LOG` / `FILETHING_LOG` wins (verbatim, so
+///   `FILETHING_LOG=ft_engine=trace` works), for both the daemon and one-shot
+///   commands.
 /// - Otherwise the daemon keeps `info` (it can run for weeks; its log is its
-///   observability), and `-v/--verbose` restores `info` for one-shot commands
-///   too — the full internal tracing (`convex::*`, `ft_*`).
+///   observability), and `-v/--verbose` restores `info` for one-shot commands too.
 /// - Otherwise a one-shot command defaults to `warn`, so the internal machinery
 ///   (`convex::*` "Starting action…", per-batch upload INFO) stops drowning the
 ///   command's own output (issue #16). The command's result is `println!` to
 ///   stdout and is unaffected; progress is rendered separately (see `progress`).
+///
+/// One-shot commands additionally silence `convex` entirely at that default level:
+/// its websocket worker logs one raw ERROR per reconnect backoff
+/// ("Convex WebSocketWorker failed: … Backing off for 15s"), which is noise next to
+/// the single actionable message `crate::env` now produces for an unreachable
+/// Coordinator. `-v` and an explicit filter bring it back.
 fn env_filter(command: &Command, verbose: bool) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
-    if std::env::var_os("RUST_LOG").is_some() {
-        return EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(directives) = log_env() {
+        return EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new("info"));
     }
+    EnvFilter::new(default_directives(command, verbose))
+}
+
+/// The directives [`env_filter`] falls back to with no explicit request.
+fn default_directives(command: &Command, verbose: bool) -> &'static str {
     if matches!(command, Command::Daemon { .. }) || verbose {
-        EnvFilter::new("info")
+        "info"
     } else {
-        EnvFilter::new("warn")
+        "warn,convex=off"
     }
+}
+
+/// The filter the fmt layer actually runs, built from three parts:
+///
+/// 1. [`env_filter`] — what the user asked for;
+/// 2. OR the engine's progress events, when a one-shot command is writing to
+///    something that is not a terminal (see [`is_progress_event`]);
+/// 3. AND a HARD cap on third-party targets (see [`third_party_cap_allows`]).
+///
+/// Part 3 is a security control, not a preference, which is why it is an `and` the
+/// user cannot override: `RUST_LOG=debug` used to reach `convex`'s websocket
+/// writer, which logs every outgoing message — and those messages carry the Account
+/// escrow `dedupSecret` (`auth:ensureDevice`), a Space's `spaceKey`
+/// (`spaces:create`) and the Convex JWT in CLEARTEXT. The CLI itself used to tell
+/// users to re-run with `RUST_LOG=debug` for detail, so following that hint,
+/// redirecting to a file and pasting it into a bug report published both halves of
+/// the user's Space key material.
+fn log_filter<S: 'static>(
+    command: &Command,
+    verbose: bool,
+    plain_progress: bool,
+) -> impl tracing_subscriber::layer::Filter<S> + 'static {
+    use tracing_subscriber::filter::{filter_fn, FilterExt as _};
+    env_filter(command, verbose)
+        .or(filter_fn(move |meta: &tracing::Metadata<'_>| {
+            plain_progress && is_progress_event(meta)
+        }))
+        .and(filter_fn(|meta: &tracing::Metadata<'_>| {
+            third_party_cap_allows(meta.target(), *meta.level())
+        }))
+}
+
+/// Whether a tracing event's `target` belongs to THIS project (the binary or one of
+/// the `ft-*` crates, whose module paths tracing renders with underscores).
+fn is_project_target(target: &str) -> bool {
+    target == "filething" || target.starts_with("filething::") || target.starts_with("ft_")
+}
+
+/// The hard third-party cap: our own crates honor whatever level was requested,
+/// everything else is capped at `info`.
+///
+/// Deny-by-default (rather than a list of `convex`/`tungstenite`/`reqwest`) because
+/// the dangerous set is "every dependency that logs what it is about to send", and
+/// that set grows: `convex` prints the outgoing `Authenticate`/`Mutation` frames at
+/// debug, and the S3/HTTP stacks print signed URLs and auth headers. `info` and
+/// above stay, so a genuinely useful third-party error is never hidden.
+fn third_party_cap_allows(target: &str, level: tracing::Level) -> bool {
+    is_project_target(target) || level <= tracing::Level::INFO
+}
+
+/// Whether this is one of the engine's progress events — an INFO event from
+/// `ft_engine`/`ft_diff` carrying a `total` field (see `progress`).
+///
+/// Used to keep a NON-TTY one-shot run from printing nothing at all for minutes:
+/// the rewriting single-line renderer needs a terminal, so `filething sync > log
+/// 2>&1` (or CI) used to show total silence during a long transfer. Letting these
+/// events through the fmt layer turns them into ordinary, already-throttled plain
+/// text lines. The TTY path is untouched.
+fn is_progress_event(meta: &tracing::Metadata<'_>) -> bool {
+    is_progress_target(meta.target())
+        && *meta.level() == tracing::Level::INFO
+        && meta.fields().field("total").is_some()
 }
 
 /// Initialize tracing for this invocation.
@@ -313,7 +489,9 @@ fn init_tracing(command: &Command, verbose: bool) {
     if log_to_file {
         match daemon_file_writer() {
             Ok(writer) => {
-                let filter = env_filter(command, verbose);
+                // The daemon already logs at `info`, so its own progress events
+                // reach the file without the non-TTY fallback.
+                let filter = log_filter(command, verbose, false);
                 // Foreground run (tty): tee to the file AND stderr so the file is
                 // always written yet the operator still sees the log live.
                 if std::io::stderr().is_terminal() {
@@ -340,10 +518,14 @@ fn init_tracing(command: &Command, verbose: bool) {
         }
     }
 
-    let show_progress = !matches!(command, Command::Daemon { .. })
-        && !verbose
-        && std::env::var_os("RUST_LOG").is_none()
-        && std::io::stderr().is_terminal();
+    // A one-shot command with no explicit log request renders progress ONE of two
+    // ways: the rewriting single line when stderr is a terminal, or plain periodic
+    // log lines when it is not (a file, a pipe, CI) — where the rewriting line
+    // would be `\r` soup and its absence was minutes of total silence.
+    let one_shot_default =
+        !matches!(command, Command::Daemon { .. }) && !verbose && log_env().is_none();
+    let show_progress = one_shot_default && std::io::stderr().is_terminal();
+    let plain_progress = one_shot_default && !std::io::stderr().is_terminal();
 
     // The progress layer sees the engine's progress events regardless of the fmt
     // layer's (possibly WARN) filter, because per-layer filters are independent —
@@ -357,7 +539,7 @@ fn init_tracing(command: &Command, verbose: bool) {
 
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(env_filter(command, verbose));
+        .with_filter(log_filter(command, verbose, plain_progress));
 
     tracing_subscriber::registry()
         .with(fmt)
@@ -377,13 +559,31 @@ fn is_progress_target(target: &str) -> bool {
 }
 
 /// Build the daemon's rotating log writer at `<config_dir>/daemon.log`
-/// (5 MB per file, 3 generations). Creates the config dir if needed.
+/// (5 MB per file, 3 generations). Creates the config dir (`0700`) if needed.
+///
+/// The log file itself is created/kept `0600`: a daemon log records Space paths and
+/// filenames, and any third-party debug line that ever slips past the cap in
+/// [`log_filter`] would land here, so it is not something other accounts on the
+/// machine should be able to read.
 fn daemon_file_writer() -> std::io::Result<logrotate::SharedRotatingWriter> {
     const MAX_BYTES: u64 = 5 * 1024 * 1024;
     const KEEP: usize = 3;
     let path = config::Config::config_dir().join(service::LOG_FILE);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        config::ensure_private_dir(parent).map_err(std::io::Error::other)?;
+    }
+    #[cfg(unix)]
+    {
+        // Create it 0600 BEFORE the rotating writer opens it, so it is never even
+        // briefly world-readable; re-assert the mode for a log an older build left
+        // at 0644.
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     let writer = logrotate::RotatingFileWriter::new(path, MAX_BYTES, KEEP)?;
     Ok(logrotate::SharedRotatingWriter::new(writer))
@@ -643,6 +843,271 @@ mod tests {
         }
         // `unmap` with no dir is a parse error (the dir is required).
         assert!(Cli::try_parse_from(["filething", "unmap"]).is_err());
+    }
+
+    // ----- the third-party log cap -----
+
+    /// REGRESSION (the CLI used to tell users to leak their own keys): `RUST_LOG` was
+    /// passed through verbatim as a GLOBAL filter, so `RUST_LOG=debug` also enabled
+    /// debug for `convex`, whose websocket writer logs every outgoing message —
+    /// including the Account escrow `dedupSecret`, a Space's `spaceKey` and the
+    /// Convex JWT in cleartext. No requested level may re-enable that.
+    #[test]
+    fn third_party_debug_is_never_allowed_however_loud_the_request() {
+        for target in [
+            "convex",
+            "convex::sync::web_socket_manager",
+            "convex::base_client",
+            "tungstenite::protocol",
+            "reqwest::connect",
+            "hyper_util::client",
+            "aws_sdk_s3::operation",
+            "rustls::client::hs",
+        ] {
+            assert!(
+                !third_party_cap_allows(target, tracing::Level::DEBUG),
+                "{target} must not be allowed to log at debug"
+            );
+            assert!(
+                !third_party_cap_allows(target, tracing::Level::TRACE),
+                "{target} must not be allowed to log at trace"
+            );
+            // Its errors/warnings/info stay: capping must not hide real failures.
+            for level in [
+                tracing::Level::INFO,
+                tracing::Level::WARN,
+                tracing::Level::ERROR,
+            ] {
+                assert!(
+                    third_party_cap_allows(target, level),
+                    "{target} must still log at {level}"
+                );
+            }
+        }
+    }
+
+    /// The cap applies to third parties only: our own crates still honor a debug or
+    /// trace request, which is the whole point of asking for one.
+    #[test]
+    fn project_targets_still_honor_a_debug_request() {
+        for target in [
+            "filething",
+            "filething::commands",
+            "ft_engine::commit",
+            "ft_diff",
+            "ft_core",
+            "ft_vault::s3",
+        ] {
+            assert!(is_project_target(target), "{target} should be ours");
+            assert!(third_party_cap_allows(target, tracing::Level::TRACE));
+        }
+        // A crate that merely starts with our prefix letters is NOT ours.
+        assert!(!is_project_target("filethingy"));
+        assert!(!is_project_target("convex"));
+    }
+
+    /// With the Coordinator down, the ONLY thing a one-shot command used to print
+    /// was `convex`'s internal worker ERROR, once per backoff, forever. The default
+    /// filter must keep that out so `crate::env`'s single actionable message is the
+    /// whole output — while `-v` and the daemon still get it.
+    #[test]
+    fn the_one_shot_default_silences_the_convex_worker_but_v_and_the_daemon_do_not() {
+        let sync = Command::Sync {
+            dir: PathBuf::from("/p"),
+            no_daemon: false,
+        };
+        assert!(default_directives(&sync, false).contains("convex=off"));
+        assert!(!default_directives(&sync, true).contains("convex=off"));
+        assert!(
+            !default_directives(&Command::Daemon { dirs: vec![] }, false).contains("convex=off")
+        );
+    }
+
+    // ----- non-TTY progress -----
+
+    /// A stand-in callsite, so a test can build the [`tracing::Metadata`] the
+    /// filters see without installing a subscriber (which would poison tracing's
+    /// process-global callsite interest cache for the other tests).
+    struct TestCallsite;
+
+    impl tracing::Callsite for TestCallsite {
+        fn set_interest(&self, _: tracing::subscriber::Interest) {}
+        fn metadata(&self) -> &tracing::Metadata<'_> {
+            unreachable!("only the FieldSet identity is used")
+        }
+    }
+
+    static TEST_CALLSITE: TestCallsite = TestCallsite;
+
+    fn meta(
+        target: &'static str,
+        level: tracing::Level,
+        fields: &'static [&'static str],
+    ) -> tracing::Metadata<'static> {
+        tracing::Metadata::new(
+            "event",
+            target,
+            level,
+            None,
+            None,
+            None,
+            tracing::field::FieldSet::new(fields, tracing::callsite::Identifier(&TEST_CALLSITE)),
+            tracing::metadata::Kind::EVENT,
+        )
+    }
+
+    /// A long transfer printed NOTHING when stderr was not a terminal (the
+    /// rewriting line needs one), so `filething sync > log 2>&1` and CI logs showed
+    /// minutes of silence. The engine's already-throttled progress events are what
+    /// fills that gap, and nothing else may sneak through with them.
+    #[test]
+    fn plain_progress_admits_the_engines_progress_events_and_nothing_else() {
+        // The real callsites: `tracing::info!(total, "uploading blocks")` in
+        // ft-engine and `tracing::info!(completed = n, total, "applying changes")`
+        // in ft-diff.
+        assert!(is_progress_event(&meta(
+            "ft_engine::commit",
+            tracing::Level::INFO,
+            &["message", "total"]
+        )));
+        assert!(is_progress_event(&meta(
+            "ft_diff",
+            tracing::Level::INFO,
+            &["message", "completed", "total"]
+        )));
+        // Not a progress event: no `total` field, the wrong level, a foreign crate.
+        assert!(!is_progress_event(&meta(
+            "ft_engine::commit",
+            tracing::Level::INFO,
+            &["message"]
+        )));
+        assert!(!is_progress_event(&meta(
+            "ft_engine::commit",
+            tracing::Level::DEBUG,
+            &["message", "total"]
+        )));
+        assert!(!is_progress_event(&meta(
+            "convex::base_client",
+            tracing::Level::INFO,
+            &["message", "total"]
+        )));
+    }
+
+    // ----- exit codes -----
+
+    /// A caller has to be able to tell the failure modes apart; before this, every
+    /// failure was 1. Each documented code is reachable, and 1 stays the fallback so
+    /// no existing caller regresses.
+    #[test]
+    fn exit_codes_classify_the_documented_failure_modes() {
+        use ft_coordinator::CoordinatorError as CE;
+
+        let cases: [(anyhow::Error, i32); 7] = [
+            (
+                anyhow::Error::new(CE::NotAuthenticated {
+                    message: "x".into(),
+                })
+                .context("spaces:listMine"),
+                EXIT_NOT_AUTHENTICATED,
+            ),
+            (
+                anyhow::Error::new(CE::Transport("socket closed".into())),
+                EXIT_UNAVAILABLE,
+            ),
+            (
+                anyhow::Error::new(env::CoordinatorUnreachable {
+                    url: "http://localhost:3210".into(),
+                })
+                .context("connecting"),
+                EXIT_UNAVAILABLE,
+            ),
+            (
+                anyhow::Error::new(CE::Conflict {
+                    message: "head moved".into(),
+                }),
+                EXIT_CONFLICT,
+            ),
+            (
+                anyhow::Error::new(ft_engine::EngineError::Refused("no roots".into()))
+                    .context("gc"),
+                EXIT_REFUSED,
+            ),
+            (
+                anyhow::Error::new(ft_engine::EngineError::SpaceLocked {
+                    root: "/p".into(),
+                    holder: "pid 1".into(),
+                }),
+                EXIT_SPACE_LOCKED,
+            ),
+            (anyhow::anyhow!("something else broke"), EXIT_FAILURE),
+        ];
+        for (err, want) in cases {
+            assert_eq!(exit_code(&err), want, "for {err:?}");
+        }
+    }
+
+    /// The CLI's own "not logged in" preconditions are plain `anyhow!` messages in
+    /// `commands.rs`; this pins the exact sentence the classification matches, and
+    /// documents that a reworded message degrades to 1 rather than misclassifying.
+    #[test]
+    fn not_logged_in_precondition_maps_to_the_auth_exit_code() {
+        let err = anyhow::anyhow!("not logged in yet — run `filething login` first");
+        assert_eq!(exit_code(&err), EXIT_NOT_AUTHENTICATED);
+        let err = anyhow::anyhow!("no Device credentials found — run `filething login` first")
+            .context("sync");
+        assert_eq!(exit_code(&err), EXIT_NOT_AUTHENTICATED);
+        // A merely login-adjacent message is not the same claim.
+        let err = anyhow::anyhow!("your password expired; visit the dashboard");
+        assert_eq!(exit_code(&err), EXIT_FAILURE);
+    }
+
+    /// Every documented code must be distinct, and none may collide with clap's
+    /// usage exit code (2) — a caller distinguishing "bad command line" from a
+    /// runtime failure relies on that.
+    #[test]
+    fn exit_codes_are_distinct_and_avoid_claps_usage_code() {
+        let codes = [
+            EXIT_FAILURE,
+            EXIT_NOT_AUTHENTICATED,
+            EXIT_UNAVAILABLE,
+            EXIT_CONFLICT,
+            EXIT_REFUSED,
+            EXIT_SPACE_LOCKED,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            assert_ne!(*a, 2, "2 belongs to clap's usage errors");
+            assert_ne!(*a, 0, "0 means success");
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "duplicate exit code {a}");
+            }
+        }
+    }
+
+    // ----- help text that matches the code -----
+
+    /// `sync --help` used to claim it "does not run the daemon" while the command
+    /// INSTALLS and starts an OS service by default. Help text that lies is worse
+    /// than none: this pins the corrected claim.
+    #[test]
+    fn sync_help_does_not_claim_it_leaves_the_daemon_alone() {
+        let sync = Cli::command()
+            .get_subcommands()
+            .find(|c| c.get_name() == "sync")
+            .expect("sync subcommand")
+            .clone();
+        let help = sync
+            .get_about()
+            .map(|a| a.to_string())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            !help.contains("does not run the daemon"),
+            "sync installs and starts the daemon service by default: {help}"
+        );
+        assert!(
+            help.contains("--no-daemon"),
+            "sync's help must point at the opt-out: {help}"
+        );
     }
 
     /// `update` takes no arguments; extras are a parse error.

@@ -87,9 +87,10 @@ impl SpaceContext {
         let space_key = space.space_key;
 
         // (3) persist the "no base yet" space_state: seq = -1, empty-Manifest root.
-        // The first pull's `ensure_empty_root_present` uploads the empty page so
-        // the diff can start from it (the head was committed by init_space, which
-        // never uploads the empty page).
+        // Built in process, and the first pull recognizes it as the empty base
+        // WITHOUT fetching its page (`pull.rs`, `empty_manifest_root`): that cid
+        // folds in no account/Space id, so requiring the object would mean trusting
+        // one globally-shared key any tenant could have created first.
         let empty_root = ft_manifest::build(Vec::new()).root;
         let state = SpaceState {
             space_id: space_id.as_str().to_string(),

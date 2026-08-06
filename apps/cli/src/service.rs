@@ -11,11 +11,14 @@
 //! rewritten to add it (see [`crate::commands`]'s `ensure_background_daemon`,
 //! which installs/restarts this service automatically after `init`/`clone`/
 //! `sync`). Both restart on crash and log to `<config_dir>/daemon.log`. The
-//! daemon needs the Convex + `S3_*` credentials in its environment; `install`
-//! captures the ones currently set into a 0600 `<config_dir>/service.env` that
-//! the service loads (systemd `EnvironmentFile`; launchd via a `/bin/sh` wrapper
-//! that sources it), so secrets live in ONE private file, never in the
-//! unit/plist or the config.
+//! daemon needs the Convex + Better Auth + `S3_*` credentials in its
+//! environment; `install` captures the ones currently set into a 0600
+//! `<config_dir>/service.env` that the service loads (systemd `EnvironmentFile`;
+//! launchd via a `/bin/sh` wrapper that sources it), so secrets live in ONE
+//! private file, never in the unit/plist or the config. The two loaders are
+//! DIFFERENT parsers, so the file is quoted for whichever one will read it (see
+//! [`EnvFileFormat`]) — a credential that survives one and is mangled by the
+//! other produces a daemon that cannot authenticate with no visible cause.
 //!
 //! The content generators are pure and unit-tested; the install/uninstall/status
 //! entry points shell out to `launchctl` / `systemctl --user` and degrade to
@@ -52,16 +55,44 @@ const ENV_FILE: &str = "service.env";
 /// `crate::main`'s rotating-writer setup so the two can never drift.
 pub(crate) const LOG_FILE: &str = "daemon.log";
 /// Where launchd sends the daemon's raw stdout/stderr: panics, early-startup
-/// errors before tracing is up, and the couple of `println!` lines. Tiny by
-/// construction (the bulk of logging goes through the rotated [`LOG_FILE`]), so it
-/// needs no rotation of its own (GitHub #22).
+/// errors before tracing is up, and the couple of `println!` lines. Meant to stay
+/// tiny (the bulk of logging goes through the rotated [`LOG_FILE`]), but nothing
+/// bounded it: a crash-loop appends a backtrace every [`plist_body`]
+/// `ThrottleInterval` forever, so it is rotated too, at every moment launchd
+/// reopens it (GitHub #22 rotated only `daemon.log`).
 const ERR_FILE: &str = "daemon.err.log";
+/// Rotate [`ERR_FILE`] once it is bigger than this. Much smaller than the
+/// daemon's own log budget because only panics/pre-tracing errors land here — a
+/// megabyte of them is already far more than any post-mortem needs.
+const ERR_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// Generations of [`ERR_FILE`] to keep (live + `.1`): enough to still hold the
+/// backtrace that started a crash-loop after the loop has appended over it.
+const ERR_FILE_KEEP: usize = 2;
 
 /// Environment variables captured into the service env file so the daemon starts
 /// with the same credentials the install shell had. Missing ones are skipped.
+///
+/// This list must cover EVERY variable the daemon's startup path reads, or the
+/// installed daemon fails where the interactive command succeeded:
+/// - `CONVEX_URL` / `CONVEX_SELF_HOSTED_URL` — the Coordinator (`crate::env`);
+/// - `CONVEX_SITE_URL` — the Better Auth host (`crate::auth::auth_base_url`).
+///   Without it the daemon DERIVES it from the Convex URL, which is wrong for
+///   any deployment whose HTTP-actions host is not `<name>.convex.site` or
+///   `port + 1`, and then every Coordinator call fails: the JWT exchange the
+///   Coordinator requires cannot complete;
+/// - the admin/deploy keys — the ops fallback when there is no session;
+/// - `S3_*` — a direct Vault (`ft_vault::S3Config::from_env`);
+/// - `FILETHING_HOME` / `XDG_CONFIG_HOME` — which config dir (and therefore
+///   which Device identity + Space mapping) the daemon resolves.
+///
+/// `RUST_LOG` is deliberately NOT captured: it is not needed (the daemon already
+/// defaults to `info`, see `crate::main`'s `env_filter`) and a `RUST_LOG=debug`
+/// in the installing shell would be frozen into the service forever, turning on
+/// third-party debug logging that has written credentials into `daemon.log`.
 const CAPTURED_ENV: &[&str] = &[
     "CONVEX_URL",
     "CONVEX_SELF_HOSTED_URL",
+    "CONVEX_SITE_URL",
     "CONVEX_DEPLOY_KEY",
     "CONVEX_ADMIN_KEY",
     "CONVEX_SELF_HOSTED_ADMIN_KEY",
@@ -72,7 +103,6 @@ const CAPTURED_ENV: &[&str] = &[
     "S3_BUCKET",
     "FILETHING_HOME",
     "XDG_CONFIG_HOME",
-    "RUST_LOG",
 ];
 
 /// Which lifecycle action `filething service` should perform.
@@ -114,18 +144,87 @@ fn xml_escape(v: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The `KEY='value'` body of the service env file. Single-quoted so it is safe
-/// both for `. file` under `/bin/sh -c 'set -a; …'` (launchd) and for systemd's
-/// `EnvironmentFile` (which accepts quoted values).
-fn env_file_body(vars: &[(String, String)]) -> String {
+/// Which parser will read the service env file — the two are NOT the same
+/// language, so one body cannot be correct for both.
+///
+/// `/bin/sh` keeps every byte inside `'…'` literal, and `'\''` is the standard
+/// way to embed a quote. systemd's `EnvironmentFile` parser also keeps a
+/// single-quoted run literal, but it returns to its *unquoted* value state after
+/// the closing quote, so it reads `'a'\''b'` as `a''b'` — it silently corrupts
+/// exactly the secrets sh handles. Its double-quoted state DOES unescape, but
+/// only the four characters in its `SHELL_NEED_ESCAPE` set
+/// (`systemd/src/basic/escape.h`: `"`, `\`, `` ` ``, `$`); a backslash before
+/// anything else is kept verbatim, so escaping more would inject backslashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvFileFormat {
+    /// Sourced by `/bin/sh` (`. file`) — the launchd wrapper, see [`plist_body`].
+    PosixSh,
+    /// Read by systemd's `EnvironmentFile=` parser — the Linux user unit.
+    SystemdEnvironmentFile,
+}
+
+impl EnvFileFormat {
+    /// The format for the platform whose service we are installing.
+    fn for_this_os() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::SystemdEnvironmentFile
+        } else {
+            Self::PosixSh
+        }
+    }
+
+    /// Quotes one value for this format so the loader yields it back byte for byte.
+    fn quote(self, v: &str) -> String {
+        match self {
+            Self::PosixSh => sh_quote(v),
+            // Double quotes, because systemd's single-quoted run cannot represent
+            // an embedded `'` at all (see the type docs). Backslash FIRST, or the
+            // backslashes introduced by the later replacements get doubled.
+            Self::SystemdEnvironmentFile => format!(
+                "\"{}\"",
+                v.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('`', "\\`")
+                    .replace('$', "\\$")
+            ),
+        }
+    }
+}
+
+/// The `KEY=<quoted value>` body of the service env file, quoted for the parser
+/// that will read it (see [`EnvFileFormat`]).
+///
+/// Errors instead of writing a value the format cannot represent: these are
+/// credentials, and a silently mangled one produces a daemon that fails to
+/// authenticate with nothing in the log pointing at the env file.
+fn env_file_body(vars: &[(String, String)], fmt: EnvFileFormat) -> anyhow::Result<String> {
     let mut s = String::new();
     for (k, v) in vars {
+        reject_unrepresentable(k, v)?;
         s.push_str(k);
         s.push('=');
-        s.push_str(&sh_quote(v));
+        s.push_str(&fmt.quote(v));
         s.push('\n');
     }
-    s
+    Ok(s)
+}
+
+/// Refuses a value no env-file format can carry. Only a NUL qualifies: `environ`
+/// itself is NUL-terminated, so neither loader could ever hand it back. Newlines,
+/// quotes and `=` ARE representable and are preserved verbatim (that is the point
+/// of [`EnvFileFormat::quote`]) — the value is a credential the daemon must see
+/// exactly as the installing shell had it.
+///
+/// The value is never echoed, only the variable name: this text ends up on a
+/// terminal and in shell history/CI logs.
+fn reject_unrepresentable(key: &str, value: &str) -> anyhow::Result<()> {
+    if value.contains('\0') {
+        bail!(
+            "the value of ${key} contains a NUL byte, which cannot be stored in the service \
+             environment file; fix ${key} in your shell and re-run `filething service install`"
+        );
+    }
+    Ok(())
 }
 
 /// The launchd plist body. Runs a `/bin/sh -c` wrapper that sources the env file
@@ -281,6 +380,7 @@ pub(crate) fn is_running() -> bool {
 /// always available/permitted for LaunchAgents), so this does the same
 /// unload-then-load `install()` uses to (re)start it.
 pub(crate) fn restart() -> anyhow::Result<()> {
+    rotate_err_log_if_oversized();
     if cfg!(target_os = "macos") {
         let plist = service_file_path()?;
         let plist_s = plist.to_string_lossy().into_owned();
@@ -293,20 +393,97 @@ pub(crate) fn restart() -> anyhow::Result<()> {
     }
 }
 
-/// Writes the captured-env file and returns its path. The file holds
-/// deployment-root-equivalent secrets, so it is created **0600 from the outset**
-/// (never write-then-chmod, which would leave a window where the secrets are
-/// world-readable): any stale file is removed first, then created with mode 0600
-/// atomically. The config dir is tightened to 0700 too.
-fn write_env_file() -> anyhow::Result<PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+/// Rotates [`ERR_FILE`] when it has grown past [`ERR_FILE_MAX_BYTES`].
+///
+/// The supervisor — not the daemon — owns this file, so it cannot be rotated by
+/// the daemon's own writer the way [`LOG_FILE`] is (`crate::logrotate`). It is
+/// rotated here instead, from the two places that make the supervisor REOPEN it
+/// (`install`, `restart`): renaming it while a live daemon holds the fd would
+/// otherwise leave that daemon appending to the renamed inode until it next
+/// starts. Best-effort — a log we cannot rotate must never block installing or
+/// restarting the service.
+fn rotate_err_log_if_oversized() {
+    let path = Config::config_dir().join(ERR_FILE);
+    let _ = crate::logrotate::rotate_if_oversized(&path, ERR_FILE_MAX_BYTES, ERR_FILE_KEEP);
+}
 
+/// The user whose systemd session must linger, for [`enable_linger`] and the
+/// manual command we print if it fails. `$USER` is set by every login shell;
+/// `loginctl` itself also accepts no argument (meaning "me"), which is the
+/// fallback when it is not.
+fn linger_user() -> Option<String> {
+    std::env::var("USER").ok().filter(|u| !u.is_empty())
+}
+
+/// The exact command to run by hand when [`enable_linger`] could not do it. With
+/// `sudo`, because the unprivileged call is what just failed (polkit only grants
+/// `set-self-linger` to a local active session — an SSH session on a VPS, the case
+/// that needs lingering most, is usually not one).
+fn linger_hint(user: Option<&str>) -> String {
+    match user {
+        Some(u) => format!("sudo loginctl enable-linger {u}"),
+        None => "sudo loginctl enable-linger $USER".to_string(),
+    }
+}
+
+/// Enables systemd lingering for this user so the `--user` daemon keeps running
+/// with no active login session.
+///
+/// Without it systemd stops the whole user manager at logout and sync silently
+/// stops — on a headless VPS (`docs/MAC-SETUP.md`'s Mac↔VPS pair) that is every
+/// disconnect. Idempotent: already-lingering users are detected first, and
+/// `enable-linger` is itself a no-op when it is already on, so re-running
+/// `install` is safe. A failure is NOT fatal (the service is installed and
+/// running either way) but must be loud, with the command that fixes it.
+fn enable_linger() {
+    let user = linger_user();
+    // `show-user -p Linger` prints `Linger=yes|no`; any failure (no user record
+    // yet, no loginctl) just falls through to attempting it.
+    let already = match user.as_deref() {
+        Some(u) => run_cmd_output("loginctl", &["show-user", u, "-p", "Linger"]),
+        None => Err(anyhow::anyhow!("no $USER")),
+    }
+    .map(|out| out.trim() == "Linger=yes")
+    .unwrap_or(false);
+    if already {
+        return;
+    }
+    let result = match user.as_deref() {
+        Some(u) => run_cmd("loginctl", &["enable-linger", u]),
+        None => run_cmd("loginctl", &["enable-linger"]),
+    };
+    match result {
+        Ok(()) => println!("Enabled lingering so the daemon survives logout."),
+        Err(e) => println!(
+            "Could not enable lingering ({e}). WITHOUT IT THE DAEMON STOPS WHEN YOU LOG OUT \
+             (systemd stops the user manager). Run:\n  {}",
+            linger_hint(user.as_deref())
+        ),
+    }
+}
+
+/// Writes the captured-env file and returns its path.
+fn write_env_file() -> anyhow::Result<PathBuf> {
     let vars: Vec<(String, String)> = CAPTURED_ENV
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
+    let body = env_file_body(&vars, EnvFileFormat::for_this_os())?;
     let path = Config::config_dir().join(ENV_FILE);
+    write_secret_file(&path, &body)?;
+    Ok(path)
+}
+
+/// Writes `body` to `path` as a secret file. The env file it is used for carries
+/// the Vault's `S3_SECRET_KEY` and the Convex admin/deploy key — full data-plane
+/// and deployment access — so it is created **0600 from the outset** (never
+/// write-then-chmod, which would leave a window where the secrets are
+/// world-readable): any stale file is removed first, then created with mode 0600
+/// atomically. The parent dir is tightened to 0700 too.
+fn write_secret_file(path: &Path, body: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -315,17 +492,17 @@ fn write_env_file() -> anyhow::Result<PathBuf> {
     }
     // Remove any stale file so the create below always makes a fresh 0600 file
     // (create+truncate would keep a pre-existing looser mode).
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("creating {} (0600)", path.display()))?;
-    file.write_all(env_file_body(&vars).as_bytes())
+    file.write_all(body.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    Ok(())
 }
 
 /// Writes the unit/plist + env file and loads the service. Public to
@@ -334,6 +511,9 @@ fn write_env_file() -> anyhow::Result<PathBuf> {
 pub(crate) fn install() -> anyhow::Result<()> {
     let exe = current_exe()?;
     let env_file = write_env_file()?;
+    // Both (re)start paths below make the supervisor reopen the err log, so this
+    // is the moment it can be rotated safely.
+    rotate_err_log_if_oversized();
     // The rotated log the daemon owns (shown to the operator below); the tiny
     // err file launchd captures raw stdout/stderr into (see `plist_body`).
     let log_file = Config::config_dir().join(LOG_FILE);
@@ -362,10 +542,13 @@ pub(crate) fn install() -> anyhow::Result<()> {
             Ok(()) => println!("Enabled and started {SYSTEMD_UNIT} (systemctl --user)."),
             Err(e) => println!(
                 "Could not enable the unit automatically ({e}). Enable it with:\n  \
-                 systemctl --user enable --now {SYSTEMD_UNIT}\n(You may need `loginctl \
-                 enable-linger $USER` so it runs without an active login session.)"
+                 systemctl --user enable --now {SYSTEMD_UNIT}\n  {}",
+                linger_hint(linger_user().as_deref())
             ),
         }
+        // A `--user` unit alone dies at logout; lingering is what makes it a real
+        // background service on a headless box.
+        enable_linger();
     } else {
         bail!("`service` supports macOS (launchd) and Linux (systemd) only");
     }
@@ -664,16 +847,48 @@ fn last_error_log_lines(n: usize) -> Vec<String> {
     }
 }
 
+/// How much of the END of a log file to read when tailing it. Generous for
+/// [`ERROR_LOG_TAIL`] lines of tracing output, yet bounded: `status` used to slurp
+/// the whole file, so a multi-megabyte log became a multi-megabyte allocation just
+/// to print 15 lines.
+const TAIL_READ_BYTES: u64 = 64 * 1024;
+
 /// Reads the last `n` lines of a text file, or an empty vec if it cannot be read.
 fn tail_file(path: &Path, n: usize) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(n);
-            lines[start..].iter().map(|l| l.to_string()).collect()
-        }
-        Err(_) => Vec::new(),
+    tail_file_capped(path, n, TAIL_READ_BYTES)
+}
+
+/// [`tail_file`] with the read window as a parameter (so the truncation behaviour
+/// is testable without writing a 64 KiB fixture).
+///
+/// Reads at most `max_bytes` from the end of the file. When the window starts
+/// mid-file its first line is a fragment, so it is dropped — showing half a log
+/// line as if it were a whole one would be worse than showing one line fewer.
+/// Invalid UTF-8 is replaced rather than rejected: this is a diagnostic, and a
+/// truncated multi-byte char at the window boundary must not lose the tail.
+fn tail_file_capped(path: &Path, n: usize, max_bytes: u64) -> Vec<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let window = len.min(max_bytes);
+    let partial_first_line = window < len;
+    if file.seek(SeekFrom::End(-(window as i64))).is_err() {
+        return Vec::new();
     }
+    let mut buf = Vec::with_capacity(window as usize);
+    if file.take(window).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if partial_first_line && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(n);
+    lines[start..].iter().map(|l| l.to_string()).collect()
 }
 
 // ----- small IO / process helpers -----
@@ -744,10 +959,129 @@ mod tests {
             ),
             ("S3_SECRET_KEY".to_string(), "ab'cd".to_string()),
         ];
-        let body = env_file_body(&vars);
+        let body = env_file_body(&vars, EnvFileFormat::PosixSh).unwrap();
         assert!(body.contains("CONVEX_URL='https://x.convex.cloud'\n"));
-        // Embedded quote is escaped so both `. file` and systemd read it.
+        // Embedded quote is escaped the way `. file` under /bin/sh reads it back.
         assert!(body.contains("S3_SECRET_KEY='ab'\\''cd'\n"));
+    }
+
+    // ----- the daemon's environment (install captures it) -----
+
+    /// The installed daemon runs with ONLY this set, so it must cover every
+    /// variable the startup path reads — `CONVEX_SITE_URL` above all, without which
+    /// the Better Auth JWT exchange behind every Coordinator call cannot complete
+    /// on a deployment whose site URL is not derivable from the Convex URL.
+    #[test]
+    fn captured_env_covers_the_whole_auth_and_vault_path() {
+        for required in [
+            // crate::env: the Coordinator URL.
+            "CONVEX_URL",
+            "CONVEX_SELF_HOSTED_URL",
+            // crate::auth::auth_base_url: the Better Auth host.
+            "CONVEX_SITE_URL",
+            // crate::env: the ops fallback when there is no session.
+            "CONVEX_ADMIN_KEY",
+            "CONVEX_DEPLOY_KEY",
+            "CONVEX_SELF_HOSTED_ADMIN_KEY",
+            // ft_vault::S3Config::from_env: a direct Vault.
+            "S3_ENDPOINT",
+            "S3_REGION",
+            "S3_ACCESS_KEY",
+            "S3_SECRET_KEY",
+            "S3_BUCKET",
+            // crate::config: which config dir (identity + Space mapping).
+            "FILETHING_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(
+                CAPTURED_ENV.contains(&required),
+                "{required} must be captured into service.env"
+            );
+        }
+    }
+
+    /// `RUST_LOG` must NOT be frozen into the service: a `RUST_LOG=debug` in the
+    /// installing shell would turn on third-party debug logging in the daemon
+    /// forever, which writes credentials into `daemon.log`.
+    #[test]
+    fn captured_env_excludes_rust_log() {
+        assert!(!CAPTURED_ENV.contains(&"RUST_LOG"));
+    }
+
+    // ----- env-file quoting per loader -----
+
+    /// systemd's `EnvironmentFile` parser leaves its single-quoted run at the
+    /// closing quote and then reads `\'` in its UNQUOTED state, so sh's `'\''`
+    /// idiom would hand the daemon `ab''cd'`. Double quotes with its own
+    /// `SHELL_NEED_ESCAPE` set are what round-trips.
+    #[test]
+    fn systemd_quoting_round_trips_values_sh_quoting_would_corrupt() {
+        let fmt = EnvFileFormat::SystemdEnvironmentFile;
+        assert_eq!(fmt.quote("plain"), "\"plain\"");
+        assert_eq!(fmt.quote("ab'cd"), "\"ab'cd\"");
+        // The four characters systemd unescapes inside double quotes — and ONLY
+        // those: a backslash before anything else is kept verbatim by its parser.
+        assert_eq!(fmt.quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(fmt.quote("a\\b"), "\"a\\\\b\"");
+        assert_eq!(fmt.quote("a`b"), "\"a\\`b\"");
+        assert_eq!(fmt.quote("a$b"), "\"a\\$b\"");
+        // A `=` or a space in a secret needs no special handling once quoted.
+        assert_eq!(fmt.quote("a=b c"), "\"a=b c\"");
+    }
+
+    /// The same values under the launchd loader (`/bin/sh` `.`), where a
+    /// single-quoted run is literal and only `'` needs the escape dance.
+    #[test]
+    fn sh_quoting_round_trips_the_same_values() {
+        let fmt = EnvFileFormat::PosixSh;
+        assert_eq!(fmt.quote("a\\b"), "'a\\b'"); // literal inside '…' for sh
+        assert_eq!(fmt.quote("a$b"), "'a$b'"); // no expansion inside '…'
+        assert_eq!(fmt.quote("ab'cd"), "'ab'\\''cd'");
+        assert_eq!(fmt.quote("a=b c"), "'a=b c'");
+    }
+
+    /// A value that cannot be represented is REFUSED, not silently mangled — and
+    /// the error names the variable but never echoes the credential.
+    #[test]
+    fn unrepresentable_value_is_refused_without_echoing_the_secret() {
+        let vars = vec![("S3_SECRET_KEY".to_string(), "sec\0ret".to_string())];
+        let err = env_file_body(&vars, EnvFileFormat::PosixSh)
+            .expect_err("a NUL cannot survive environ")
+            .to_string();
+        assert!(err.contains("S3_SECRET_KEY"), "{err}");
+        assert!(!err.contains("sec"), "the secret must not be echoed: {err}");
+    }
+
+    /// The env file holds credentials, so it is created 0600 even when a looser
+    /// file (an older install, a different umask) is already there.
+    #[test]
+    fn secret_file_is_written_owner_only_even_over_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.env");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_file(&path, "S3_SECRET_KEY='x'\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "S3_SECRET_KEY='x'\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "service.env must be owner-only");
+    }
+
+    // ----- systemd lingering (a --user unit dies at logout without it) -----
+
+    /// When lingering cannot be enabled we must print the command that works —
+    /// with `sudo`, since the unprivileged attempt is what just failed.
+    #[test]
+    fn linger_hint_names_the_exact_command() {
+        assert_eq!(
+            linger_hint(Some("deploy")),
+            "sudo loginctl enable-linger deploy"
+        );
+        // No $USER: loginctl's own "me" form, still runnable as printed.
+        assert_eq!(linger_hint(None), "sudo loginctl enable-linger $USER");
     }
 
     #[test]
@@ -840,6 +1174,48 @@ mod tests {
         assert_eq!(st.pid, None); // MainPID 0 → not running
         assert_eq!(st.last_exit_code, Some(1));
         assert_eq!(st.restarts, Some(7));
+    }
+
+    // ----- log tailing (bounded: `status` used to slurp the whole file) -----
+
+    /// The tail is read from the END of the file within a byte window, so a log far
+    /// bigger than the window still yields its last lines — and the fragment the
+    /// window starts in the middle of is dropped rather than shown as a line.
+    #[test]
+    fn tail_reads_only_the_end_of_a_file_bigger_than_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.err.log");
+        // 100 lines of 8 bytes each ("line-NN\n") = 800 bytes on disk.
+        let body: String = (0..100).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        // A 40-byte window holds five whole lines, so asking for three gives the
+        // last three — the file's first 760 bytes are never read.
+        assert_eq!(
+            tail_file_capped(&path, 3, 40),
+            vec!["line-97", "line-98", "line-99"]
+        );
+        // The window is the hard bound: one too small for three lines yields the
+        // whole lines it does cover, and never a fragment of the line it starts in
+        // (the old whole-file read would still have returned three here).
+        assert_eq!(tail_file_capped(&path, 3, 20), vec!["line-98", "line-99"]);
+    }
+
+    /// A file that fits inside the window keeps its very first line (nothing was
+    /// truncated), and asking for more lines than exist returns them all.
+    #[test]
+    fn tail_of_a_small_file_keeps_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.err.log");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        assert_eq!(tail_file_capped(&path, 10, 64 * 1024), vec!["a", "b", "c"]);
+    }
+
+    /// A missing log is not an error: `status` calls this whenever it suspects a
+    /// crash-loop, including before anything has ever been written.
+    #[test]
+    fn tail_of_a_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(tail_file_capped(&dir.path().join("nope.log"), 5, 1024).is_empty());
     }
 
     #[test]

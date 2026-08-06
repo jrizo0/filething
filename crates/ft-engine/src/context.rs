@@ -11,8 +11,13 @@
 //!   already persisted (it loads `chunk_secret` and the `last_synced` base).
 //! - [`SpaceContext::init_space`](crate::SpaceContext::init_space) (in
 //!   `commit.rs`) creates a brand-new Space.
+//!
+//! A mount that can publish Revisions also takes the Space's exclusive
+//! [`SpaceLock`] and holds it for the context's whole lifetime, so two processes
+//! never drive one Space at once (`§9`).
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ft_chunker::Chunker;
@@ -33,6 +38,141 @@ pub struct LastSynced {
     pub seq: i64,
     /// `manifestRoot` of that base Revision (`space_state.last_synced_root`).
     pub root: Cid,
+}
+
+/// Name of the per-Space lock file inside the control dir
+/// ([`CONTROL_DIR`](crate::scan::CONTROL_DIR)).
+const LOCK_FILE: &str = "space.lock";
+
+/// The exclusive advisory lock over one Space root, held for as long as the
+/// [`SpaceContext`] that took it lives.
+///
+/// Two processes driving the same Space corrupt the tree: a one-shot `filething
+/// sync` that scans while the daemon is halfway through materializing a pull sees
+/// neither the old nor the new name of a renamed file, plus a
+/// `.<name>`[`TMP_SUFFIX`](ft_diff::TMP_SUFFIX) scratch file — and commits THAT as
+/// a Revision, which then replicates to every Device (`§7`/`§9`).
+///
+/// It is `flock(2)` on an open descriptor and NOT a pid file because the kernel
+/// drops the lock when the holder dies: a `kill -9`d daemon leaves a lock file
+/// behind but no lock, so the next process mounts normally instead of finding the
+/// Space bricked. Nothing ever unlocks explicitly — closing the descriptor (that
+/// is, dropping this value) IS the release.
+pub(crate) struct SpaceLock {
+    /// Held only for its side effect: the lock lives on this descriptor, so the
+    /// lock lives exactly as long as this value.
+    _file: File,
+}
+
+impl SpaceLock {
+    /// Takes the Space's exclusive lock, creating `<root>/.filething/space.lock`
+    /// if needed, and stamps this process into it so a contender can name the
+    /// holder.
+    ///
+    /// Fails fast with [`EngineError::SpaceLocked`] instead of waiting: the holder
+    /// that contends in practice is the daemon, which keeps its lock for its whole
+    /// lifetime, so a bounded wait could only add latency to an error it cannot
+    /// avoid. (It would also have to block: this is a sync fn the daemon calls
+    /// inside its async task, where sleeping stalls the other Spaces.)
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        let dir = root.join(crate::scan::CONTROL_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(LOCK_FILE);
+        let file = open_lock_file(&path)?;
+        if try_lock_exclusive(&file)? {
+            stamp_holder(&file);
+            Ok(Self { _file: file })
+        } else {
+            Err(EngineError::SpaceLocked {
+                root: root.display().to_string(),
+                holder: read_holder(&path),
+            })
+        }
+    }
+}
+
+/// Opens (or creates, `0600`) the lock file for locking.
+///
+/// Deliberately does NOT truncate: the current holder's identity must survive
+/// until we know whether we got the lock, otherwise a contender would erase the
+/// very line it is about to report.
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`: `Ok(true)` = ours, `Ok(false)` = someone else holds
+/// it, `Err` = a real failure.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd as _;
+
+    // Declared here rather than pulling in a locking crate: the workspace has no
+    // `libc`/`nix`/`fs2` direct dependency, and `flock` plus these two operation
+    // bits are identical on the only two platforms filething ships for (Linux,
+    // macOS).
+    const LOCK_EX: std::os::raw::c_int = 2;
+    const LOCK_NB: std::os::raw::c_int = 4;
+    extern "C" {
+        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+
+    // SAFETY: `fd` is open for the whole call (we hold `file`), and `flock` only
+    // reads the two scalars it is given.
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    // EWOULDBLOCK is the contended answer, not a failure: the lock is simply held.
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+/// filething ships for macOS and Linux only, so there is no other `flock`. This
+/// arm refuses rather than pretending the Space was locked: an unlocked mount that
+/// believes it is locked is exactly the corruption this guard exists to prevent.
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no Space lock implementation for this platform",
+    ))
+}
+
+/// Writes `pid <n> (<exe>)` into the lock file we just locked, so the NEXT process
+/// can name us in its [`EngineError::SpaceLocked`]. Best-effort: the lock itself is
+/// the descriptor, never this text.
+fn stamp_holder(file: &File) {
+    use std::io::Write as _;
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "filething".to_string());
+    let mut file = file;
+    let _ = file.set_len(0);
+    let _ = write!(file, "pid {} ({exe})", std::process::id());
+    let _ = file.flush();
+}
+
+/// Reads the holder line a previous [`stamp_holder`] left. Truncated and defaulted
+/// because it is untrusted decoration inside an error message, not data.
+fn read_holder(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        // The holder locks before it stamps, so a contender can land in that window.
+        return "another process".to_string();
+    }
+    line.chars().take(120).collect()
 }
 
 /// A Space mounted on this Device: the unit the engine commits and (Part 2)
@@ -94,6 +234,10 @@ pub struct SpaceContext {
     /// persisted in `space_state` (the escrow/keyring that supplies it lives
     /// outside the engine).
     pub crypto: Option<SpaceCrypto>,
+    /// The Space's exclusive [`SpaceLock`], held until this context is dropped.
+    /// `Some` for a mount that can publish Revisions, `None` for the scan-only
+    /// [`mount`](SpaceContext::mount) (see [`from_state`](Self::from_state)).
+    _space_lock: Option<SpaceLock>,
 }
 
 impl SpaceContext {
@@ -103,7 +247,9 @@ impl SpaceContext {
     ///
     /// The default [`LinuxFs`] adapter is used; pass a different one with
     /// [`SpaceContext::open_with_fs`]. Errors with [`EngineError::SpaceState`] if
-    /// no row exists for `space_id` or its `chunk_secret` is not 32 bytes.
+    /// no row exists for `space_id` or its `chunk_secret` is not 32 bytes, and with
+    /// [`EngineError::SpaceLocked`] if another process is already driving this Space
+    /// — the [`SpaceLock`] this takes is held until the context is dropped.
     pub fn open(
         index: Index,
         vault: Box<dyn Vault>,
@@ -157,6 +303,9 @@ impl SpaceContext {
     /// [`stage_to_vault`](SpaceContext::stage_to_vault) work; `commit` returns an
     /// error until a [`Coordinator`] is attached. Useful offline (Gate 4) and in
     /// network-free tests.
+    ///
+    /// Takes NO [`SpaceLock`]: it cannot publish a Revision, so it is safe (and
+    /// necessary — `filething status` mounts this way) alongside a daemon holding it.
     pub fn mount(
         index: Index,
         vault: Box<dyn Vault>,
@@ -189,6 +338,25 @@ impl SpaceContext {
             ))
         })?;
         let chunker = Chunker::new(&chunk_secret);
+        let local_root = PathBuf::from(&state.local_root_path);
+
+        // A mount that can publish Revisions takes the Space's exclusive lock and
+        // holds it for the context's lifetime, so `filething sync`, `clone`, `gc`
+        // and the daemon can never drive one Space concurrently (`§9`, see
+        // [`SpaceLock`]). Having a live Coordinator is exactly that property:
+        // `open`/`init_space`/`clone_space` all pass one, and only a context with
+        // one can commit or pull.
+        //
+        // The scan-only `mount` (Coordinator `None`) deliberately does NOT lock: it
+        // never writes the tree and cannot publish anything, and `filething status`
+        // mounts that way — locking it would make `status` fail exactly when the
+        // daemon is doing its job.
+        let space_lock = if coordinator.is_some() {
+            Some(SpaceLock::acquire(&local_root)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             index,
             vault,
@@ -200,7 +368,7 @@ impl SpaceContext {
             device_id,
             space_id,
             device_display_name: None,
-            local_root: PathBuf::from(&state.local_root_path),
+            local_root,
             last_synced: LastSynced {
                 seq: state.last_synced_seq,
                 root: state.last_synced_root,
@@ -218,6 +386,7 @@ impl SpaceContext {
             // Encryption is OFF unless the caller attaches key material (§4.4).
             // Not read from `space_state`: the space_key is not persisted there.
             crypto: None,
+            _space_lock: space_lock,
         })
     }
 
@@ -290,19 +459,57 @@ impl SpaceContext {
     /// reconcile needs (`§10`). It downloads pages (no hash pruning) because
     /// reconcile must see whole entries by path; for the toy MVP trees this is
     /// cheap. The empty-Manifest root yields an empty map.
+    ///
+    /// Everything it admits crosses the INBOUND trust boundary first: each page is
+    /// verified against the `page_cid` that referenced it and each entry against
+    /// [`FileEntry::validate_untrusted`](ft_core::FileEntry::validate_untrusted).
+    /// The map this returns is the base/remote view the reconcile treats as truth,
+    /// so an unchecked entry here is an unchecked write later.
     pub(crate) async fn read_manifest_entries(
         &self,
         root: &Cid,
     ) -> Result<std::collections::HashMap<ft_core::CasefoldKey, ft_core::FileEntry>> {
-        use ft_manifest::{decode_page, Page};
-        let mut out = std::collections::HashMap::new();
+        use ft_manifest::{decode_page_verified, Page};
+        let mut out: std::collections::HashMap<ft_core::CasefoldKey, ft_core::FileEntry> =
+            std::collections::HashMap::new();
         let mut stack = vec![*root];
         while let Some(cid) = stack.pop() {
             let obj = self.vault.get(&ft_hash::manifest_key(&cid)).await?;
-            match decode_page(&obj)? {
+            // A page NAMES every other object of the tree, so substituted page bytes
+            // void the integrity of all of them — it takes only a rewritten `p` to
+            // aim an entry at `../../.ssh/authorized_keys`, or a dropped run of
+            // entries for the reconcile to read the gap as mass deletion (`§5.3`).
+            // Verification also rules out a page cycle: no page can reference itself
+            // or an ancestor under content addressing, so this walk terminates.
+            let page =
+                decode_page_verified(&obj, &cid).map_err(|e| manifest_decode_error(&cid, e))?;
+            match page {
                 Page::Leaf(leaf) => {
                     for entry in leaf.e {
+                        // The inbound half of the path policy (`§5.2`): a path from
+                        // the Vault is untrusted input, and the reconcile joins these
+                        // onto `local_root` to materialize them.
+                        entry.validate_untrusted()?;
                         let key = ft_fsmap::casefold_key(&entry.p);
+                        if let Some(prev) = out.get(&key) {
+                            // `§5.2`: one casefold key names one entry. Inserting over
+                            // the previous one would drop it from the base/remote view
+                            // the three-way reconcile compares, where an absent entry
+                            // means "deleted" — so a Manifest holding both `README.md`
+                            // and `readme.md` (authored on a case-sensitive Device)
+                            // would make the pull DELETE one of them, silently. This
+                            // map cannot express two entries under one key, so refuse
+                            // the whole read instead of picking a winner.
+                            return Err(EngineError::Refused(format!(
+                                "manifest page {cid} holds two entries with the same \
+                                 case-insensitive name ({:?} and {:?}); one of them \
+                                 would silently disappear on this Device, so the sync \
+                                 stopped. Rename one of the two on the Device that \
+                                 created them, then sync again (§5.2)",
+                                prev.p.as_str(),
+                                entry.p.as_str()
+                            )));
+                        }
                         out.insert(key, entry);
                     }
                 }
@@ -335,6 +542,37 @@ impl SpaceContext {
     }
 }
 
+/// Turns a Manifest-page decode failure into the error the user can act on,
+/// separating "this build is too old" from "this object is corrupt".
+///
+/// [`ft_manifest::decode_page_verified`] checks the page against its `page_cid`
+/// BEFORE decoding the payload, so a `Cbor`/`UnknownKind` failure cannot be
+/// corruption: those bytes are exactly what the writer produced and hash to the
+/// cid the Revision promised — we simply do not understand them. Two Devices on
+/// different filething versions is a normal state (`filething update` is manual,
+/// ADR 0019: a pre-Dir binary cannot decode a `t=3` entry), so that case must say
+/// so instead of surfacing a bare `invalid file type: 4`.
+///
+/// An unknown header version is remapped for the same reason. A `PageCidMismatch`
+/// or a malformed/short header is NOT: those mean substituted or damaged bytes,
+/// which no update fixes.
+fn manifest_decode_error(page_cid: &Cid, err: ft_manifest::ManifestError) -> EngineError {
+    use ft_manifest::ManifestError as Me;
+    let too_old = matches!(
+        &err,
+        Me::Cbor(_) | Me::UnknownKind(_) | Me::Header(ft_core::Error::UnsupportedHeaderVersion(_))
+    );
+    if too_old {
+        EngineError::Refused(format!(
+            "manifest page {page_cid} was written by a newer filething than this build \
+             can read ({err}); run `filething update` on this Device, then sync again \
+             (ADR 0019)"
+        ))
+    } else {
+        EngineError::Manifest(err)
+    }
+}
+
 /// Joins a Space root with a canonical (forward-slash) path, segment by segment.
 pub(crate) fn join_canonical(root: &std::path::Path, path: &ft_core::CanonicalPath) -> PathBuf {
     let mut dest = root.to_path_buf();
@@ -353,5 +591,274 @@ impl std::fmt::Debug for SpaceContext {
             .field("local_root", &self.local_root)
             .field("last_synced", &self.last_synced)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ft_core::{CanonicalPath, CasefoldKey, FileEntry, FileType, Pcid};
+    use ft_vault::FsVault;
+
+    /// A minimal File entry at `path` with no blocks — enough for the trust-boundary
+    /// checks below, which only ever look at `p`/`t`.
+    fn file_entry(path: &str) -> (CasefoldKey, FileEntry) {
+        let p = CanonicalPath(path.to_string());
+        let key = ft_fsmap::casefold_key(&p);
+        let entry = FileEntry {
+            p,
+            t: FileType::File,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: Vec::new(),
+            bk_ref: None,
+            lt: None,
+            wu: None,
+        };
+        (key, entry)
+    }
+
+    /// Uploads every page of the Manifest of `entries`; returns its root.
+    async fn upload_manifest(vault: &FsVault, entries: Vec<(CasefoldKey, FileEntry)>) -> Cid {
+        let m = ft_manifest::build(entries);
+        for (page_cid, bytes) in &m.pages {
+            vault
+                .put(&ft_hash::manifest_key(page_cid), bytes.clone())
+                .await
+                .unwrap();
+        }
+        m.root
+    }
+
+    /// Mounts a scan-only context (no Coordinator, so no Space lock) over `root`.
+    fn mount_scan_only(root: &Path, vault: FsVault) -> SpaceContext {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .upsert_space_state(&SpaceState {
+                space_id: "sp".to_string(),
+                last_synced_seq: -1,
+                last_synced_root: ft_manifest::build(Vec::new()).root,
+                last_synced_revision_id: None,
+                chunk_secret: [0x11; 32].to_vec(),
+                dedup_secret: None,
+                local_root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        SpaceContext::mount(
+            index,
+            Box::new(vault),
+            Box::new(LinuxFs),
+            AccountId::new("acct"),
+            DeviceId::new("dev"),
+            SpaceId::new("sp"),
+        )
+        .unwrap()
+    }
+
+    // ----- read_manifest_entries: the inbound trust boundary (§5.2/§5.3) -----
+
+    /// A page swapped for another VALID page: it decodes cleanly, so only the
+    /// `page_cid` check catches it. Without that check the reconcile would treat
+    /// the substituted tree as the Space's real base/remote view.
+    #[tokio::test]
+    async fn read_manifest_entries_rejects_a_page_substituted_under_another_pages_cid() {
+        let vdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vdir.path());
+
+        let honest = upload_manifest(&vault, vec![file_entry("notes.md")]).await;
+        let forged = ft_manifest::build(vec![file_entry("evil.md")]);
+        vault
+            .put(&ft_hash::manifest_key(&honest), forged.pages[0].1.clone())
+            .await
+            .unwrap();
+
+        let ctx = mount_scan_only(root.path(), vault);
+        let err = ctx.read_manifest_entries(&honest).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Manifest(ft_manifest::ManifestError::PageCidMismatch { .. })
+            ),
+            "expected a page cid mismatch, got {err}"
+        );
+    }
+
+    /// A hostile path in an otherwise well-formed Manifest must not reach the
+    /// reconcile's view at all — `..` there becomes a write outside the Space.
+    #[tokio::test]
+    async fn read_manifest_entries_rejects_an_entry_whose_path_climbs_out_of_the_space_root() {
+        let vdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vdir.path());
+
+        let head = upload_manifest(&vault, vec![file_entry("../../.zshrc")]).await;
+
+        let ctx = mount_scan_only(root.path(), vault);
+        let err = ctx.read_manifest_entries(&head).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Core(ft_core::Error::UnsafePath { .. })),
+            "expected an UnsafePath rejection, got {err}"
+        );
+    }
+
+    /// `README.md` + `readme.md` authored on a case-sensitive Device: both are
+    /// legitimate entries that collapse onto one casefold key. Collapsing them
+    /// silently would make the reconcile read the loser as deleted and delete it.
+    #[tokio::test]
+    async fn read_manifest_entries_refuses_a_manifest_whose_entries_share_one_casefold_key() {
+        let vdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vdir.path());
+
+        let head = upload_manifest(
+            &vault,
+            vec![file_entry("README.md"), file_entry("readme.md")],
+        )
+        .await;
+
+        let ctx = mount_scan_only(root.path(), vault);
+        let err = ctx.read_manifest_entries(&head).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, EngineError::Refused(_)),
+            "expected a refusal, got {err}"
+        );
+        assert!(
+            msg.contains("README.md") && msg.contains("readme.md"),
+            "the refusal must name both colliding entries: {msg}"
+        );
+    }
+
+    /// A leaf page carrying an entry type this build does not know — what a NEWER
+    /// filething writes once it adds a `t` (ADR 0019: `t=3` Dir was such an
+    /// addition, and a pre-Dir binary cannot read it). Field names and order mirror
+    /// `LeafPage`/`FileEntry` (`§5.1`/`§5.3`) so the decode fails on `t`, nothing else.
+    #[derive(serde::Serialize)]
+    struct FuturePage {
+        k: u8,
+        v: u8,
+        first: String,
+        last: String,
+        e: Vec<FutureEntry>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct FutureEntry {
+        p: String,
+        t: u8,
+        x: bool,
+        sz: u64,
+        #[serde(with = "serde_bytes")]
+        pcid: Vec<u8>,
+    }
+
+    /// The version-skew case: the page is AUTHENTIC (it hashes to the cid that
+    /// referenced it) but undecodable, which can only mean the writer's format is
+    /// newer than ours. The user needs `filething update`, not a discriminant.
+    #[tokio::test]
+    async fn read_manifest_entries_advises_an_update_for_an_authentic_page_it_cannot_decode() {
+        let vdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(vdir.path());
+
+        let page = FuturePage {
+            k: ft_manifest::KIND_LEAF,
+            v: ft_manifest::PAGE_VERSION,
+            first: "new.txt".to_string(),
+            last: "new.txt".to_string(),
+            e: vec![FutureEntry {
+                p: "new.txt".to_string(),
+                // A type no released filething defines yet: the next `t` after Dir.
+                t: 4,
+                x: false,
+                sz: 0,
+                pcid: vec![0u8; 32],
+            }],
+        };
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&page, &mut payload).unwrap();
+        // Address the object by its own bytes, so the cid check passes and only the
+        // decode fails.
+        let cid = ft_hash::cid_of(&payload);
+        let mut obj = ft_core::BlockHeader::new_manifest(payload.len() as u64)
+            .encode()
+            .to_vec();
+        obj.extend_from_slice(&payload);
+        vault.put(&ft_hash::manifest_key(&cid), obj).await.unwrap();
+
+        let ctx = mount_scan_only(root.path(), vault);
+        let err = ctx.read_manifest_entries(&cid).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, EngineError::Refused(_)),
+            "expected a refusal carrying update advice, got {err}"
+        );
+        assert!(
+            msg.contains("filething update"),
+            "the error must tell the user how to fix it: {msg}"
+        );
+        assert!(
+            msg.contains("FileType") && msg.contains('4'),
+            "the error must keep the offending discriminant for support: {msg}"
+        );
+    }
+
+    // ----- SpaceLock: one process per Space (§9) -----
+
+    /// The whole point: while one holder lives, a second mount of the same root is
+    /// refused and can name who holds it.
+    #[test]
+    fn a_second_holder_cannot_take_a_space_lock_the_first_still_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let first = SpaceLock::acquire(root.path()).unwrap();
+        assert!(root
+            .path()
+            .join(crate::scan::CONTROL_DIR)
+            .join(LOCK_FILE)
+            .exists());
+
+        match SpaceLock::acquire(root.path()) {
+            Err(EngineError::SpaceLocked { holder, .. }) => assert!(
+                holder.contains(&format!("pid {}", std::process::id())),
+                "the error must name the holder, got {holder:?}"
+            ),
+            Err(other) => panic!("expected SpaceLocked, got {other}"),
+            Ok(_) => panic!("the same Space lock must never be handed out twice"),
+        }
+
+        // Closing the descriptor is the release — the same thing the kernel does for
+        // the holder's process when it dies.
+        drop(first);
+        SpaceLock::acquire(root.path()).expect("the lock is free once the holder is gone");
+    }
+
+    /// The `kill -9` case, which is exactly why this is `flock(2)` and not a pid
+    /// file: the file survives the dead holder, the LOCK does not, so the Space is
+    /// not bricked.
+    #[test]
+    fn a_lock_file_left_behind_by_a_dead_holder_does_not_brick_the_space() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::scan::CONTROL_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LOCK_FILE), b"pid 999999 (filething)").unwrap();
+
+        let lock = SpaceLock::acquire(root.path()).expect("a stale lock file must not block");
+        drop(lock);
+    }
+
+    /// `filething status` mounts scan-only WHILE the daemon holds the lock, so that
+    /// mount must not take (or need) it.
+    #[test]
+    fn a_scan_only_mount_takes_no_space_lock_so_status_still_works_under_the_daemon() {
+        let vdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let held = SpaceLock::acquire(root.path()).unwrap();
+
+        let ctx = mount_scan_only(root.path(), FsVault::new(vdir.path()));
+        assert_eq!(ctx.local_root, root.path());
+
+        drop(held);
     }
 }

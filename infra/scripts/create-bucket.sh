@@ -10,16 +10,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${INFRA_DIR}/.env"
 
-# Load infra/.env if present, else fall back to .env.example defaults.
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set +a
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "ERROR: ${ENV_FILE} not found — run infra/scripts/up.sh first (it generates it)." >&2
+  exit 1
 fi
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
 
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
+# No minioadmin fallback: guessing at the credentials only ever produced a
+# working bucket back when minioadmin WAS the credential.
+: "${MINIO_ROOT_USER:?not set in ${ENV_FILE} — delete it and re-run infra/scripts/up.sh}"
+: "${MINIO_ROOT_PASSWORD:?not set in ${ENV_FILE} — delete it and re-run infra/scripts/up.sh}"
 S3_BUCKET="${S3_BUCKET:-filething}"
 
 echo ">> Ensuring MinIO bucket '${S3_BUCKET}' exists..."

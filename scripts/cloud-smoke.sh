@@ -27,19 +27,53 @@ hr()  { echo; echo "==================== $* ===================="; }
 # hardening, Fase 3 Fix B: convex/betterAuth.ts disableSignUp) — solo se abre
 # con FILETHING_ALLOW_SIGNUP=1. Este smoke hace signup real (PASO 1), así que lo
 # abrimos aquí y lo devolvemos a como estaba al terminar (éxito o fallo).
+#
+# El estado abierto es un cambio de SEGURIDAD real sobre un deployment vivo, así
+# que el cierre no puede depender de que el camino feliz llegue al final:
+#   - el flag se arma ANTES de mutar (un `env set` que aplica y devuelve != 0
+#     dejaba el signup abierto sin que el trap lo supiera — es la fuga real que
+#     tenía este script),
+#   - el restore comprueba su propio código de salida y grita si falló,
+#   - hay traps de señal explícitos: bash *suele* correr el de EXIT al recibir
+#     INT/TERM/HUP, pero eso no lo garantiza POSIX y además así el script sale
+#     con el 128+n convencional.
+# Contra SIGKILL o un corte de luz no hay red: de ahí el chequeo manual que
+# sugiere el mensaje de error.
 ALLOW_SIGNUP_TOUCHED=0
 ORIG_ALLOW_SIGNUP=""
+CLEANED=0
 cleanup() {
+  [ "$CLEANED" -eq 1 ] && return 0   # los traps de señal salen -> el de EXIT reentra
+  CLEANED=1
   if [ "$ALLOW_SIGNUP_TOUCHED" -eq 1 ]; then
+    local restored=0 now
     if [ -n "$ORIG_ALLOW_SIGNUP" ]; then
-      ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP "$ORIG_ALLOW_SIGNUP" ) >/dev/null 2>&1
+      ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP "$ORIG_ALLOW_SIGNUP" ) >/dev/null 2>&1 && restored=1
     else
-      ( cd "$REPO/packages/backend" && bunx convex env remove FILETHING_ALLOW_SIGNUP ) >/dev/null 2>&1
+      ( cd "$REPO/packages/backend" && bunx convex env remove FILETHING_ALLOW_SIGNUP ) >/dev/null 2>&1 && restored=1
+    fi
+    # Releer confirma el cierre, pero un `env get` de una variable ausente ya
+    # devuelve vacío: solo escalamos si podemos LEER un valor distinto del
+    # original. Quien manda es el código de salida del propio restore.
+    now="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
+    if [ "$restored" -ne 1 ] || { [ -n "$now" ] && [ "$now" != "$ORIG_ALLOW_SIGNUP" ]; }; then
+      echo >&2
+      echo "!!! ATENCIÓN: no pude devolver FILETHING_ALLOW_SIGNUP a '${ORIG_ALLOW_SIGNUP:-<sin definir>}'" >&2
+      echo "!!! (ahora lee '${now:-<vacío>}'). El SIGNUP PÚBLICO puede seguir ABIERTO." >&2
+      echo "!!! Ciérralo A MANO ya:" >&2
+      echo "!!!   cd packages/backend && bunx convex env remove FILETHING_ALLOW_SIGNUP" >&2
+      command rm -rf "${WORK:?}"
+      exit 1
     fi
   fi
-  command rm -rf "$WORK"
+  command rm -rf "${WORK:?}"
 }
+# Un handler de señal que solo limpia y RETORNA dejaría al script seguir donde
+# iba, así que los de señal salen; el de EXIT cubre el camino normal y `set -e`.
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 # Dos Devices = dos FILETHING_HOME distintos sobre el mismo binario. Los Devices
 # corren SIN S3_* (env -u): igual que un usuario final, el plano de datos va por
@@ -63,14 +97,39 @@ set +a
 : "${CONVEX_DEPLOY_KEY:?falta CONVEX_DEPLOY_KEY en $ENV_FILE (hace falta para abrir/cerrar signup)}"
 export CONVEX_DEPLOY_KEY
 
+# Una deploy key `prod:` apunta al deployment de PRODUCCIÓN, y este script no es
+# read-only sobre él: abre el signup público y crea una cuenta. Eso no puede
+# pasar por descuido (un `scripts/cloud-smoke.sh` a ciegas), así que exige un
+# consentimiento explícito. Contra un deployment de dev/preview corre sin más.
+if [[ "$CONVEX_DEPLOY_KEY" == prod:* && "${FILETHING_SMOKE_ALLOW_PROD:-}" != "1" ]]; then
+  cat >&2 <<'EOF'
+ERROR: CONVEX_DEPLOY_KEY apunta a un deployment de PRODUCCIÓN.
+
+Este smoke NO es read-only sobre el deployment: abre el signup público
+(FILETHING_ALLOW_SIGNUP=1) mientras corre y crea una cuenta real. Contra
+producción eso es un cambio de seguridad temporal en un sistema vivo.
+
+Opciones:
+  1) (recomendado) córrelo contra un deployment de dev/preview: genera una
+     deploy key de ese deployment y ponla en infra/.env.cloud.
+  2) si de verdad quieres tocar producción, hazlo explícito:
+       FILETHING_SMOKE_ALLOW_PROD=1 scripts/cloud-smoke.sh
+     y confirma después que el signup quedó cerrado:
+       cd packages/backend && bunx convex env get FILETHING_ALLOW_SIGNUP
+EOF
+  exit 1
+fi
+
 hr "PRECHEQUEO — habilitando signup temporalmente (FILETHING_ALLOW_SIGNUP)"
 ORIG_ALLOW_SIGNUP="$(cd "$REPO/packages/backend" && bunx convex env get FILETHING_ALLOW_SIGNUP 2>/dev/null || true)"
+# El flag se arma ANTES de mutar: un `env set` que falla a medias (o que aplica y
+# devuelve != 0) dejaba el signup abierto sin que el trap lo supiera.
+ALLOW_SIGNUP_TOUCHED=1
 if ! ( cd "$REPO/packages/backend" && bunx convex env set FILETHING_ALLOW_SIGNUP 1 ); then
   echo "ERROR: no se pudo fijar FILETHING_ALLOW_SIGNUP=1 en el deployment (revisa CONVEX_DEPLOY_KEY)." >&2
   exit 1
 fi
-ALLOW_SIGNUP_TOUCHED=1
-ok "signup habilitado para esta corrida (se revierte al terminar)"
+ok "signup habilitado para esta corrida (se revierte al terminar, incluso con Ctrl-C)"
 
 hr "BUILD — binario release (target/release/filething)"
 ( cd "$REPO" && cargo build --release -p filething )

@@ -23,7 +23,11 @@
 #   g05 blob binario 3MB          g13 sync one-shot al día
 #   g06 borrados bidireccionales  g14 roots idénticos + status sin "behind"
 #   g07 subdirs + rename + bit x       (fix de 464496c)
-set -u
+# `pipefail` para que un `ssh` que falla no quede tapado por el `grep`/`wc` de la
+# derecha del pipe. Sin `-e` a propósito: cada gate reporta su propio PASS/FAIL y
+# los fallos fatales van por `die`; con `-e` el primer predicado falso mataría la
+# corrida en vez de dejar el resumen.
+set -uo pipefail
 
 # Este runbook corre `daemon`/`sync` a mano bajo control del script; no debe
 # instalar ningún servicio de daemon en la Mac ni en el VPS (Fase 6).
@@ -34,7 +38,9 @@ RUN_DIR=$HOME/ft-e2e-$TS
 mkdir -p "$RUN_DIR"
 LOG=$RUN_DIR/runbook.log
 
-BIN=/Users/jrizo/filething/target/release/filething
+# Raíz del repo relativa a este script (era una ruta absoluta de una sola Mac).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$REPO/target/release/filething"
 MAC_SPACE=$HOME/space-demo
 E2E=e2e-$TS                       # subdir de prueba dentro del Space
 VPS=vpsjr
@@ -131,7 +137,7 @@ $SSH "test -d ~/space-demo" || die "no existe ~/space-demo en el VPS"
 # cero daemons zombis antes de empezar
 pkill -INT -f "filething daemon" 2>/dev/null && sleep 1 || true
 $SSH "pkill -INT -f 'filething daemon' && sleep 1" 2>/dev/null || true
-say "  binario Mac: $("$BIN" --version)   commit: $(cd /Users/jrizo/filething && git log -1 --format=%h)"
+say "  binario Mac: $("$BIN" --version)   commit: $(cd "$REPO" && git log -1 --format=%h)"
 say "  binario VPS: $($SSH "~/repos/filething/target/debug/filething --version")   commit: $($SSH 'cd ~/repos/filething && git log -1 --format=%h')"
 
 start_vps_daemon

@@ -30,8 +30,16 @@
 //!   [`convex::ConvexClient`] with those argument maps and interpret the
 //!   [`FunctionResult`]. The conflict path of the commit CAS (`§7`) is surfaced
 //!   as a distinguishable [`CommitError::Conflict`].
+//!
+//! Two properties of the transport layer are load-bearing rather than incidental:
+//! every call carries a deadline ([`DEFAULT_CALL_TIMEOUT`], see [`with_deadline`])
+//! because the underlying client would otherwise retry a dead socket forever, and
+//! [`Coordinator::list_revisions_from`] pages a long Revision chain because the GC
+//! mark set it feeds must be COMPLETE or an error (`§6.3`, `docs/adr/0007`).
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::time::Duration;
 
 use convex::{ConvexClient, ConvexError, FunctionResult, Value};
 use ft_core::{Cid, Pcid};
@@ -92,6 +100,60 @@ pub enum CoordinatorError {
     Conflict {
         /// The raw backend message (carries the Convex Request ID in prod).
         message: String,
+    },
+
+    /// The Coordinator refused the arguments as malformed. Backend codes
+    /// `bad_request` / `bad_key` / `bad_manifest_root_cid` / `bad_meta_blob_cid`
+    /// / `bad_space_key`. DETERMINISTIC — the same call fails identically on
+    /// every retry, so callers must NOT back off and repeat it; it means this
+    /// client (or the value it was handed) is wrong.
+    #[error("coordinator rejected the request ({code}): {message}")]
+    BadRequest {
+        /// The backend `data.code`, kept verbatim so a new code still lands here
+        /// with its identity intact.
+        code: String,
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// The Revision chain past the requested `minSeq` is longer than one
+    /// `revisions:listFromSeq` answer may carry. Backend code
+    /// `too_many_revisions`. [`Coordinator::list_revisions_from`] handles this by
+    /// paging, so reaching a caller means even a windowed walk hit it — the set
+    /// is INCOMPLETE and a GC mark phase must refuse to sweep (`§6.3`,
+    /// `docs/adr/0007`).
+    #[error("too many revisions in one window: {message}")]
+    TooManyRevisions {
+        /// The raw backend message (carries the limit and the window bounds).
+        message: String,
+    },
+
+    /// The Space already has an escrow `space_key`, so `spaces:ensureSpaceKey`
+    /// declined to overwrite it. Backend code `space_key_already_set`. Benign for
+    /// an idempotent back-fill: the key that is already there is the right one.
+    #[error("space key already set: {message}")]
+    SpaceKeyAlreadySet {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// The Space head points at a Revision that does not exist — a Coordinator
+    /// data-integrity fault, not a client error. Backend code `dangling_head`.
+    #[error("space head points at a missing revision: {message}")]
+    DanglingHead {
+        /// The raw backend message (carries the Convex Request ID in prod).
+        message: String,
+    },
+
+    /// One Coordinator round trip exceeded [`DEFAULT_CALL_TIMEOUT`] (or the
+    /// override set by [`Coordinator::with_call_timeout`]). See
+    /// [`with_deadline`] for why this crate imposes a deadline at all.
+    #[error("coordinator did not answer {function} within {timeout:?}")]
+    Timeout {
+        /// The contract function that was called (e.g. `revisions:commit`).
+        function: &'static str,
+        /// The deadline that elapsed.
+        timeout: Duration,
     },
 
     /// A Convex function returned an application error (a thrown `Error` or a
@@ -536,8 +598,45 @@ mod func {
 
 /// Marker the backend's `revisions:commit` mutation uses to flag a CAS conflict
 /// in a machine-distinguishable way: a thrown `ConvexError` whose `data` object
-/// carries `{ "code": "conflict" }`, and/or this substring in the message.
+/// carries `{ "code": "conflict" }`.
 const CONFLICT_CODE: &str = "conflict";
+
+/// Codes that mean "the arguments were malformed" → [`CoordinatorError::BadRequest`].
+/// All deterministic: a retry sends the same bad value and fails the same way.
+const BAD_REQUEST_CODES: &[&str] = &[
+    "bad_request",
+    "bad_key",
+    "bad_manifest_root_cid",
+    "bad_meta_blob_cid",
+    "bad_space_key",
+];
+
+/// Every `data.code` the backend can throw EXCEPT [`CONFLICT_CODE`]
+/// (`packages/backend/convex/*.ts`). Two jobs: it documents the contract in one
+/// place, and it keeps the legacy message fallback in
+/// [`message_suggests_conflict`] from reading a typed, deterministic failure as a
+/// retryable CAS race. The backend deliberately keeps `"conflict"` out of every
+/// other code for the same reason — `codes_other_than_conflict_never_contain_the_word`
+/// locks that in from this side.
+const NON_CONFLICT_CODES: &[&str] = &[
+    "space_not_found",
+    "device_not_found",
+    "forbidden",
+    "unauthenticated",
+    "no_account",
+    "vault_unavailable",
+    "storage_unconfigured",
+    "too_many_revisions",
+    "space_key_already_set",
+    "dangling_head",
+    "bad_request",
+    "bad_key",
+    "bad_manifest_root_cid",
+    "bad_meta_blob_cid",
+    "bad_space_key",
+    "bad_dedup_secret",
+    "dedup_secret_required",
+];
 
 // ---------------------------------------------------------------------------
 // Argument builders (pure)
@@ -614,12 +713,26 @@ fn set_base_seq_args(device_id: &DeviceId, base_seq_in_use: u64) -> BTreeMap<Str
     ])
 }
 
-fn list_from_seq_args(space_id: &SpaceId, min_seq: u64) -> BTreeMap<String, Value> {
-    obj([
+/// Args for `revisions:listFromSeq`. `max_seq` is the INCLUSIVE upper bound of a
+/// window; `None` asks for the whole tail. The key is OMITTED when `None` (the
+/// backend validator is `v.optional(v.number())`, and Convex rejects an
+/// unexpected `null` as hard as an unexpected field) — which is also what keeps
+/// the unwindowed call wire-identical to what a deployment predating `maxSeq`
+/// accepts.
+fn list_from_seq_args(
+    space_id: &SpaceId,
+    min_seq: u64,
+    max_seq: Option<u64>,
+) -> BTreeMap<String, Value> {
+    let mut args = obj([
         ("spaceId", space_id.to_value()),
         // `v.number()` on the backend → Convex float64 (see `revision_by_seq_args`).
         ("minSeq", Value::Float64(min_seq as f64)),
-    ])
+    ]);
+    if let Some(max) = max_seq {
+        args.insert("maxSeq".to_string(), Value::Float64(max as f64));
+    }
+    args
 }
 
 fn refresh_retention_floor_args(space_id: &SpaceId) -> BTreeMap<String, Value> {
@@ -778,6 +891,75 @@ fn parse_revision_roots(v: &Value) -> Result<Vec<RevisionRoot>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Revision paging (pure) — §6.3 mark set
+// ---------------------------------------------------------------------------
+
+/// Width of one `revisions:listFromSeq` window when the chain is too long for a
+/// single answer. Comfortably under the backend's own `MAX_REVISIONS_PER_CALL`
+/// (4096, `packages/backend/convex/revisions.ts`) so a window can never be the
+/// thing that trips the limit.
+const REVISION_PAGE: u64 = 1024;
+
+/// A window at or above the backend's limit could itself be the thing that trips
+/// it, and a window of 0 would make the walk stand still — both are compile-time
+/// mistakes, so they are caught at compile time.
+const _: () = assert!(REVISION_PAGE >= 1 && REVISION_PAGE < 4096);
+
+/// The next `[start, end]` (inclusive) window of a paged walk up to `head_seq`,
+/// or `None` once `start` is past the head. Pure and saturating so the arithmetic
+/// is unit-testable and cannot wrap — the release profile traps on overflow, and
+/// a wrapped bound would re-request a window the walk already visited.
+fn next_window(start: u64, head_seq: u64, page: u64) -> Option<(u64, u64)> {
+    if start > head_seq {
+        return None;
+    }
+    let end = start.saturating_add(page.saturating_sub(1)).min(head_seq);
+    Some((start, end))
+}
+
+/// Appends one window's rows to the accumulating mark set, enforcing what the GC
+/// depends on: every row inside the window that was asked for, and `seq` STRICTLY
+/// increasing across the whole concatenation (no duplicate, nothing out of
+/// order). A violated invariant is an error, never a quietly-accepted set — a
+/// mark set that is short by one Revision makes the sweep delete live data
+/// (`§6.3`, `docs/adr/0007`).
+fn push_window(
+    out: &mut Vec<RevisionRoot>,
+    window: Vec<RevisionRoot>,
+    min_seq: u64,
+    max_seq: Option<u64>,
+) -> Result<()> {
+    for root in window {
+        if root.seq < min_seq || max_seq.is_some_and(|max| root.seq > max) {
+            return Err(CoordinatorError::UnexpectedValue {
+                field: "seq",
+                context: func::REVISIONS_LIST_FROM_SEQ,
+                detail: format!(
+                    "revision seq {} outside the requested window [{min_seq}, {}]",
+                    root.seq,
+                    max_seq.map_or_else(|| "unbounded".to_string(), |max| max.to_string()),
+                ),
+            });
+        }
+        if let Some(prev) = out.last() {
+            if root.seq <= prev.seq {
+                return Err(CoordinatorError::UnexpectedValue {
+                    field: "seq",
+                    context: func::REVISIONS_LIST_FROM_SEQ,
+                    detail: format!(
+                        "revision seq {} is not above the previous {}; the chain must be \
+                         strictly ascending",
+                        root.seq, prev.seq
+                    ),
+                });
+            }
+        }
+        out.push(root);
+    }
+    Ok(())
+}
+
 fn parse_retention_floor(v: &Value) -> Result<RetentionFloor> {
     const CTX: &str = func::SPACES_REFRESH_RETENTION_FLOOR;
     let o = wire::as_object(v, CTX)?;
@@ -825,13 +1007,21 @@ fn classify_convex_error(e: &ConvexError) -> CoordinatorError {
         Some("unauthenticated") | Some("no_account") => {
             CoordinatorError::NotAuthenticated { message }
         }
-        // NOTE: `bad_key`/`bad_request` (malformed Vault requests — client
-        // bugs, not outages) deliberately fall through to `Function`: the
-        // "retry in a few seconds" advice would mislead for a deterministic
-        // failure.
         Some("vault_unavailable") | Some("storage_unconfigured") => {
             CoordinatorError::VaultUnavailable { message }
         }
+        Some("too_many_revisions") => CoordinatorError::TooManyRevisions { message },
+        Some("space_key_already_set") => CoordinatorError::SpaceKeyAlreadySet { message },
+        Some("dangling_head") => CoordinatorError::DanglingHead { message },
+        // Malformed arguments (`bad_key`, `bad_manifest_root_cid`, …) get their
+        // own variant rather than the `Function` fallback so a caller can tell a
+        // DETERMINISTIC rejection from a transient outage: `VaultUnavailable`'s
+        // "retry in a few seconds" advice would mislead, and a retry loop that
+        // cannot tell them apart repeats the same bad call forever.
+        Some(c) if BAD_REQUEST_CODES.contains(&c) => CoordinatorError::BadRequest {
+            code: c.to_string(),
+            message,
+        },
         _ => CoordinatorError::Function(message),
     }
 }
@@ -847,19 +1037,64 @@ fn unwrap_value(result: FunctionResult) -> Result<Value> {
     }
 }
 
-/// True if a [`FunctionResult`] is the recognized commit-conflict signal: a
-/// `ConvexError` classified as [`CoordinatorError::Conflict`] (the preferred,
-/// machine-stable `data.code == "conflict"` path), or any error whose message
-/// contains `"conflict"` (fallback for a backend that only set the message).
+/// True if a [`FunctionResult`] is the recognized commit-conflict signal.
+///
+/// The structured `data.code` DECIDES whenever the backend sent one: a code that
+/// is not [`CONFLICT_CODE`] is a different failure, whatever its message says.
+/// The message is only consulted when there is no code at all, because
+/// `CommitError::Conflict` is the one commit failure `ft-engine` answers by
+/// pulling and retrying (`§7` step 6) — reading a deterministic failure as a CAS
+/// race turns it into a retry that can never succeed.
 fn is_conflict(result: &FunctionResult) -> bool {
     match result {
-        FunctionResult::ConvexError(e) => {
-            matches!(classify_convex_error(e), CoordinatorError::Conflict { .. })
-                || e.message.to_ascii_lowercase().contains(CONFLICT_CODE)
-        }
-        FunctionResult::ErrorMessage(msg) => msg.to_ascii_lowercase().contains(CONFLICT_CODE),
+        FunctionResult::ConvexError(e) => match convex_error_code(e) {
+            Some(code) => code.eq_ignore_ascii_case(CONFLICT_CODE),
+            None => message_suggests_conflict(&e.message),
+        },
+        FunctionResult::ErrorMessage(msg) => message_suggests_conflict(msg),
         FunctionResult::Value(_) => false,
     }
+}
+
+/// The legacy, message-only conflict test: kept so a deployment predating the
+/// typed `data.code` (or a `ConvexError` Convex redacted to a bare message) still
+/// reconciles instead of failing the commit outright. Deliberately narrow — it
+/// runs only when no code is present, only on the commit path
+/// ([`interpret_commit`] is its single caller), and never on a message that
+/// carries one of the typed [`NON_CONFLICT_CODES`], so a newer backend's
+/// deterministic error can never fall into it.
+fn message_suggests_conflict(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if NON_CONFLICT_CODES.iter().any(|code| lower.contains(code)) {
+        return false;
+    }
+    lower.contains(CONFLICT_CODE)
+}
+
+/// Deadline for ONE Coordinator round trip. Generous on purpose: it must outlast
+/// a full detect-and-reconnect cycle of the underlying [`convex`] client (30 s
+/// server-inactivity threshold + its 15 s max reconnect backoff) so a transient
+/// hiccup still completes, while still ending a call that never will.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds one round trip, mapping the elapsed deadline to
+/// [`CoordinatorError::Timeout`].
+///
+/// The wrapper exists because [`convex::ConvexClient`] has no deadline of its
+/// own: an outstanding query/mutation is RE-SENT on every reconnect
+/// (`resend_ongoing_queries_mutations`), and the socket worker reconnects
+/// forever. Against a Coordinator that accepts the connection and then stops
+/// answering, the future therefore never resolves — a one-shot CLI command looks
+/// wedged with no output, and the daemon's sync loop stops for good. Connecting
+/// is bounded by the caller (`apps/cli`); everything after it is bounded here.
+async fn with_deadline<F: Future>(
+    timeout: Duration,
+    function: &'static str,
+    fut: F,
+) -> Result<F::Output> {
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| CoordinatorError::Timeout { function, timeout })
 }
 
 /// Interprets the commit mutation result: success → [`CommitOk`]; conflict →
@@ -882,6 +1117,8 @@ fn interpret_commit(result: FunctionResult) -> std::result::Result<CommitOk, Com
 #[derive(Clone)]
 pub struct Coordinator {
     client: ConvexClient,
+    /// Per-call deadline — see [`with_deadline`] and [`DEFAULT_CALL_TIMEOUT`].
+    call_timeout: Duration,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -897,29 +1134,52 @@ impl Coordinator {
         let client = ConvexClient::new(deployment_url)
             .await
             .map_err(|e| CoordinatorError::Transport(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self::from_client(client))
     }
 
     /// Wraps an already-built [`convex::ConvexClient`] (e.g. one configured by a
     /// [`convex::ConvexClientBuilder`]).
     pub fn from_client(client: ConvexClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        }
     }
 
-    async fn call_mutation(&mut self, name: &str, args: BTreeMap<String, Value>) -> Result<Value> {
-        let result = self
-            .client
-            .mutation(name, args)
-            .await
+    /// Overrides the per-call deadline ([`DEFAULT_CALL_TIMEOUT`]) for every call
+    /// this [`Coordinator`] makes. A long-running daemon wants the default; a
+    /// one-shot command that would rather fail fast can shorten it.
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// The per-call deadline in force.
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+
+    async fn call_mutation(
+        &mut self,
+        name: &'static str,
+        args: BTreeMap<String, Value>,
+    ) -> Result<Value> {
+        // Read before the mutable borrow of `self.client` below.
+        let timeout = self.call_timeout;
+        let result = with_deadline(timeout, name, self.client.mutation(name, args))
+            .await?
             .map_err(|e| CoordinatorError::Transport(e.to_string()))?;
         unwrap_value(result)
     }
 
-    async fn call_query(&mut self, name: &str, args: BTreeMap<String, Value>) -> Result<Value> {
-        let result = self
-            .client
-            .query(name, args)
-            .await
+    async fn call_query(
+        &mut self,
+        name: &'static str,
+        args: BTreeMap<String, Value>,
+    ) -> Result<Value> {
+        let timeout = self.call_timeout;
+        let result = with_deadline(timeout, name, self.client.query(name, args))
+            .await?
             .map_err(|e| CoordinatorError::Transport(e.to_string()))?;
         unwrap_value(result)
     }
@@ -998,14 +1258,22 @@ impl Coordinator {
         manifest_root: &Cid,
         author_device_id: &DeviceId,
     ) -> std::result::Result<CommitOk, CommitError> {
-        let result = self
-            .client
-            .mutation(
+        let timeout = self.call_timeout;
+        // A commit that times out MAY still have landed (the mutation is a
+        // serializable txn on the server). That is safe to retry: the retry's CAS
+        // sees the advanced head and comes back as a conflict, which `§7` step 6
+        // already reconciles. Hanging forever is the only outcome with no recovery.
+        let result = with_deadline(
+            timeout,
+            func::REVISIONS_COMMIT,
+            self.client.mutation(
                 func::REVISIONS_COMMIT,
                 commit_args(space_id, expected_base, manifest_root, author_device_id),
-            )
-            .await
-            .map_err(|e| CommitError::Other(CoordinatorError::Transport(e.to_string())))?;
+            ),
+        )
+        .await
+        .map_err(CommitError::Other)?
+        .map_err(|e| CommitError::Other(CoordinatorError::Transport(e.to_string())))?;
         interpret_commit(result)
     }
 
@@ -1017,20 +1285,115 @@ impl Coordinator {
         parse_revision(&v)
     }
 
-    /// `revisions:listFromSeq` — every Revision root at or above `min_seq` (the
-    /// GC's retained set, `§6.3`). Returns id + seq + Manifest root per Revision.
+    /// `revisions:listFromSeq` — EVERY Revision root at or above `min_seq` (the
+    /// GC's retained set, `§6.3`). Returns id + seq + Manifest root per Revision,
+    /// ordered by ascending seq.
+    ///
+    /// Complete or `Err`, never partial: this is the mark phase of a destructive
+    /// sweep, so a set that is short by one Revision makes the sweep delete live
+    /// data (`docs/adr/0007`). The backend refuses to answer more than 4096
+    /// Revisions in one call (`too_many_revisions`) rather than truncate, so a
+    /// chain that long is walked here in `REVISION_PAGE`-wide windows and
+    /// concatenated, with every window checked for gaps, duplicates and order.
+    ///
+    /// The common case is ONE unwindowed call, wire-identical to what this client
+    /// has always sent. That is also what keeps `maxSeq` safe to use: Convex
+    /// rejects an argument its validator does not declare, but only a backend that
+    /// HAS `maxSeq` can answer `too_many_revisions` in the first place — so the
+    /// windowed walk never runs against a deployment that predates it.
     pub async fn list_revisions_from(
         &mut self,
         space_id: &SpaceId,
         min_seq: u64,
     ) -> Result<Vec<RevisionRoot>> {
+        match self.list_revision_window(space_id, min_seq, None).await {
+            Ok(roots) => {
+                // Even the single-call answer is checked: the invariants below are
+                // what make the set usable as a mark set at all.
+                let mut out = Vec::with_capacity(roots.len());
+                push_window(&mut out, roots, min_seq, None)?;
+                Ok(out)
+            }
+            Err(CoordinatorError::TooManyRevisions { .. }) => {
+                self.page_revisions_from(space_id, min_seq).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One window of `revisions:listFromSeq` (`max_seq` inclusive, `None` = the
+    /// whole tail).
+    async fn list_revision_window(
+        &mut self,
+        space_id: &SpaceId,
+        min_seq: u64,
+        max_seq: Option<u64>,
+    ) -> Result<Vec<RevisionRoot>> {
         let v = self
             .call_query(
                 func::REVISIONS_LIST_FROM_SEQ,
-                list_from_seq_args(space_id, min_seq),
+                list_from_seq_args(space_id, min_seq, max_seq),
             )
             .await?;
         parse_revision_roots(&v)
+    }
+
+    /// The windowed walk behind [`Self::list_revisions_from`], for a chain the
+    /// server refuses to hand over in one answer.
+    async fn page_revisions_from(
+        &mut self,
+        space_id: &SpaceId,
+        min_seq: u64,
+    ) -> Result<Vec<RevisionRoot>> {
+        // The head seq bounds the walk: `commit` assigns `seq = head.seq + 1`
+        // inside the CAS txn (`§7`), so no Revision can sit above the head at the
+        // instant this query reads it.
+        let head = self.head(space_id).await?;
+        let head_seq = match (&head.head_revision_id, head.seq) {
+            (Some(_), Some(seq)) => seq,
+            // The backend's defensive dangling-head answer: a head pointer whose
+            // Revision is unreadable leaves the walk with no upper bound, so there
+            // is no way to know the set is complete. Refuse loudly.
+            (Some(id), None) => {
+                return Err(CoordinatorError::DanglingHead {
+                    message: format!(
+                        "space head {id} has no readable seq, so the Revision chain cannot be \
+                         paged completely"
+                    ),
+                })
+            }
+            // The unwindowed call reported >4096 Revisions and the head says the
+            // Space has none: the two answers cannot both be true.
+            (None, _) => {
+                return Err(CoordinatorError::UnexpectedValue {
+                    field: "headRevisionId",
+                    context: func::SPACES_HEAD,
+                    detail: "space reports no head yet listFromSeq reported too many Revisions"
+                        .to_string(),
+                })
+            }
+        };
+
+        let mut out: Vec<RevisionRoot> = Vec::new();
+        let mut next = Some(min_seq);
+        while let Some((lo, hi)) =
+            next.and_then(|start| next_window(start, head_seq, REVISION_PAGE))
+        {
+            let window = self.list_revision_window(space_id, lo, Some(hi)).await?;
+            push_window(&mut out, window, lo, Some(hi))?;
+            next = hi.checked_add(1);
+        }
+
+        // A commit that landed WHILE the walk ran got a seq above `head_seq` (seq
+        // only ever grows), so one unbounded tail call makes the union complete as
+        // of its own snapshot — the same guarantee the single-call path gives.
+        if let Some(after_head) = head_seq.checked_add(1) {
+            let tail = self
+                .list_revision_window(space_id, after_head, None)
+                .await?;
+            push_window(&mut out, tail, after_head, None)?;
+        }
+        Ok(out)
     }
 
     // ----- devices -----
@@ -1060,20 +1423,40 @@ impl Coordinator {
 
     // ----- change feed (§8) -----
 
+    /// `spaces:head` as a ONE-SHOT query: the same document
+    /// [`Self::subscribe_head`] streams, read once. Used by
+    /// [`Self::list_revisions_from`] to learn the head seq that bounds a paged
+    /// walk, and by any caller that wants the head without holding a subscription.
+    pub async fn head(&mut self, space_id: &SpaceId) -> Result<HeadUpdate> {
+        let v = self
+            .call_query(func::SPACES_HEAD, head_args(space_id))
+            .await?;
+        parse_head_update(&v)
+    }
+
     /// `spaces:head` — subscribe to the reactive Space-head query and yield a
     /// [`HeadUpdate`] every time it changes. The change feed of `§8`.
     ///
     /// The returned [`Stream`] yields `Result<HeadUpdate>`: a parse failure on
     /// one pushed value is surfaced as an `Err` item without ending the stream.
+    ///
+    /// Only REGISTERING the subscription is deadlined (the `convex` client answers
+    /// that from its own worker, but a worker stuck mid-reconnect would otherwise
+    /// stall it). The stream itself is not: a change feed is idle by design between
+    /// head moves, so a deadline on the next item would be a bug, not a guard.
     pub async fn subscribe_head(
         &mut self,
         space_id: &SpaceId,
     ) -> Result<impl Stream<Item = Result<HeadUpdate>>> {
-        let sub = self
-            .client
-            .subscribe(func::SPACES_HEAD, head_args(space_id))
-            .await
-            .map_err(|e| CoordinatorError::Transport(e.to_string()))?;
+        let timeout = self.call_timeout;
+        let sub = with_deadline(
+            timeout,
+            func::SPACES_HEAD,
+            self.client
+                .subscribe(func::SPACES_HEAD, head_args(space_id)),
+        )
+        .await?
+        .map_err(|e| CoordinatorError::Transport(e.to_string()))?;
         Ok(sub.map(|result| {
             let value = unwrap_value(result)?;
             parse_head_update(&value)
@@ -1243,11 +1626,30 @@ mod tests {
     #[test]
     fn list_from_seq_args_send_float64_min_seq() {
         // `minSeq` is `v.number()` on the backend → Float64, not Int64.
-        let args = list_from_seq_args(&SpaceId::new("sp_1"), 7);
+        let args = list_from_seq_args(&SpaceId::new("sp_1"), 7, None);
         let keys: Vec<_> = args.keys().cloned().collect();
         assert_eq!(keys, vec!["minSeq", "spaceId"]);
         assert_eq!(args["spaceId"], Value::String("sp_1".into()));
         assert_eq!(args["minSeq"], Value::Float64(7.0));
+    }
+
+    #[test]
+    fn list_from_seq_args_omit_max_seq_entirely_when_the_window_is_unbounded() {
+        // `maxSeq` is `v.optional(v.number())`: omitted means "the whole tail".
+        // Sending an explicit null would be REJECTED by the validator, and the
+        // omitted form is also the exact request a deployment predating `maxSeq`
+        // accepts — which is what keeps the unwindowed path compatible.
+        let args = list_from_seq_args(&SpaceId::new("sp_1"), 0, None);
+        assert!(!args.contains_key("maxSeq"));
+    }
+
+    #[test]
+    fn list_from_seq_args_send_the_window_upper_bound_as_float64() {
+        let args = list_from_seq_args(&SpaceId::new("sp_1"), 1024, Some(2047));
+        let keys: Vec<_> = args.keys().cloned().collect();
+        assert_eq!(keys, vec!["maxSeq", "minSeq", "spaceId"]);
+        assert_eq!(args["minSeq"], Value::Float64(1024.0));
+        assert_eq!(args["maxSeq"], Value::Float64(2047.0));
     }
 
     #[test]
@@ -1277,6 +1679,98 @@ mod tests {
         assert_eq!(roots[0].manifest_root_cid, cid(2));
         assert_eq!(roots[1].seq, 3);
         assert_eq!(roots[1].manifest_root_cid, cid(3));
+    }
+
+    // ----- Revision paging (§6.3 mark set) -----
+
+    fn root(seq: u64) -> RevisionRoot {
+        RevisionRoot {
+            revision_id: RevisionId::new(format!("rev_{seq}")),
+            seq,
+            manifest_root_cid: cid(seq as u8),
+        }
+    }
+
+    /// The windows a paged walk visits, driven exactly as `page_revisions_from`
+    /// drives it.
+    fn walk(min_seq: u64, head_seq: u64, page: u64) -> Vec<(u64, u64)> {
+        let mut windows = Vec::new();
+        let mut next = Some(min_seq);
+        while let Some((lo, hi)) = next.and_then(|start| next_window(start, head_seq, page)) {
+            windows.push((lo, hi));
+            next = hi.checked_add(1);
+        }
+        windows
+    }
+
+    #[test]
+    fn paged_windows_cover_the_whole_range_without_a_gap_or_an_overlap() {
+        assert_eq!(walk(5, 12, 4), vec![(5, 8), (9, 12)]);
+        // Exactly one full window.
+        assert_eq!(walk(0, 3, 4), vec![(0, 3)]);
+        // A single Revision.
+        assert_eq!(walk(7, 7, 4), vec![(7, 7)]);
+        // Nothing at or above min_seq → no call at all.
+        assert!(walk(9, 8, 4).is_empty());
+    }
+
+    #[test]
+    fn paged_windows_clamp_the_last_window_to_the_head_seq() {
+        // The tail window must not ask beyond the head: `maxSeq` past the head is
+        // harmless server-side but makes the client's own window check useless.
+        assert_eq!(walk(0, 5, 4), vec![(0, 3), (4, 5)]);
+    }
+
+    #[test]
+    fn paged_windows_saturate_instead_of_wrapping_at_the_top_of_u64() {
+        // Release builds now trap on overflow, and a WRAPPED bound would send the
+        // walk back over a window it already visited.
+        assert_eq!(
+            walk(u64::MAX - 1, u64::MAX, 1024),
+            vec![(u64::MAX - 1, u64::MAX)]
+        );
+    }
+
+    #[test]
+    fn push_window_concatenates_ascending_windows_in_order() {
+        let mut out = Vec::new();
+        push_window(&mut out, vec![root(0), root(1)], 0, Some(1)).unwrap();
+        push_window(&mut out, vec![root(2), root(3)], 2, Some(3)).unwrap();
+        push_window(&mut out, vec![root(4)], 4, None).unwrap();
+        assert_eq!(
+            out.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn push_window_rejects_a_row_outside_the_requested_window() {
+        // A row above `maxSeq` (or below `minSeq`) means the window bounds were
+        // not honoured, so the walk's "no gap, no overlap" reasoning no longer
+        // holds and the set cannot be trusted as a mark set.
+        let mut out = Vec::new();
+        match push_window(&mut out, vec![root(2), root(9)], 0, Some(3)) {
+            Err(CoordinatorError::UnexpectedValue { field, detail, .. }) => {
+                assert_eq!(field, "seq");
+                assert!(detail.contains('9'), "detail names the offending seq");
+            }
+            other => panic!("expected UnexpectedValue, got {other:?}"),
+        }
+        let mut out2 = Vec::new();
+        assert!(push_window(&mut out2, vec![root(1)], 4, Some(8)).is_err());
+    }
+
+    #[test]
+    fn push_window_rejects_a_duplicate_or_out_of_order_seq() {
+        // A duplicated Revision means the windows overlapped; a descending seq
+        // means the chain came back unordered. Either way the count the GC reports
+        // and the completeness it assumes are wrong — fail loudly.
+        let mut out = Vec::new();
+        push_window(&mut out, vec![root(0), root(1)], 0, Some(1)).unwrap();
+        assert!(push_window(&mut out, vec![root(1)], 1, Some(2)).is_err());
+
+        let mut out2 = Vec::new();
+        assert!(push_window(&mut out2, vec![root(5), root(4)], 0, Some(9)).is_err());
     }
 
     #[test]
@@ -1536,9 +2030,63 @@ mod tests {
 
     #[test]
     fn conflict_detected_from_message_substring() {
+        // Legacy fallback: a deployment predating the typed `data.code` only set a
+        // message, and such a commit must still reconcile instead of failing.
         let r = FunctionResult::ErrorMessage("Conflict: base != head".into());
         assert!(is_conflict(&r));
         assert!(matches!(interpret_commit(r), Err(CommitError::Conflict)));
+    }
+
+    #[test]
+    fn a_typed_non_conflict_code_is_never_a_cas_conflict_whatever_its_message_says() {
+        // `CommitError::Conflict` is the ONE commit failure ft-engine answers by
+        // pulling and retrying (§7 step 6), so a deterministic failure classified
+        // as a CAS race becomes a retry that can never succeed. When the backend
+        // sent a structured code, that code decides — the message is not read.
+        let e = convex_err(
+            "bad_manifest_root_cid",
+            "manifestRootCid must be exactly 32 bytes; it conflicts with the stored root",
+        );
+        assert!(!is_conflict(&FunctionResult::ConvexError(e.clone())));
+        match interpret_commit(FunctionResult::ConvexError(e)) {
+            Err(CommitError::Other(CoordinatorError::BadRequest { code, .. })) => {
+                assert_eq!(code, "bad_manifest_root_cid");
+            }
+            other => panic!("expected Other(BadRequest), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_legacy_message_fallback_ignores_a_message_carrying_a_typed_code() {
+        // Belt to the braces above: even with no structured `data` at all, a
+        // message that names one of the typed codes is that typed failure, not a
+        // CAS race — so the fallback must not fire on it.
+        for code in NON_CONFLICT_CODES {
+            let msg = format!("Uncaught ConvexError: {code} (conflict while validating)");
+            assert!(
+                !message_suggests_conflict(&msg),
+                "{code} must not be read as a CAS conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn codes_other_than_conflict_never_contain_the_word_conflict() {
+        // The backend keeps "conflict" out of every other code on purpose, because
+        // this client's legacy fallback matches that substring. Locked in from this
+        // side so a new backend code cannot quietly reintroduce the ambiguity.
+        for code in NON_CONFLICT_CODES {
+            assert!(
+                !code.contains(CONFLICT_CODE),
+                "backend code {code} must not contain {CONFLICT_CODE:?}"
+            );
+        }
+        for code in BAD_REQUEST_CODES {
+            assert!(
+                NON_CONFLICT_CODES.contains(code),
+                "{code} must be listed among the non-conflict codes"
+            );
+        }
     }
 
     #[test]
@@ -1632,15 +2180,54 @@ mod tests {
     }
 
     #[test]
-    fn classify_malformed_request_codes_fall_back_to_function() {
-        // bad_key/bad_request are deterministic client bugs, not Vault outages:
-        // they must NOT get VaultUnavailable's "retry in a few seconds" advice.
-        for code in ["bad_key", "bad_request"] {
-            assert!(matches!(
-                classify_convex_error(&convex_err(code, "malformed")),
-                CoordinatorError::Function(_)
-            ));
+    fn classify_maps_malformed_argument_codes_to_bad_request_with_the_code_kept() {
+        // These are deterministic client bugs, not Vault outages: they must NOT get
+        // VaultUnavailable's "retry in a few seconds" advice, and a caller must be
+        // able to see they will fail identically forever rather than back off and
+        // repeat them. The code travels with the error so the detail is not lost.
+        for code in BAD_REQUEST_CODES {
+            match classify_convex_error(&convex_err(code, "malformed")) {
+                CoordinatorError::BadRequest { code: got, message } => {
+                    assert_eq!(&got, code);
+                    assert_eq!(message, "malformed");
+                }
+                other => panic!("expected BadRequest for {code}, got {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn classify_maps_too_many_revisions_to_its_own_variant() {
+        // `revisions:listFromSeq` refuses a window past 4096 rather than truncate;
+        // a truncated mark set would make the GC delete live data (§6.3), so the
+        // client must be able to tell this apart from a generic function error.
+        match classify_convex_error(&convex_err(
+            "too_many_revisions",
+            "more than 4096 Revisions at or above seq 0",
+        )) {
+            CoordinatorError::TooManyRevisions { message } => {
+                assert!(message.contains("4096"));
+            }
+            other => panic!("expected TooManyRevisions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_maps_space_key_already_set_and_dangling_head() {
+        assert!(matches!(
+            classify_convex_error(&convex_err(
+                "space_key_already_set",
+                "already has a spaceKey"
+            )),
+            CoordinatorError::SpaceKeyAlreadySet { .. }
+        ));
+        assert!(matches!(
+            classify_convex_error(&convex_err(
+                "dangling_head",
+                "head points at a missing Revision"
+            )),
+            CoordinatorError::DanglingHead { .. }
+        ));
     }
 
     #[test]
@@ -1699,6 +2286,44 @@ mod tests {
             Err(CoordinatorError::MissingField { field, .. }) => assert_eq!(field, "metaBlobCid"),
             other => panic!("expected MissingField, got {other:?}"),
         }
+    }
+
+    // ----- per-call deadline -----
+
+    #[tokio::test]
+    async fn with_deadline_ends_a_call_the_coordinator_never_answers() {
+        // The failure this guards: the convex client re-sends an outstanding call
+        // on every reconnect and its socket worker reconnects forever, so a
+        // Coordinator that accepts the connection and then goes silent leaves the
+        // future pending for good — a one-shot command that looks wedged.
+        let stalled = futures::future::pending::<FunctionResult>();
+        match with_deadline(Duration::from_millis(10), func::REVISIONS_COMMIT, stalled).await {
+            Err(CoordinatorError::Timeout { function, timeout }) => {
+                assert_eq!(function, func::REVISIONS_COMMIT);
+                assert_eq!(timeout, Duration::from_millis(10));
+                // The message must name the function, so the log says WHICH call hung.
+                let rendered = CoordinatorError::Timeout { function, timeout }.to_string();
+                assert!(rendered.contains("revisions:commit"), "got {rendered}");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_deadline_passes_an_answered_call_straight_through() {
+        let ready = std::future::ready(Value::Int64(7));
+        let v = with_deadline(DEFAULT_CALL_TIMEOUT, func::SPACES_HEAD, ready)
+            .await
+            .unwrap();
+        assert_eq!(v, Value::Int64(7));
+    }
+
+    #[test]
+    fn the_default_call_deadline_outlasts_one_reconnect_cycle_of_the_convex_client() {
+        // The convex client gives up on a silent socket after 30s and reconnects
+        // with at most 15s of backoff; a deadline shorter than that sum would fail
+        // calls that were about to succeed.
+        assert!(DEFAULT_CALL_TIMEOUT >= Duration::from_secs(45));
     }
 
     // ----- live integration (red real) — requires a Convex deployment -----

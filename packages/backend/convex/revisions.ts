@@ -19,6 +19,18 @@ import { v, ConvexError } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import { requireAccount, requireOwnedSpace, requireOwnedDevice } from "./auth";
 
+// A Manifest root is a 32-byte Cid (schema.ts revisions.manifestRootCid).
+const CID_BYTES = 32;
+
+// Upper bound on the Revisions one listFromSeq call may return. Convex caps how
+// much a single query may read, so an unbounded .collect() over a long chain
+// throws an opaque runtime error; worse, any scheme that silently returned a
+// SHORT list would be read by the GC as "nothing else is reachable" and it
+// would sweep live objects (§6.3, docs/adr/0007). Bounded well under Convex's
+// own read cap so exceeding it is our explicit, typed failure rather than the
+// platform's.
+const MAX_REVISIONS_PER_CALL = 4096;
+
 // Commit a new Revision iff the Space head still equals the expected base.
 //
 // Order guarantee from the client (§7): every Block and Manifest page is already
@@ -43,6 +55,17 @@ export const commit = mutation({
     const account = await requireAccount(ctx);
     const space = await requireOwnedSpace(ctx, account, args.spaceId);
     await requireOwnedDevice(ctx, account, args.authorDeviceId);
+
+    // v.bytes() accepts any length, and a stored root that is not a 32-byte Cid
+    // wedges the Space permanently: every later read of it (spaces:head, the
+    // client's Cid decode) fails on a Revision that can no longer be replaced.
+    // Reject it at the only point where the chain is still healthy.
+    if (args.manifestRootCid.byteLength !== CID_BYTES) {
+      throw new ConvexError({
+        code: "bad_manifest_root_cid",
+        message: `manifestRootCid must be exactly ${CID_BYTES} bytes`,
+      });
+    }
 
     // CAS: the current head MUST equal the base the client committed against.
     // Compared as strings because Convex Ids compare by value as strings, and
@@ -92,10 +115,17 @@ export const commit = mutation({
 // Manifest root it must keep reachable), newest last (by_space_seq is ascending).
 // The GC unions the Manifest trees rooted at these `manifestRootCid`s; objects
 // reachable from none of them (and older than the grace-period) are swept.
+//
+// COMPLETE OR NOTHING: this is the mark phase of a destructive sweep, so a
+// partial answer is worse than no answer. At most MAX_REVISIONS_PER_CALL rows
+// come back; a window holding more throws `too_many_revisions` instead of
+// truncating. `maxSeq` (inclusive) lets a caller walk a long chain in windows it
+// knows are small enough — omit it for the whole tail, as the MVP GC does.
 export const listFromSeq = query({
   args: {
     spaceId: v.id("spaces"),
     minSeq: v.number(),
+    maxSeq: v.optional(v.number()),
   },
   returns: v.array(
     v.object({
@@ -107,12 +137,28 @@ export const listFromSeq = query({
   handler: async (ctx, args) => {
     const account = await requireAccount(ctx);
     await requireOwnedSpace(ctx, account, args.spaceId);
+    const maxSeq = args.maxSeq;
     const rows = await ctx.db
       .query("revisions")
-      .withIndex("by_space_seq", (q) =>
-        q.eq("spaceId", args.spaceId).gte("seq", args.minSeq),
-      )
-      .collect();
+      .withIndex("by_space_seq", (q) => {
+        const from = q.eq("spaceId", args.spaceId).gte("seq", args.minSeq);
+        return maxSeq === undefined ? from : from.lte("seq", maxSeq);
+      })
+      // One MORE than the bound: reading it is how we know the window was cut
+      // short. Asking for exactly the bound cannot distinguish "complete" from
+      // "truncated", which is the failure mode that loses live data.
+      .take(MAX_REVISIONS_PER_CALL + 1);
+    if (rows.length > MAX_REVISIONS_PER_CALL) {
+      throw new ConvexError({
+        code: "too_many_revisions",
+        message:
+          `more than ${MAX_REVISIONS_PER_CALL} Revisions at or above seq ${args.minSeq}; ` +
+          "re-request in windows bounded by maxSeq",
+        limit: MAX_REVISIONS_PER_CALL,
+        minSeq: args.minSeq,
+        maxSeq: maxSeq ?? null,
+      });
+    }
     return rows.map((r) => ({
       revisionId: r._id,
       seq: r.seq,

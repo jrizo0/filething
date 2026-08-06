@@ -15,27 +15,37 @@
 // one S3 credential (server-side env, never shipped to a client) and hands out
 // short-lived, single-object, single-verb pre-signed URLs instead.
 //
-// Threat model: a pre-signed URL is only as safe as the key it points at.
+// Threat model: a pre-signed URL is only as safe as the key it points at. The
+// bucket has NO per-Account key prefix, so a key alone never proves tenancy.
 //   - `blocks/`, `manifest/`, `blocklist/`, `meta/` keys are content-addressed
 //     (a 32-byte cid keyed by the per-Account dedup secret, ADR 0003) and fan
-//     out into a 2-hex-char shard equal to the cid's own first byte — nobody
-//     can forge or guess one without the secret AND the bytes, and the content
-//     behind it is opaque ciphertext once a Space enables alg=1 (format.md
-//     §6.2). We still gate the fan-out shard against the cid to reject
-//     typo'd/foreign keys early.
+//     out into a 2-hex-char shard equal to the cid's own first byte. Guessing
+//     one generally needs the secret AND the bytes — but NOT always: the
+//     empty-Manifest root page is Account-independent and therefore a globally
+//     constant key, and a legacy alg=0 Space has cid == BLAKE3(cleartext
+//     chunk), so any guessable small file is a computable key. Obscurity is
+//     therefore not an authorization check, and we do not treat it as one:
+//     every PUT signed here is CREATE-ONLY (see CREATE_ONLY below), which is
+//     what actually stops one Account from clobbering another's object.
 //   - `keys/<space_id>/` keys hold per-Space escrow material (dedup/meta
-//     secrets). Unlike content-addressed keys these are guessable-ish (a
-//     Space id is not a secret), so this is the one prefix that needs an
-//     explicit ownership check: we require the caller's Account to own the
-//     Space before signing anything under it.
+//     secrets). A Space id is not a secret at all, so this prefix additionally
+//     requires an explicit ownership check: the caller's Account must own the
+//     Space before we sign anything under it.
 //   - `list` and `delete` are deliberately NOT signable here: they are
 //     account-wide, destructive-adjacent operations reserved for the GC
 //     (docs/adr/0012), which still runs with direct S3 credentials as a
 //     trusted operator job, never as a per-request grant to a client.
+//   - A signed GET still exposes another Account's object to anyone who can
+//     compute its key. Under alg=1 that is opaque ciphertext (format.md §6.2);
+//     closing it for alg=0 needs per-Account key prefixes, i.e. a format +
+//     migration change, not a change here.
 //
 // Contract (mirrored in the Rust client):
 //   action vault:sign({ ops: [{ key, method: "HEAD"|"GET"|"PUT" }, ...] })
 //     -> [{ key, method, url }, ...]   // same order as `ops`, 15 min TTL
+//   A signed PUT is create-only: the client MUST send `If-None-Match: *` with
+//   it (the header is part of the signature) and MUST read 412 Precondition
+//   Failed as "already present", which for an immutable object is success.
 //
 // Batched (up to 256 ops/call) so a sync round can fetch every URL it needs
 // for a Revision's Blocks + Manifest pages in one round-trip instead of one
@@ -49,6 +59,16 @@ import { internal } from "./_generated/api";
 
 const MAX_OPS = 256;
 const URL_TTL_SECONDS = 900; // 15 minutes
+
+// `If-None-Match: *` — succeed only if the object does not exist yet. Every key
+// signable here is content-addressed (both regexes below end in
+// `<aa>/<64 hex>`), and a content-addressed object is immutable by definition,
+// so an overwrite is never a legitimate operation: it is either a redundant
+// re-upload (412, which the client reads as success) or an attempt to
+// substitute someone else's bytes. Making the condition part of the SIGNATURE
+// is the point — a caller cannot drop it, so the store, not our trust in the
+// caller, enforces write-once.
+const CREATE_ONLY = "*";
 
 // Content-addressed prefixes: <prefix>/<aa>/<64 hex sha256>, where <aa> is the
 // same two hex chars as the hash's first byte (the storage fan-out shard).
@@ -68,9 +88,9 @@ function badKey(key: string): never {
 }
 
 // Parse and validate a single Vault key, returning the owning space_id when
-// the key is under keys/ (null for content-addressed keys, which need no
-// ownership check beyond the shape itself).
-function parseKey(key: string): { spaceId: string | null } {
+// the key is under keys/ (null for content-addressed keys, whose tenancy the
+// key cannot prove — authorization for those rests on the create-only PUT).
+export function parseKey(key: string): { spaceId: string | null } {
   const contentMatch = CONTENT_ADDRESSED_KEY.exec(key);
   if (contentMatch !== null) {
     const [, , shard, hash] = contentMatch;
@@ -86,6 +106,24 @@ function parseKey(key: string): { spaceId: string | null } {
   }
 
   return badKey(key);
+}
+
+// The single-object, single-verb S3 command a signed URL authorizes. PUT is
+// pinned to CREATE_ONLY here rather than at the call site so no future caller
+// can mint an unconditional write.
+export function commandForOp(
+  bucket: string,
+  op: { key: string; method: "HEAD" | "GET" | "PUT" },
+): HeadObjectCommand | GetObjectCommand | PutObjectCommand {
+  const input = { Bucket: bucket, Key: op.key };
+  switch (op.method) {
+    case "HEAD":
+      return new HeadObjectCommand(input);
+    case "GET":
+      return new GetObjectCommand(input);
+    case "PUT":
+      return new PutObjectCommand({ ...input, IfNoneMatch: CREATE_ONLY });
+  }
 }
 
 function s3ClientFromEnv(): { client: S3Client; bucket: string } {
@@ -168,13 +206,7 @@ export const sign = action({
     const results = [];
     try {
       for (const op of parsed) {
-        const commandInput = { Bucket: bucket, Key: op.key };
-        const command =
-          op.method === "HEAD"
-            ? new HeadObjectCommand(commandInput)
-            : op.method === "GET"
-              ? new GetObjectCommand(commandInput)
-              : new PutObjectCommand(commandInput);
+        const command = commandForOp(bucket, op);
         const url = await getSignedUrl(client, command, { expiresIn: URL_TTL_SECONDS });
         results.push({ key: op.key, method: op.method, url });
       }

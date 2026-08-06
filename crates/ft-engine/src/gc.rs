@@ -23,20 +23,75 @@
 //! future work. See `docs/adr/0012`.
 //!
 //! Safety nets:
+//! - **Roots guard**: refuses to run at all unless the authenticated Account lists
+//!   at least one Space AND owns the Space the caller pointed at. Reachability comes
+//!   entirely from `list_mine`, so an Account with no Spaces collapses the mark set
+//!   to a single key and the sweep would delete the WHOLE bucket — the realistic
+//!   cause being a wrong login or a re-deployed Coordinator while `S3_*` still
+//!   points at the real Vault.
 //! - **Grace-period**: never sweep an object younger than the window (24h
 //!   default), so a commit in flight (Vault-first, head-after, `§7`) whose objects
 //!   are uploaded but not yet referenced is protected. A missing/future mtime is
-//!   treated as "too young" (never sweep on uncertainty).
+//!   treated as "too young" (never sweep on uncertainty). The window enforced is
+//!   `grace + clock_skew_allowance` — see residual race 2 below.
+//! - **Proportion guard**: refuses `--apply` when the delete set is a large
+//!   fraction ([`GcOptions::max_sweep_fraction`]) of the objects scanned. A sweep
+//!   that big is far more likely to mean an INCOMPLETE mark than a Vault that full
+//!   of garbage, so it must be asked for explicitly.
 //! - **Concurrency guard**: the reachability snapshot predates the object listing,
 //!   so before deleting (with `apply`) the GC re-reads every Space head; if any
-//!   advanced (a concurrent commit) it ABORTS without deleting.
+//!   advanced (a concurrent commit) it ABORTS without deleting. It re-reads again
+//!   every [`HEAD_RECHECK_EVERY`] deletes and once after the last one, so a race
+//!   that starts mid-sweep is at worst REPORTED instead of silent.
 //! - **Anomaly guard**: refuses to run if a Space has a head but zero Revisions
 //!   are listed, rather than sweeping everything.
 //! - It fails if a reachable object cannot be read (never sweeps on a partial mark).
+//! - Every refusal is an `Err`, never a [`GcReport`]: a guard that declined can
+//!   therefore not be misread as a sweep that found nothing to do.
 //!
-//! Even so, a Device must still not trust a stale local presence cache: the commit
-//! path HEAD-verifies every Block before referencing it (`commit.rs`), so a Block
-//! this GC (or another Device's) removed is simply re-uploaded on the next commit.
+//! Even so, a Device must still not trust a stale local presence cache. The commit
+//! path never references a Block on the strength of its `local_block` row alone
+//! (`scan.rs`/`commit.rs`): a cid may be referenced without a `HEAD` exactly when
+//! the BASE Revision already references it — which this sweep, being
+//! orphan-only, can never remove — and any other cid is either uploaded by that
+//! same commit under `HEAD`-before-`PUT` or left out of the Manifest entirely. So a
+//! Block this GC (or another Device's) removed is one no Revision referenced, and
+//! the next commit that needs it re-reads the file and re-uploads it.
+//!
+//! ## Residual races (read before lowering the grace-period)
+//!
+//! Neither of these can be closed from the client side. They are written down
+//! because an operator who knows about them can avoid them — run the GC when the
+//! Account's Devices are idle, and keep the grace-period generous.
+//!
+//! 1. **HEAD-then-CAS.** A commit does NOT re-upload a Block whose presence a HEAD
+//!    confirmed (`commit.rs`, `§7`), so between that HEAD and its CAS the Block is
+//!    about to be referenced by a Revision that does not exist yet. The
+//!    grace-period does not cover it: the object is OLD — it is being
+//!    RE-referenced, not re-uploaded. Mitigated here by re-reading the heads before
+//!    the first delete, every [`HEAD_RECHECK_EVERY`] deletes and once after the
+//!    last, and by deleting OLDEST-FIRST so an abort has touched only the
+//!    least-recently-written objects. What SURVIVES: a CAS landing after the final
+//!    re-read is invisible to us, so a racing commit can still publish a Revision
+//!    referencing a swept Block. The blast radius is bounded and recoverable — the
+//!    racing Device fixes it by committing again (its next HEAD finds the Block
+//!    gone and re-uploads it), and a Device that pulled the broken Revision in
+//!    between gets a hard fetch error, not silent corruption. A real fix is
+//!    server-side (a Coordinator-held "commit in flight" lease, or a server-side
+//!    sweep) and is out of scope for the client (ADR 0012).
+//! 2. **Clock skew and long commits.** An object's age mixes two clocks: `mtime` is
+//!    stamped by the storage provider, `now` is this Device's. A local clock AHEAD
+//!    of the provider's makes every object look OLDER and so silently SHORTENS the
+//!    window — the dangerous direction, and one the listing cannot reveal. Hence
+//!    the enforced window is `grace + clock_skew_allowance`. The opposite skew is
+//!    safe (ages come out too small, and a future mtime is already "too young") and
+//!    IS detectable, so it is warned about instead of corrected. Independently, an
+//!    object is protected only while it is younger than the window, so the
+//!    grace-period MUST exceed the longest commit that can be in flight: a
+//!    multi-hour initial upload over a slow link is not protected by a window
+//!    shorter than itself. `grace = 0` is an explicit opt-out (the demo gates use
+//!    it to sweep an injected orphan immediately): no window, and no skew allowance
+//!    silently reinstating one.
 //!
 //! ## Scope: ONE bucket == ONE account
 //!
@@ -73,14 +128,52 @@ const SWEEP_PREFIXES: [&str; 5] = ["blocks/", "manifest/", "blocklist/", "meta/"
 /// The default grace-period: 24h. An object younger than this is never swept.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Knobs for a [`SpaceContext::gc`] run.
+/// The default slack the grace-period is widened by to absorb client↔storage
+/// clock skew: 1h. Generous enough for the skew a badly-synced host actually
+/// shows (NTP keeps a healthy one inside seconds) while costing only an extra hour
+/// of retained garbage. See residual race 2 in the module docs.
+pub const DEFAULT_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(60 * 60);
+
+/// The default proportion guard: refuse `--apply` when the delete set exceeds HALF
+/// the objects scanned. The GC retains all history, so live content is never
+/// garbage and a healthy Vault's orphans (debris of commits that died between the
+/// Vault write and the CAS, `§7`) are a small minority; a majority-orphan bucket is
+/// far more likely to be an incomplete mark. A value `>= 1.0` disables the guard,
+/// since the sweep set can never exceed what was scanned.
+pub const DEFAULT_MAX_SWEEP_FRACTION: f64 = 0.5;
+
+/// The proportion guard needs a meaningful denominator: below this many scanned
+/// objects the ratio is noise (a fresh Space with three objects and two orphans is
+/// 67% garbage and perfectly healthy) and the blast radius of a wrong sweep is a
+/// handful of objects, so the guard stands down. The roots guard, the grace-period
+/// and the concurrency guard still apply.
+const PROPORTION_GUARD_MIN_SCANNED: usize = 32;
+
+/// How often, in deletes, a long sweep re-reads the Space heads (residual race 1
+/// in the module docs). It bounds the window in which a commit's HEAD→CAS can
+/// overlap deletes still to come, at one Coordinator round-trip per 500 deletes.
+const HEAD_RECHECK_EVERY: usize = 500;
+
+/// Knobs for a [`SpaceContext::gc`] run. Construct with `..Default::default()` —
+/// new safety knobs are added here as they are needed.
 #[derive(Debug, Clone)]
 pub struct GcOptions {
     /// Actually delete swept objects. `false` (the default) is a dry run: the
     /// report lists what WOULD be deleted and the Vault is untouched.
     pub apply: bool,
-    /// Never sweep an object younger than this. Protects in-flight commits.
+    /// Never sweep an object younger than this. Protects in-flight commits, so it
+    /// must exceed the longest commit that can be in flight (module docs, residual
+    /// race 2). `Duration::ZERO` waives the protection entirely.
     pub grace: Duration,
+    /// Extra slack added to [`Self::grace`] because ages compare the storage
+    /// provider's mtimes against the LOCAL clock: a local clock ahead of the
+    /// provider's would otherwise shorten the real window. Ignored when
+    /// [`Self::grace`] is zero (an explicit opt-out must not be silently undone).
+    pub clock_skew_allowance: Duration,
+    /// Refuse `--apply` when the delete set exceeds this fraction of the objects
+    /// scanned — the guard against sweeping a Vault whose mark set came out
+    /// incomplete. `>= 1.0` disables it, for the legitimately huge sweep.
+    pub max_sweep_fraction: f64,
 }
 
 impl Default for GcOptions {
@@ -88,6 +181,8 @@ impl Default for GcOptions {
         Self {
             apply: false,
             grace: DEFAULT_GRACE,
+            clock_skew_allowance: DEFAULT_CLOCK_SKEW_ALLOWANCE,
+            max_sweep_fraction: DEFAULT_MAX_SWEEP_FRACTION,
         }
     }
 }
@@ -109,12 +204,18 @@ pub struct GcReport {
     pub scanned_objects: usize,
     /// Unreachable objects held back ONLY by the grace-period (younger than it).
     pub kept_by_grace: usize,
-    /// Keys eligible to sweep (unreachable AND older than the grace-period),
-    /// sorted. In a dry run these are what WOULD be deleted; with `apply` they
-    /// were deleted.
+    /// The PLAN: keys eligible to sweep (unreachable AND older than the
+    /// grace-period), sorted. Always the plan, in both modes — what was actually
+    /// deleted is [`Self::deleted_keys`], so the two never have to be told apart by
+    /// remembering which mode produced the report.
     pub sweepable: Vec<String>,
-    /// Objects actually deleted (0 in a dry run).
+    /// Objects actually deleted (0 in a dry run) — `deleted_keys.len()`.
     pub deleted: usize,
+    /// The keys actually deleted, sorted: EMPTY in a dry run, equal to
+    /// [`Self::sweepable`] after a complete `--apply`. A run that stopped partway
+    /// returns an `Err` naming what it had already deleted, so this field is never
+    /// a partial record presented as a whole one.
+    pub deleted_keys: Vec<String>,
     /// Whether deletes were applied.
     pub applied: bool,
 }
@@ -144,6 +245,10 @@ impl SpaceContext {
             .expect("coordinator present")
             .list_mine()
             .await?;
+        // The mark set has NO other source, so an empty or foreign root set means
+        // "delete the bucket". Check before touching the Vault at all.
+        guard_roots(&spaces, &self.space_id)?;
+        warn_on_weak_grace(opts.grace);
 
         // Each root is paired with its owning Space id so the mark can name that
         // Space's `keys/<space_id>/<cid>` sidecars (`§4.5`): the sidecar key is
@@ -192,32 +297,93 @@ impl SpaceContext {
             scanned += listed.len();
             all_objects.extend(listed);
         }
-        let (sweepable, kept_by_grace) = partition_sweep(all_objects, &reachable, now, opts.grace);
+        warn_on_future_mtimes(&all_objects, now, opts.clock_skew_allowance);
+        let window = enforced_grace(opts.grace, opts.clock_skew_allowance);
+        // Oldest-first, so an abort partway through has deleted only the objects
+        // least likely to be in a racing commit's working set (residual race 1).
+        let (plan, kept_by_grace) = partition_sweep(all_objects, &reachable, now, window);
+        let mut sweepable: Vec<String> = plan.iter().map(|c| c.key.clone()).collect();
+        sweepable.sort();
 
         // ----- apply -----
-        let mut deleted = 0usize;
-        if opts.apply && !sweepable.is_empty() {
+        let mut deleted_keys: Vec<String> = Vec::new();
+        if !plan.is_empty() {
+            // A delete set that is most of the bucket means the mark is suspect. Both
+            // modes evaluate the guard — `--apply` is refused, a dry run warns — so
+            // the alarm reaches the operator from the mode that deletes nothing.
+            match guard_sweep_proportion(plan.len(), scanned, opts.max_sweep_fraction) {
+                Err(e) if opts.apply => return Err(e),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "gc dry run: this plan would be REFUSED by --apply"
+                ),
+                Ok(()) => {}
+            }
+        }
+        if opts.apply && !plan.is_empty() {
             // Concurrency guard: our reachability snapshot predates the listing, so
             // a commit that advanced a head in between could have referenced an
             // object we now deem an orphan. Re-read the heads; if any changed (or a
             // Space appeared/vanished), ABORT without deleting.
-            let after = self
-                .coordinator
-                .as_mut()
-                .expect("coordinator present")
-                .list_mine()
-                .await?;
-            if head_snapshot(&after) != heads_before {
-                return Err(EngineError::SpaceState(
+            if self.heads_changed_since(&heads_before).await? {
+                return Err(EngineError::Refused(
                     "gc --apply aborted: a Space head changed during the sweep (concurrent commit, \
                      or a Space was created/removed); nothing was deleted — re-run when idle"
                         .to_string(),
                 ));
             }
-            for key in &sweepable {
-                self.vault.delete(key).await?;
-                deleted += 1;
+            tracing::info!(total = plan.len(), "gc sweeping orphans");
+            for (done, candidate) in plan.iter().enumerate() {
+                // A long sweep can outlive its pre-delete guard, so re-check
+                // periodically: it bounds how far a commit's HEAD→CAS window can
+                // reach into deletes we have not made yet (residual race 1).
+                if done > 0 && done % HEAD_RECHECK_EVERY == 0 {
+                    if self.heads_changed_since(&heads_before).await? {
+                        return Err(EngineError::Refused(format!(
+                            "gc --apply aborted mid-sweep: a Space head changed (concurrent \
+                             commit, or a Space was created/removed). {}. If that commit \
+                             referenced one of them, commit again on the Device that made it — \
+                             its HEAD-before-PUT (`§7`) re-uploads whatever went missing",
+                            deleted_record(&deleted_keys, plan.len())
+                        )));
+                    }
+                    tracing::info!(deleted = done, total = plan.len(), "gc sweeping orphans");
+                }
+                // Report what a partial run destroyed: an `Err` carries no
+                // `GcReport`, so without this the record would be lost.
+                self.vault.delete(&candidate.key).await.map_err(|e| {
+                    tracing::error!(
+                        deleted = deleted_keys.len(),
+                        planned = plan.len(),
+                        key = %candidate.key,
+                        error = %e,
+                        "gc --apply stopped: a delete failed"
+                    );
+                    EngineError::Refused(format!(
+                        "gc --apply stopped: deleting {} failed ({e}); refusing to keep sweeping \
+                         a Vault that is rejecting deletes. {}. Re-running gc is safe — deletes \
+                         are idempotent and a fresh dry run shows what is left",
+                        candidate.key,
+                        deleted_record(&deleted_keys, plan.len())
+                    ))
+                })?;
+                deleted_keys.push(candidate.key.clone());
             }
+            // The pre-delete guard cannot see a commit whose CAS lands after it. This
+            // last re-read cannot protect that commit — the deletes are done — it
+            // exists so the operator LEARNS the sweep raced instead of reading a
+            // clean report over a Revision that may reference a swept Block.
+            if self.heads_changed_since(&heads_before).await? {
+                return Err(EngineError::Refused(format!(
+                    "gc --apply refuses to report a clean run: a Space head changed while it was \
+                     deleting (concurrent commit). {}. Commit again on the Device that was \
+                     committing — its HEAD-before-PUT (`§7`) re-uploads any Block this sweep \
+                     removed from under it",
+                    deleted_record(&deleted_keys, plan.len())
+                )));
+            }
+            deleted_keys.sort();
+            tracing::info!(deleted = deleted_keys.len(), "gc swept orphans");
         }
 
         Ok(GcReport {
@@ -227,10 +393,172 @@ impl SpaceContext {
             scanned_objects: scanned,
             kept_by_grace,
             sweepable,
-            deleted,
+            deleted: deleted_keys.len(),
+            deleted_keys,
             applied: opts.apply,
         })
     }
+
+    /// Re-reads every Space head and reports whether the account's head snapshot
+    /// moved since `before` (a concurrent commit, or a Space created/removed) — the
+    /// concurrency guard's single question, asked before, during and after the
+    /// sweep.
+    async fn heads_changed_since(&mut self, before: &[(String, Option<String>)]) -> Result<bool> {
+        let after = self
+            .coordinator
+            .as_mut()
+            .expect("coordinator present")
+            .list_mine()
+            .await?;
+        Ok(head_snapshot(&after) != before)
+    }
+}
+
+/// Refuses the whole GC unless the authenticated Account actually provides
+/// reachability roots: at least one Space, INCLUDING the one the caller pointed at.
+/// Reachability has no other source, so `list_mine() == []` collapses the mark set
+/// to the empty-Manifest root and every object past the grace-period becomes
+/// "garbage" — a whole-Vault wipe. The realistic trigger is an identity mismatch
+/// (signed up again after re-deploying the Coordinator, or a personal login while
+/// `S3_*` still points at the work bucket), not a corrupt backend, so the message
+/// names that cause.
+fn guard_roots(spaces: &[ft_coordinator::Space], space_id: &SpaceId) -> Result<()> {
+    if spaces.is_empty() {
+        return Err(EngineError::Refused(format!(
+            "gc: the logged-in Account owns NO Spaces, so NOTHING in this Vault would be \
+             reachable and the sweep would delete the entire bucket. This is almost always the \
+             wrong login or the wrong Coordinator deployment (a fresh signup after re-deploying, \
+             or a personal login while S3_* still points at the work bucket) — check `filething \
+             whoami` and the Coordinator URL. Space {} was not touched",
+            space_id.as_str()
+        )));
+    }
+    if !spaces.iter().any(|s| s.space_id == *space_id) {
+        return Err(EngineError::Refused(format!(
+            "gc: the logged-in Account owns {} Space(s) but not {}, the Space this folder is \
+             mapped to — the login and the Vault this folder syncs to disagree. Sweeping would \
+             treat every object of this Space (and of every other Space missing from that login) \
+             as garbage. Log in as the Account that owns this Space, or point S3_* at the Vault \
+             of the Account you are logged in as",
+            spaces.len(),
+            space_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an `--apply` whose delete set is a large fraction of everything scanned.
+/// Independent of [`guard_roots`] on purpose: it catches ANY cause of a collapsed
+/// mark set (a Coordinator page that silently dropped Spaces or Revisions, a
+/// prefix the mark forgot), not just a wrong login. Stands down below
+/// [`PROPORTION_GUARD_MIN_SCANNED`] objects, where a ratio means nothing.
+fn guard_sweep_proportion(sweepable: usize, scanned: usize, max_fraction: f64) -> Result<()> {
+    if scanned < PROPORTION_GUARD_MIN_SCANNED {
+        return Ok(());
+    }
+    // Every comparison against a NaN is false, so a NaN threshold (`"nan".parse()`
+    // reaching a future --max-sweep-fraction flag) would silently WAIVE the guard.
+    // Waiving must be explicit, so a NaN falls back to the default.
+    let max_fraction = if max_fraction.is_nan() {
+        DEFAULT_MAX_SWEEP_FRACTION
+    } else {
+        max_fraction
+    };
+    let fraction = sweepable as f64 / scanned as f64;
+    if fraction > max_fraction {
+        return Err(EngineError::Refused(format!(
+            "gc --apply refused: the sweep would delete {sweepable} of {scanned} scanned \
+             object(s) ({:.0}%), over the {:.0}% safety threshold. The GC retains all history, \
+             so a majority-garbage Vault is far more likely to be an INCOMPLETE mark (a Space or \
+             Revision the Coordinator did not list) than that much real debris. Re-run without \
+             --apply and read the plan; if it is genuinely all garbage, raise \
+             GcOptions::max_sweep_fraction (1.0 disables this guard). Nothing was deleted",
+            fraction * 100.0,
+            max_fraction * 100.0
+        )));
+    }
+    Ok(())
+}
+
+/// The window [`partition_sweep`] actually enforces: `grace` WIDENED by the
+/// clock-skew allowance, because an object's age compares the storage provider's
+/// mtime against the local clock and a local clock running ahead would shorten the
+/// window (module docs, residual race 2). A zero `grace` is an explicit opt-out of
+/// the protection, so it is left at zero rather than silently reinstated as an hour.
+fn enforced_grace(grace: Duration, skew_allowance: Duration) -> Duration {
+    if grace.is_zero() {
+        Duration::ZERO
+    } else {
+        grace.saturating_add(skew_allowance)
+    }
+}
+
+/// Warns when the grace-period is too weak to do its job. It protects a commit
+/// only while that commit's objects are younger than the window, so a window
+/// shorter than the longest commit in flight (a huge initial upload over a slow
+/// link) protects nothing (`§7`).
+fn warn_on_weak_grace(grace: Duration) {
+    if grace.is_zero() {
+        tracing::warn!(
+            "gc grace-period is 0: objects of a commit still in flight are NOT protected — only \
+             safe on an idle Vault"
+        );
+    } else if grace < DEFAULT_GRACE {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            default_secs = DEFAULT_GRACE.as_secs(),
+            "gc grace-period is below the default: it must exceed the longest commit that can be \
+             in flight, or that commit's Blocks can be swept before its head lands"
+        );
+    }
+}
+
+/// Warns when listed mtimes lie in the FUTURE of the local clock — the storage
+/// clock is ahead of ours, so the two disagree. That direction is the safe one
+/// (ages come out too small, so the window is effectively wider, and a future mtime
+/// is already treated as too young), but an offset of the same size in the OTHER
+/// direction is invisible here and shortens the window, which is why
+/// [`GcOptions::clock_skew_allowance`] exists: skew this large means it is too small.
+fn warn_on_future_mtimes(objects: &[VaultObject], now: SystemTime, allowance: Duration) {
+    let ahead = objects
+        .iter()
+        .filter_map(|o| o.last_modified)
+        .filter_map(|m| m.duration_since(now).ok())
+        .max();
+    if let Some(ahead) = ahead {
+        if ahead > allowance {
+            tracing::warn!(
+                ahead_secs = ahead.as_secs(),
+                allowance_secs = allowance.as_secs(),
+                "gc: storage mtimes are in the future of this Device's clock by more than the \
+                 skew allowance — fix the clocks (NTP) or raise the allowance; the reverse skew \
+                 would silently shorten the grace-period"
+            );
+        }
+    }
+}
+
+/// Renders what an aborted `--apply` had ALREADY deleted, for embedding in the
+/// error. An `Err` carries no [`GcReport`], so this is the operator's only record
+/// of a destructive partial run; truncated like the CLI's own listing, since a
+/// re-run's dry-run plan shows precisely what is left.
+fn deleted_record(deleted: &[String], planned: usize) -> String {
+    if deleted.is_empty() {
+        return "nothing had been deleted yet".to_string();
+    }
+    const SHOW: usize = 20;
+    let mut out = format!(
+        "{} of {planned} planned object(s) WERE ALREADY DELETED:",
+        deleted.len()
+    );
+    for key in deleted.iter().take(SHOW) {
+        out.push_str("\n    ");
+        out.push_str(key);
+    }
+    if deleted.len() > SHOW {
+        out.push_str(&format!("\n    … and {} more", deleted.len() - SHOW));
+    }
+    out
 }
 
 /// A sorted snapshot of each Space's `(id, head-revision-id)` — the concurrency
@@ -367,22 +695,34 @@ async fn mark_entry_blocks(
     Ok(())
 }
 
-/// Splits listed objects into (sweepable, kept_by_grace_count). An object is
-/// sweepable iff it is unreachable AND provably older than `grace`. A missing or
-/// future `last_modified` counts as "too young" — the GC never sweeps on
-/// uncertainty. The returned sweep list is sorted for stable output.
+/// One object the sweep intends to delete: its key plus the mtime the grace check
+/// judged it by, which the delete loop orders on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepCandidate {
+    key: String,
+    mtime: SystemTime,
+}
+
+/// Splits listed objects into (delete plan, kept_by_grace_count). An object is
+/// sweepable iff it is unreachable AND provably older than `grace` (the window
+/// [`enforced_grace`] computed, not the raw option). A missing or future
+/// `last_modified` counts as "too young" — the GC never sweeps on uncertainty. The
+/// plan comes out OLDEST-FIRST (key as tie-break, so it is deterministic): the
+/// order the deletes are made in, oldest being the least likely to be re-referenced
+/// by a commit racing the sweep (module docs, residual race 1).
 fn partition_sweep(
     objects: Vec<VaultObject>,
     reachable: &HashSet<String>,
     now: SystemTime,
     grace: Duration,
-) -> (Vec<String>, usize) {
-    let mut sweepable = Vec::new();
+) -> (Vec<SweepCandidate>, usize) {
+    let mut plan: Vec<SweepCandidate> = Vec::new();
     let mut kept_by_grace = 0usize;
     for obj in objects {
         if reachable.contains(&obj.key) {
             continue;
         }
+        // Only a provable age sweeps, so a candidate always has a known mtime.
         let old_enough = match obj.last_modified {
             Some(mtime) => now
                 .duration_since(mtime)
@@ -390,14 +730,16 @@ fn partition_sweep(
                 .unwrap_or(false),
             None => false,
         };
-        if old_enough {
-            sweepable.push(obj.key);
-        } else {
-            kept_by_grace += 1;
+        match (old_enough, obj.last_modified) {
+            (true, Some(mtime)) => plan.push(SweepCandidate {
+                key: obj.key,
+                mtime,
+            }),
+            _ => kept_by_grace += 1,
         }
     }
-    sweepable.sort();
-    (sweepable, kept_by_grace)
+    plan.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.key.cmp(&b.key)));
+    (plan, kept_by_grace)
 }
 
 #[cfg(test)]
@@ -409,6 +751,24 @@ mod tests {
 
     fn cid(n: u8) -> Cid {
         Cid::new([n; 32])
+    }
+
+    /// A [`ft_coordinator::Space`] as `list_mine` returns it; only the id matters
+    /// to the roots guard.
+    fn space(id: &str) -> ft_coordinator::Space {
+        ft_coordinator::Space {
+            space_id: SpaceId::new(id),
+            account_id: ft_coordinator::AccountId::new("acct1"),
+            name: b"space".to_vec(),
+            head_revision_id: None,
+            meta_blob_cid: cid(200),
+            space_key: None,
+        }
+    }
+
+    /// The keys of a delete plan, in plan order.
+    fn keys(plan: &[SweepCandidate]) -> Vec<String> {
+        plan.iter().map(|c| c.key.clone()).collect()
     }
 
     /// A minimal File [`FileEntry`] at `path` referencing inline blocks `bk`.
@@ -643,8 +1003,8 @@ mod tests {
                 last_modified: Some(now - Duration::from_secs(10_000)),
             },
         ];
-        let (sweepable, _kept) = partition_sweep(objects, &reachable, now, grace);
-        assert_eq!(sweepable, vec!["keys/bb/orphan-old".to_string()]);
+        let (plan, _kept) = partition_sweep(objects, &reachable, now, grace);
+        assert_eq!(keys(&plan), vec!["keys/bb/orphan-old".to_string()]);
     }
 
     #[test]
@@ -677,8 +1037,187 @@ mod tests {
             },
         ];
 
-        let (sweepable, kept_by_grace) = partition_sweep(objects, &reachable, now, grace);
-        assert_eq!(sweepable, vec!["blocks/bb/orphan-old".to_string()]);
+        let (plan, kept_by_grace) = partition_sweep(objects, &reachable, now, grace);
+        assert_eq!(keys(&plan), vec!["blocks/bb/orphan-old".to_string()]);
         assert_eq!(kept_by_grace, 2); // orphan-young + orphan-nomtime
+    }
+
+    // ----- roots guard (a mark set with no roots would wipe the Vault) -----
+
+    #[test]
+    fn gc_refuses_when_the_authenticated_account_lists_no_spaces_at_all() {
+        // The whole-Vault wipe: reachability comes ONLY from list_mine(), so with
+        // zero Spaces every object past the grace-period looks like garbage.
+        let err = guard_roots(&[], &SpaceId::new("space1")).unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("NO Spaces"), "{msg}");
+        // The message must point at the real cause, not at the Vault.
+        assert!(msg.contains("whoami"), "{msg}");
+    }
+
+    #[test]
+    fn gc_refuses_when_the_account_does_not_own_the_space_the_caller_pointed_at() {
+        // A login that owns OTHER Spaces is just as dangerous: this Space's objects
+        // are unreachable from the roots that login can see.
+        let err =
+            guard_roots(&[space("other1"), space("other2")], &SpaceId::new("space1")).unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("space1"), "{msg}");
+        assert!(msg.contains("2 Space(s)"), "{msg}");
+    }
+
+    #[test]
+    fn gc_runs_when_the_roots_include_the_space_the_caller_pointed_at() {
+        guard_roots(&[space("other"), space("space1")], &SpaceId::new("space1")).unwrap();
+    }
+
+    // ----- proportion guard -----
+
+    #[test]
+    fn gc_refuses_to_apply_a_sweep_that_would_delete_most_of_the_vault() {
+        let err = guard_sweep_proportion(90, 100, DEFAULT_MAX_SWEEP_FRACTION).unwrap_err();
+        assert!(matches!(err, EngineError::Refused(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("90 of 100"), "{msg}");
+        assert!(msg.contains("Nothing was deleted"), "{msg}");
+    }
+
+    #[test]
+    fn the_proportion_guard_passes_an_ordinary_orphan_sweep() {
+        guard_sweep_proportion(5, 100, DEFAULT_MAX_SWEEP_FRACTION).unwrap();
+    }
+
+    #[test]
+    fn the_proportion_guard_can_be_raised_for_a_legitimately_huge_sweep() {
+        // The override exists because a real all-garbage Vault exists (a huge
+        // staged upload the user then deleted before any head referenced it).
+        guard_sweep_proportion(100, 100, 1.0).unwrap();
+    }
+
+    #[test]
+    fn the_proportion_guard_stands_down_on_a_vault_too_small_to_reason_about() {
+        // 2 of 3 objects is 67% garbage and perfectly healthy on a fresh Space.
+        guard_sweep_proportion(2, 3, DEFAULT_MAX_SWEEP_FRACTION).unwrap();
+    }
+
+    #[test]
+    fn a_nan_threshold_falls_back_to_the_default_instead_of_waiving_the_guard() {
+        // Every comparison against NaN is false, so a NaN would disable the guard
+        // silently — the one way to waive it must be an explicit `>= 1.0`.
+        assert!(guard_sweep_proportion(90, 100, f64::NAN).is_err());
+    }
+
+    // ----- grace-period under clock skew -----
+
+    #[test]
+    fn the_enforced_grace_window_is_widened_by_the_clock_skew_allowance() {
+        assert_eq!(
+            enforced_grace(Duration::from_secs(100), Duration::from_secs(30)),
+            Duration::from_secs(130)
+        );
+    }
+
+    #[test]
+    fn a_zero_grace_period_stays_zero_so_an_explicit_opt_out_is_never_undone() {
+        assert_eq!(
+            enforced_grace(Duration::ZERO, DEFAULT_CLOCK_SKEW_ALLOWANCE),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn an_object_only_just_past_the_grace_period_is_kept_by_the_skew_allowance() {
+        // Ages mix clocks: mtime is the provider's, `now` is ours. A local clock
+        // ahead of the provider's inflates every age, so an object that looks
+        // 3700s old may really be younger than the 3600s window. The widened
+        // window is what holds it back.
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = Duration::from_secs(3600);
+        let skew = Duration::from_secs(600);
+        let objects = vec![VaultObject {
+            key: "blocks/aa/just-past-grace".to_string(),
+            last_modified: Some(now - Duration::from_secs(3700)),
+        }];
+
+        let (bare, _) = partition_sweep(objects.clone(), &HashSet::new(), now, grace);
+        assert_eq!(keys(&bare), vec!["blocks/aa/just-past-grace".to_string()]);
+
+        let (widened, kept) =
+            partition_sweep(objects, &HashSet::new(), now, enforced_grace(grace, skew));
+        assert!(widened.is_empty());
+        assert_eq!(kept, 1);
+    }
+
+    #[test]
+    fn the_delete_plan_is_ordered_oldest_first() {
+        // Oldest-first bounds the damage of an abort mid-sweep: the objects most
+        // likely to be re-referenced by a racing commit go last (residual race 1).
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = Duration::from_secs(60);
+        let objects = vec![
+            VaultObject {
+                key: "blocks/bb/newer".to_string(),
+                last_modified: Some(now - Duration::from_secs(100)),
+            },
+            VaultObject {
+                key: "blocks/aa/oldest".to_string(),
+                last_modified: Some(now - Duration::from_secs(10_000)),
+            },
+            VaultObject {
+                key: "blocks/cc/middle".to_string(),
+                last_modified: Some(now - Duration::from_secs(5_000)),
+            },
+        ];
+        let (plan, _) = partition_sweep(objects, &HashSet::new(), now, grace);
+        assert_eq!(
+            keys(&plan),
+            vec![
+                "blocks/aa/oldest".to_string(),
+                "blocks/cc/middle".to_string(),
+                "blocks/bb/newer".to_string(),
+            ]
+        );
+    }
+
+    // ----- forensics of a partial run -----
+
+    #[test]
+    fn an_aborted_apply_names_every_object_it_had_already_deleted() {
+        let deleted = vec!["blocks/aa/one".to_string(), "blocks/bb/two".to_string()];
+        let record = deleted_record(&deleted, 7);
+        assert!(record.contains("2 of 7"), "{record}");
+        assert!(record.contains("blocks/aa/one"), "{record}");
+        assert!(record.contains("blocks/bb/two"), "{record}");
+    }
+
+    #[test]
+    fn an_aborted_apply_that_had_deleted_nothing_says_so_explicitly() {
+        assert_eq!(deleted_record(&[], 7), "nothing had been deleted yet");
+    }
+
+    #[test]
+    fn the_deleted_record_truncates_a_huge_deleted_set_but_still_counts_all_of_it() {
+        let deleted: Vec<String> = (0..50).map(|i| format!("blocks/aa/{i:02}")).collect();
+        let record = deleted_record(&deleted, 100);
+        assert!(record.contains("50 of 100"), "{record}");
+        assert!(record.contains("blocks/aa/00"), "{record}");
+        assert!(record.contains("and 30 more"), "{record}");
+        assert!(!record.contains("blocks/aa/49"), "{record}");
+    }
+
+    #[test]
+    fn gc_options_keep_working_with_struct_update_syntax_and_default_to_the_safe_knobs() {
+        // The CLI constructs GcOptions positionally-by-name; every new safety knob
+        // must arrive with a safe default so `..Default::default()` stays correct.
+        let opts = GcOptions {
+            apply: true,
+            grace: Duration::from_secs(1),
+            ..Default::default()
+        };
+        assert!(!GcOptions::default().apply);
+        assert_eq!(opts.clock_skew_allowance, DEFAULT_CLOCK_SKEW_ALLOWANCE);
+        assert_eq!(opts.max_sweep_fraction, DEFAULT_MAX_SWEEP_FRACTION);
     }
 }

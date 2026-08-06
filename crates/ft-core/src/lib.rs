@@ -115,6 +115,18 @@ pub enum Error {
     /// A `u8` value did not correspond to any [`FileType`] variant.
     #[error("invalid FileType discriminant: {0}")]
     InvalidFileType(u8),
+
+    /// A path arriving from an UNTRUSTED source (a Manifest page fetched from the
+    /// Vault) is not a safe Space-relative path. See
+    /// [`CanonicalPath::validate_untrusted`] for the exact rules and why this is a
+    /// hard error rather than a sanitization.
+    #[error("unsafe manifest path {path:?}: {reason}")]
+    UnsafePath {
+        /// The offending path, verbatim as it arrived.
+        path: String,
+        /// Which rule it broke.
+        reason: &'static str,
+    },
 }
 
 /// Crate-wide `Result` alias over the root [`Error`].
@@ -239,6 +251,115 @@ impl CanonicalPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Asserts this path is safe to join onto a Space root, for a path that came
+    /// from an UNTRUSTED source.
+    ///
+    /// A Manifest page is fetched from the Vault and its entries' `p` fields are a
+    /// remote-controlled `String` with a derived `Deserialize` — nothing on the way
+    /// in constrains them. `ft_fsmap::canonicalize` guards the OUTBOUND (scan) side
+    /// only, so this is the inbound half of that guarantee and must be called at
+    /// the trust boundary, before a path is joined onto the Space root.
+    ///
+    /// The rules (any violation is a hard error, never a silent sanitization — a
+    /// Manifest that breaks them is either corrupt or hostile, and quietly
+    /// rewriting the path would apply the wrong bytes to the wrong file):
+    ///
+    /// - non-empty (an empty path resolves to the Space root itself, which the
+    ///   apply path would then try to remove and replace with a regular file);
+    /// - no leading `/` (absolute);
+    /// - every `/`-separated component is a normal name: no `..` (escapes the
+    ///   root), no `.`, no empty component (`a//b`, trailing `/`);
+    /// - no NUL byte (truncates the path at the syscall boundary).
+    ///
+    /// # What this deliberately does NOT reject
+    ///
+    /// A backslash and a Windows drive prefix used to be hard errors here, and
+    /// that was a sync WEDGE: on Linux/macOS `foo\bar.txt` and `a:b.txt` are
+    /// perfectly legal file names that the scanner canonicalizes verbatim
+    /// (`ft_fsmap::canonicalize` pushes the OS bytes of every component), commits
+    /// into the Manifest, and publishes — after which every OTHER Device aborted
+    /// its whole pull on that one entry, forever, with nothing applied. Those two
+    /// rules are NOT about escaping the Space root on THIS platform; they are
+    /// portability rules, so they live in [`Self::unsyncable_reason`] and the
+    /// apply path skips the individual entry instead of failing the batch. The
+    /// rules kept above are ones the scanner can never emit, so a Manifest that
+    /// breaks one is corrupt or hostile and must still abort loudly.
+    pub fn validate_untrusted(&self) -> Result<()> {
+        let p = self.0.as_str();
+        let bad = |reason: &'static str| -> Error {
+            Error::UnsafePath {
+                path: p.to_string(),
+                reason,
+            }
+        };
+        if p.is_empty() {
+            return Err(bad("empty path"));
+        }
+        if p.starts_with('/') {
+            return Err(bad("absolute path"));
+        }
+        if p.contains('\0') {
+            return Err(bad("contains a NUL byte"));
+        }
+        for comp in p.split('/') {
+            match comp {
+                "" => return Err(bad("empty path component")),
+                "." => return Err(bad("contains a `.` component")),
+                ".." => return Err(bad("contains a `..` component")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Why this path cannot be SYNCED even though it is safe to join onto a Space
+    /// root — `Some(reason)` for a name filething refuses to carry across
+    /// platforms, `None` for an ordinary path.
+    ///
+    /// This is the portability half of [`Self::validate_untrusted`], and both
+    /// directions consult it so they agree on exactly which names are affected:
+    ///
+    /// - the SCANNER (outbound) leaves such a path out of the Manifest, reported
+    ///   as a skip, so a name that cannot round-trip is never published;
+    /// - `ft_diff::apply` (inbound) SKIPS such an entry instead of aborting the
+    ///   batch, so a name a pre-upgrade build already committed cannot wedge every
+    ///   peer's pull.
+    ///
+    /// The two rules, both applied PER COMPONENT (`docs/format.md §5.2` makes `/`
+    /// the only separator, so a component is exactly one on-disk file name):
+    ///
+    /// - a `\` in a component: it is a path SEPARATOR on Windows, so `a\..\..\b`
+    ///   is one harmless component here and an escape out of the Space root there;
+    /// - a component whose second byte is `:` (`C:`, `a:b.txt`): Windows reads it
+    ///   as a drive prefix, which makes the join replace the root outright.
+    ///
+    /// The per-component check is what makes the rule COHERENT. Applying the
+    /// drive-prefix heuristic to the whole path only ever looked at byte 1 of the
+    /// string, so `a:b.txt` in the root was rejected while `docs/a:b.txt` — the
+    /// same file name, one directory down — sailed through. Either both are
+    /// unsyncable or neither is; per component says both, and matches what the
+    /// rule is actually about (a NAME, not an offset).
+    pub fn unsyncable_reason(&self) -> Option<&'static str> {
+        self.0.split('/').find_map(unsyncable_component_reason)
+    }
+}
+
+/// Why a single path COMPONENT (one on-disk file name) is unsyncable, or `None`.
+/// The one place the rule is written down; see [`CanonicalPath::unsyncable_reason`]
+/// for why these two names are a portability matter and not a trust-boundary one.
+pub fn unsyncable_component_reason(comp: &str) -> Option<&'static str> {
+    if comp.contains('\\') {
+        // A separator on Windows: `a\..\..\b` is one component here and an escape
+        // out of the Space root there.
+        return Some("contains a backslash");
+    }
+    if comp.len() >= 2 && comp.as_bytes()[1] == b':' {
+        // `C:` / `a:b.txt` — a drive prefix on Windows, which makes a join REPLACE
+        // the root instead of extending it.
+        return Some("looks like a Windows drive prefix");
+    }
+    None
 }
 
 impl fmt::Debug for CanonicalPath {
@@ -403,6 +524,63 @@ pub struct FileEntry {
     /// RESERVED windows-unsafe flag; absent/false by default. `§5.1` field `"wu"`.
     #[serde(rename = "wu", default, skip_serializing_if = "Option::is_none")]
     pub wu: Option<bool>,
+}
+
+impl FileEntry {
+    /// Asserts this entry, which arrived from an UNTRUSTED Manifest page, is safe
+    /// to act on. Call this at the trust boundary — the moment a page is decoded —
+    /// so no later code has to remember to.
+    ///
+    /// Checks the entry's path with [`CanonicalPath::validate_untrusted`], and for
+    /// a [`FileType::Symlink`] also rejects a target that would let a LATER write
+    /// through the link land outside the Space: an absolute target, or a relative
+    /// one whose `..` components climb above the link's own directory. (The
+    /// scanner applies the equivalent rule outbound via `ft_fsmap::symlink_policy`;
+    /// this is the inbound half.) A symlink with no target at all is rejected too —
+    /// materializing it would silently create a link to `""`.
+    pub fn validate_untrusted(&self) -> Result<()> {
+        self.p.validate_untrusted()?;
+
+        if self.t == FileType::Symlink {
+            let bad = |reason: &'static str| -> Error {
+                Error::UnsafePath {
+                    path: self.p.0.clone(),
+                    reason,
+                }
+            };
+            let target = self
+                .lt
+                .as_deref()
+                .ok_or_else(|| bad("symlink has no target"))?;
+            if target.is_empty() {
+                return Err(bad("symlink target is empty"));
+            }
+            if target.contains('\0') {
+                return Err(bad("symlink target contains a NUL byte"));
+            }
+            if target.starts_with('/') || (target.len() >= 2 && target.as_bytes()[1] == b':') {
+                return Err(bad("symlink target is absolute"));
+            }
+            // Walk the target relative to the link's own DIRECTORY depth: the link
+            // `a/b/link` sits at depth 2, so a target may climb at most twice
+            // before it would leave the Space root.
+            let mut depth = self.p.0.split('/').count() - 1;
+            for comp in target.split('/') {
+                match comp {
+                    ".." => {
+                        if depth == 0 {
+                            return Err(bad("symlink target escapes the Space root"));
+                        }
+                        depth -= 1;
+                    }
+                    "." | "" => {}
+                    _ => depth += 1,
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +833,185 @@ impl BlockHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- validate_untrusted: the inbound Manifest trust boundary -----
+
+    /// Builds a minimal entry of `t` at `p` (with `lt` for symlinks) for the
+    /// validation tests.
+    fn entry(p: &str, t: FileType, lt: Option<&str>) -> FileEntry {
+        FileEntry {
+            p: CanonicalPath(p.to_string()),
+            t,
+            x: false,
+            sz: 0,
+            pcid: Pcid::new([0u8; 32]),
+            bk: Vec::new(),
+            bk_ref: None,
+            lt: lt.map(|s| s.to_string()),
+            wu: None,
+        }
+    }
+
+    /// Ordinary Space-relative paths pass, including ones with dots INSIDE a
+    /// component (`..foo`, `a..b`) which are legitimate file names.
+    #[test]
+    fn validate_untrusted_accepts_ordinary_paths() {
+        for ok in [
+            "a",
+            "src/main.rs",
+            "a/b/c/d.txt",
+            "..foo",
+            "a..b/c",
+            "dir/.hidden",
+            "espacio con nombre/café.md",
+        ] {
+            CanonicalPath(ok.to_string())
+                .validate_untrusted()
+                .unwrap_or_else(|e| panic!("{ok:?} should be accepted: {e}"));
+        }
+    }
+
+    /// The escape vectors: `..` traversal, absolute paths, empty components, NUL,
+    /// and the empty path (which would resolve to the Space root itself). Every
+    /// one of these is something the scanner can NEVER produce, so it stays a hard
+    /// error.
+    #[test]
+    fn validate_untrusted_rejects_escapes() {
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "../../.ssh/authorized_keys",
+            "a/../../b",
+            "a/..",
+            "/etc/passwd",
+            "/",
+            ".",
+            "./a",
+            "a/./b",
+            "a//b",
+            "a/",
+            "a\0b",
+        ] {
+            assert!(
+                CanonicalPath(bad.to_string()).validate_untrusted().is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A backslash / drive-prefix name is a legal unix file name the scanner can
+    /// and did commit, so it must NOT be a trust-boundary error any more: it is
+    /// safe to join onto the root here, merely unsyncable. (Before this split, one
+    /// such entry aborted every peer's entire pull, forever.)
+    #[test]
+    fn validate_untrusted_accepts_unsyncable_names_and_flags_them_separately() {
+        for name in [
+            "a\\..\\..\\b",
+            "C:/Windows/system32",
+            "C:foo",
+            "docs/a:b.txt",
+        ] {
+            let p = CanonicalPath(name.to_string());
+            p.validate_untrusted()
+                .unwrap_or_else(|e| panic!("{name:?} must not be a hard error: {e}"));
+            assert!(
+                p.unsyncable_reason().is_some(),
+                "{name:?} must be reported unsyncable"
+            );
+        }
+    }
+
+    /// The drive-prefix rule is PER COMPONENT, so a name is unsyncable wherever it
+    /// sits in the tree — the old whole-path check only looked at byte 1 and so
+    /// rejected `a:b.txt` while accepting `docs/a:b.txt`.
+    #[test]
+    fn unsyncable_reason_is_per_component_and_leaves_ordinary_paths_alone() {
+        assert_eq!(
+            CanonicalPath("a:b.txt".to_string()).unsyncable_reason(),
+            CanonicalPath("docs/deep/a:b.txt".to_string()).unsyncable_reason(),
+        );
+        assert_eq!(
+            CanonicalPath("foo\\bar.txt".to_string()).unsyncable_reason(),
+            Some("contains a backslash")
+        );
+        for ok in [
+            "a.txt",
+            "docs/notes.md",
+            "ab:c.txt",        // only byte 1 is the drive heuristic
+            "espacio/caf:.md", // ditto: `:` elsewhere in the name is fine
+        ] {
+            assert_eq!(
+                CanonicalPath(ok.to_string()).unsyncable_reason(),
+                None,
+                "{ok:?} must stay syncable"
+            );
+        }
+    }
+
+    /// The rejection names the path and the rule, so the error is actionable.
+    #[test]
+    fn unsafe_path_error_names_path_and_reason() {
+        let err = CanonicalPath("../../x".to_string())
+            .validate_untrusted()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("../../x"), "{msg}");
+        assert!(msg.contains(".."), "{msg}");
+    }
+
+    /// A symlink target may climb only as far as its own depth allows; anything
+    /// that would leave the Space (or is absolute) is rejected.
+    #[test]
+    fn validate_untrusted_checks_symlink_targets() {
+        // Inside the Space: fine.
+        entry("a/link", FileType::Symlink, Some("../b"))
+            .validate_untrusted()
+            .unwrap();
+        entry("a/b/link", FileType::Symlink, Some("../../c"))
+            .validate_untrusted()
+            .unwrap();
+        entry("link", FileType::Symlink, Some("target.txt"))
+            .validate_untrusted()
+            .unwrap();
+        entry("a/link", FileType::Symlink, Some("b/../c"))
+            .validate_untrusted()
+            .unwrap();
+
+        // Escaping or absolute: rejected.
+        for (p, lt) in [
+            ("link", ".."),
+            ("link", "../outside"),
+            ("a/link", "../../outside"),
+            ("a/b/link", "../../../outside"),
+            ("link", "/Users/victim/.ssh"),
+            ("link", "/etc"),
+            ("link", "C:/Windows"),
+            ("link", ""),
+        ] {
+            assert!(
+                entry(p, FileType::Symlink, Some(lt))
+                    .validate_untrusted()
+                    .is_err(),
+                "symlink {p:?} -> {lt:?} must be rejected"
+            );
+        }
+
+        // A symlink with no target at all is rejected.
+        assert!(entry("link", FileType::Symlink, None)
+            .validate_untrusted()
+            .is_err());
+    }
+
+    /// A non-symlink entry is not subject to the target rules (its `lt` is unused),
+    /// but its path is still validated.
+    #[test]
+    fn validate_untrusted_validates_path_for_every_type() {
+        for t in [FileType::File, FileType::Derived, FileType::Dir] {
+            entry("ok/path", t, None).validate_untrusted().unwrap();
+            assert!(entry("../escape", t, None).validate_untrusted().is_err());
+        }
+    }
 
     // ----- Cid / Pcid hex roundtrip -----
 

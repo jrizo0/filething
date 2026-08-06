@@ -108,7 +108,14 @@ pub fn read_space_key(root: &Path) -> anyhow::Result<Option<[u8; 32]>> {
 }
 
 /// Caches a Space's `space_key` at `<root>/.filething/space_key`, `0600`.
+///
+/// Goes through [`crate::env::ensure_control_dir`] rather than letting
+/// [`write_secret_file`] create the parent, because that is what drops the
+/// self-ignoring `.gitignore` next to the key: the control dir sits INSIDE the
+/// user's synced folder, which for a developer folder is very often a git
+/// repository, and nothing else stops `git add -A` from committing the Space key.
 pub fn write_space_key(root: &Path, space_key: &[u8; 32]) -> anyhow::Result<()> {
+    crate::env::ensure_control_dir(root)?;
     write_secret_file(&space_key_path(root), hex::encode(space_key).as_bytes())
 }
 
@@ -126,13 +133,12 @@ fn decode_secret(hexstr: &str, what: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Writes `bytes` to `path` with `0600` permissions, creating the parent dir.
-/// On Unix the file is created `0600` from the start (never briefly world-
+/// Writes `bytes` to `path` with `0600` permissions, creating the parent dir
+/// `0700`. On Unix the file is created `0600` from the start (never briefly world-
 /// readable); the mode is re-asserted on an existing file.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("creating {}: {e}", parent.display()))?;
+        crate::config::ensure_private_dir(parent)?;
     }
     #[cfg(unix)]
     {
@@ -217,6 +223,55 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "space_key must be 0600, got {mode:o}");
+    }
+
+    /// The control dir holds the Space key and the local index INSIDE the user's
+    /// synced folder, which is very often a git repo. Caching a key must therefore
+    /// also drop a `.gitignore` that ignores the whole directory (itself included),
+    /// so no repo-level rule or `git add -A` can commit the key.
+    #[test]
+    fn caching_a_space_key_makes_the_control_dir_ignore_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        write_space_key(dir.path(), &[0x11u8; 32]).unwrap();
+        let ignore = dir.path().join(CONTROL_DIR).join(".gitignore");
+        let body = std::fs::read_to_string(&ignore)
+            .unwrap_or_else(|e| panic!("{} should exist: {e}", ignore.display()));
+        assert!(
+            body.lines().any(|l| l.trim() == "*"),
+            "the .gitignore must ignore everything, got: {body:?}"
+        );
+    }
+
+    /// The dir holding a secret must be 0700, not the 0755 `create_dir_all` leaves:
+    /// the config dir (`credentials.json`) and a Space's control dir (`space_key`).
+    #[cfg(unix)]
+    #[test]
+    fn dirs_holding_secrets_are_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+
+        let config_home = dir.path().join("config-home");
+        Credentials {
+            session_token: "s".into(),
+            dedup_secret_hex: hex::encode([1u8; 32]),
+        }
+        .save_to(&config_home.join(CREDENTIALS_FILE))
+        .unwrap();
+        let mode = std::fs::metadata(&config_home)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "config dir must be 0700, got {mode:o}");
+
+        let root = dir.path().join("space");
+        write_space_key(&root, &[2u8; 32]).unwrap();
+        let mode = std::fs::metadata(root.join(CONTROL_DIR))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "control dir must be 0700, got {mode:o}");
     }
 
     #[test]

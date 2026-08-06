@@ -24,8 +24,18 @@
 //! the `space_state.last_synced_revision_id` column — is applied with an
 //! idempotent `ALTER TABLE ADD COLUMN` (see [`Index::init`]) because
 //! `CREATE TABLE IF NOT EXISTS` never alters a table that already exists.
+//!
+//! Two processes share one file: the daemon holds the index open while a one-shot
+//! `filething status`/`sync` opens the same path, so the connection runs in WAL
+//! with a busy timeout ([`Index::init`]) and the batch writers take ONE
+//! transaction. The schema shape is stamped in `PRAGMA user_version`
+//! ([`SCHEMA_VERSION`]) so a DB written by a NEWER filething is refused loudly
+//! instead of silently misread — `filething update` is manual, so two Devices on
+//! different versions is normal.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use ft_core::{CanonicalPath, CasefoldKey, Cid, FileType, Pcid};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -62,6 +72,21 @@ pub enum Error {
     /// A `type` column held a value that is not a valid [`FileType`].
     #[error("invalid FileType discriminant in row: {0}")]
     InvalidFileType(u8),
+
+    /// The DB's stamped schema version is newer than this binary understands.
+    /// Opening it anyway would read the §9 tables with the wrong shape, so the
+    /// open is refused before ANY statement touches the file.
+    #[error(
+        "this Space's local index was written by a newer filething \
+         (index schema v{found}, this build understands v{supported}); \
+         run `filething update`"
+    )]
+    SchemaTooNew {
+        /// Version found in `PRAGMA user_version`.
+        found: i64,
+        /// Highest version this binary can read ([`SCHEMA_VERSION`]).
+        supported: i64,
+    },
 }
 
 /// Crate-wide `Result` alias over the local index [`Error`].
@@ -193,6 +218,41 @@ CREATE TABLE IF NOT EXISTS dedup_local (
 );
 "#;
 
+/// Shape of the §9 schema this binary reads and writes, stamped in
+/// `PRAGMA user_version`. Bump ONLY together with a migration step in
+/// [`Index::init`].
+///
+/// `0` is not a version: SQLite reports it both for a brand-new file and for a DB
+/// written by a filething from before the stamp existed (≤0.3.0). The §9 DDL is
+/// idempotent, so it doubles as the `0 -> 1` migration for both.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// How long a write waits for a lock the OTHER process holds before giving up.
+/// The daemon and a one-shot CLI command open the same file, so contention is
+/// normal and must WAIT rather than surface `database is locked` to the user.
+///
+/// Longer than the 5 s `rusqlite` happens to install by default, on purpose:
+/// [`Index::upsert_entries`] holds the write lock for a whole scan, which on a big
+/// tree is seconds, and waiting out the daemon beats failing next to it. Set
+/// explicitly so the behaviour is ours and not a default that could change.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The one-row `local_entry` upsert, shared by [`Index::upsert_entry`] and
+/// [`Index::upsert_entries`] so a batch write can never drift from a single one.
+const UPSERT_ENTRY_SQL: &str = "INSERT INTO local_entry \
+       (space_id, path, casefold_key, type, exec, size, mtime, pcid, base_seq, blocks, local_only) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+     ON CONFLICT(space_id, path) DO UPDATE SET \
+       casefold_key = excluded.casefold_key, \
+       type = excluded.type, \
+       exec = excluded.exec, \
+       size = excluded.size, \
+       mtime = excluded.mtime, \
+       pcid = excluded.pcid, \
+       base_seq = excluded.base_seq, \
+       blocks = excluded.blocks, \
+       local_only = excluded.local_only";
+
 // ---------------------------------------------------------------------------
 // Index
 // ---------------------------------------------------------------------------
@@ -206,8 +266,17 @@ pub struct Index {
 impl Index {
     /// Opens (creating if absent) the local index at `path` and ensures the §9
     /// schema exists.
+    ///
+    /// Fails with [`Error::SchemaTooNew`] if the file was written by a newer
+    /// filething.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // The index holds every synced path NAME, so it must not be readable by
+        // other users of the machine — same rule as the CLI's `credentials.json`.
+        // Runs BEFORE `init` switches on WAL because SQLite derives the mode of the
+        // `-wal`/`-shm` sidecars from the DB file's mode.
+        #[cfg(unix)]
+        restrict_to_owner(path);
         Self::init(conn)
     }
 
@@ -218,6 +287,32 @@ impl Index {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // Only the busy timeout may precede the version gate: it is a per-CONNECTION
+        // setting that writes nothing to the file, and the gate's own `PRAGMA
+        // user_version` read must wait rather than fail if the other process holds
+        // the lock.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+
+        // Version gate BEFORE any DDL, write, or FILE-FORMAT change: a DB stamped
+        // by a newer filething may hold columns/tables this binary would
+        // half-migrate or misread, so we do not touch it at all. That is why
+        // `apply_pragmas` runs AFTER and not before: `journal_mode=WAL` is
+        // PERSISTENT — it rewrites the header of the database file and spawns the
+        // `-wal`/`-shm` sidecars — so applying it first would have modified the very
+        // file this error claims to leave untouched (and, on a DB the newer build
+        // deliberately kept in rollback-journal mode, changed its format behind its
+        // back).
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found > SCHEMA_VERSION {
+            return Err(Error::SchemaTooNew {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+
+        // The version is accepted: now the connection can be configured for real.
+        Self::apply_pragmas(&conn)?;
+
         conn.execute_batch(SCHEMA)?;
         // Additive migration: `CREATE TABLE IF NOT EXISTS` never touches a table
         // that already exists, so a DB created before `last_synced_revision_id`
@@ -233,7 +328,48 @@ impl Index {
                 return Err(e.into());
             }
         }
+
+        // Everything above is the `0 -> 1` forward migration (fresh file OR a
+        // pre-stamp DB), so stamping it now is what makes the gate meaningful next
+        // time. A future v2 adds its own steps keyed off `found` — or fails as
+        // loudly as the too-new case if it cannot migrate. Crashing between the
+        // DDL and the stamp is benign: `found` stays 0 and the next open replays
+        // the same idempotent statements.
+        if found != SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Connection settings that must be in place before the first statement that
+    /// reads or writes the `§9` tables — but AFTER the schema-version gate, since
+    /// `journal_mode=WAL` is a persistent file-format change (see [`Self::init`]).
+    /// The busy timeout is the one exception and is set by `init` itself, ahead of
+    /// the gate's read; setting it again here is idempotent and keeps this function
+    /// a complete description of the connection.
+    ///
+    /// WAL plus a busy timeout is what makes the daemon + one-shot-CLI pair work:
+    /// WAL lets a reader run while the other process commits, and the timeout
+    /// turns the remaining write-write overlap into a short WAIT instead of a raw
+    /// `database is locked` error in the user's face. `synchronous=NORMAL` is the
+    /// standard companion to WAL — a power loss can lose the last commits but
+    /// never corrupt the file, and this index is a rebuildable cache of the FS +
+    /// Coordinator (a lost tail only costs a re-scan).
+    fn apply_pragmas(conn: &Connection) -> Result<()> {
+        // First, so that everything after it — including the switch into WAL, which
+        // wants a brief exclusive lock, and the DDL in `init` — waits rather than
+        // failing when the other process got there first.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // `PRAGMA journal_mode` RETURNS the resulting mode, so it must be queried,
+        // not executed. An in-memory DB can only be `memory` and silently stays
+        // there — nothing shares it, so that is fine.
+        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // The §9 schema declares no FOREIGN KEY today; enforcement is per
+        // connection and OFF by default, so turning it on now means any future one
+        // is enforced from its first release rather than silently ignored.
+        conn.pragma_update(None, "foreign_keys", true)?;
+        Ok(())
     }
 
     /// Borrows the underlying connection (escape hatch for adjacent crates that
@@ -318,35 +454,26 @@ impl Index {
 
     /// Inserts or replaces a [`LocalEntry`] for `(space_id, entry.path)`.
     pub fn upsert_entry(&self, space_id: &str, entry: &LocalEntry) -> Result<()> {
-        let blocks_blob = encode_blocks(&entry.blocks)?;
-        self.conn.execute(
-            "INSERT INTO local_entry \
-               (space_id, path, casefold_key, type, exec, size, mtime, pcid, base_seq, blocks, local_only) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(space_id, path) DO UPDATE SET \
-               casefold_key = excluded.casefold_key, \
-               type = excluded.type, \
-               exec = excluded.exec, \
-               size = excluded.size, \
-               mtime = excluded.mtime, \
-               pcid = excluded.pcid, \
-               base_seq = excluded.base_seq, \
-               blocks = excluded.blocks, \
-               local_only = excluded.local_only",
-            params![
-                space_id,
-                entry.path.as_str(),
-                entry.casefold_key.as_str(),
-                entry.file_type.as_u8() as i64,
-                entry.exec as i64,
-                entry.size as i64,
-                entry.mtime,
-                entry.pcid.map(|p| p.as_bytes().to_vec()),
-                entry.base_seq,
-                blocks_blob,
-                entry.local_only as i64,
-            ],
-        )?;
+        let mut stmt = self.conn.prepare_cached(UPSERT_ENTRY_SQL)?;
+        upsert_entry_with(&mut stmt, space_id, entry)
+    }
+
+    /// Inserts or replaces MANY entries in one transaction — the shape a full scan
+    /// or a pull's apply pass writes.
+    ///
+    /// One `upsert_entry` per row is one durable transaction (one fsync) per row,
+    /// which dominates the cost of a large scan; batching makes it one. Also
+    /// all-or-nothing: a scan that fails halfway leaves the previous consistent
+    /// state rather than a half-written one, and the next scan redoes it.
+    pub fn upsert_entries(&self, space_id: &str, entries: &[LocalEntry]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(UPSERT_ENTRY_SQL)?;
+            for entry in entries {
+                upsert_entry_with(&mut stmt, space_id, entry)?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -435,6 +562,13 @@ impl Index {
     }
 
     // ---- local_block ("what do I already have") ----
+    //
+    // ADVISORY cache, and today write-ONLY: `pull`/`commit` fill it but nothing in
+    // the wired paths reads it back — commit deliberately does HEAD-before-PUT
+    // instead, because GC can delete a Block this table still claims (ADR 0012 §4).
+    // So a missing row only ever costs a HEAD or a re-download, never correctness,
+    // which is what makes [`Index::prune_blocks`] safe. The table stays because it
+    // is normative §9 and is what a future "what am I missing" pass would read.
 
     /// Returns whether `cid`'s Block is recorded as present locally for `space_id`.
     pub fn has_block(&self, space_id: &str, cid: &Cid) -> Result<bool> {
@@ -459,6 +593,24 @@ impl Index {
         Ok(())
     }
 
+    /// Marks many Blocks as present locally for `space_id` in ONE transaction —
+    /// the shape a pull's apply pass and a commit's upload pass write (they loop
+    /// over every Block of every changed file).
+    pub fn put_blocks(&self, space_id: &str, cids: &[Cid]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO local_block (space_id, cid) VALUES (?1, ?2) \
+                 ON CONFLICT(space_id, cid) DO NOTHING",
+            )?;
+            for cid in cids {
+                stmt.execute(params![space_id, cid.as_bytes().to_vec()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Lists every locally-present Block [`Cid`] for `space_id`.
     pub fn list_blocks(&self, space_id: &str) -> Result<Vec<Cid>> {
         let mut stmt = self
@@ -471,6 +623,65 @@ impl Index {
             out.push(cid_from_blob(&bytes)?);
         }
         Ok(out)
+    }
+
+    /// Drops the `local_block` rows of `space_id` whose Block is referenced by no
+    /// `local_entry` in that Space, returning how many went away.
+    ///
+    /// Nothing prunes this table otherwise, so it accumulates a row for every
+    /// Block ever pulled or uploaded — including every superseded version of every
+    /// rewritten file — for the life of the Space. Pruning is safe because the
+    /// table is advisory (see the section note): dropping a row that a concurrent
+    /// pull just added costs at most a re-download.
+    ///
+    /// Rows for OTHER Spaces are never touched (the key is `(space_id, cid)`).
+    pub fn prune_blocks(&self, space_id: &str) -> Result<usize> {
+        // Reads and deletes share one transaction so the "referenced" set and the
+        // rows we judge against it come from the same snapshot.
+        let tx = self.conn.unchecked_transaction()?;
+
+        // The referenced set lives in the CBOR `blocks` BLOBs, which SQL cannot
+        // look inside, so it has to be decoded here rather than expressed as a join.
+        let mut referenced: HashSet<[u8; 32]> = HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT blocks FROM local_entry WHERE space_id = ?1")?;
+            let mut rows = stmt.query(params![space_id])?;
+            while let Some(row) = rows.next()? {
+                if let Some(bytes) = row.get::<_, Option<Vec<u8>>>(0)? {
+                    for block in decode_blocks(&bytes)? {
+                        referenced.insert(*block.cid.as_bytes());
+                    }
+                }
+            }
+        }
+
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT cid FROM local_block WHERE space_id = ?1")?;
+            let mut rows = stmt.query(params![space_id])?;
+            while let Some(row) = rows.next()? {
+                let bytes: Vec<u8> = row.get(0)?;
+                // A wrong-length blob cannot match any BlockRef, so it is stale by
+                // definition — pruning it also cleans up the corruption.
+                let keep = <[u8; 32]>::try_from(&bytes[..])
+                    .map(|arr| referenced.contains(&arr))
+                    .unwrap_or(false);
+                if !keep {
+                    stale.push(bytes);
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        {
+            let mut stmt =
+                tx.prepare_cached("DELETE FROM local_block WHERE space_id = ?1 AND cid = ?2")?;
+            for cid in &stale {
+                removed += stmt.execute(params![space_id, cid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 }
 
@@ -516,6 +727,43 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> Result<LocalEntry> {
         blocks,
         local_only: local_only != 0,
     })
+}
+
+/// Binds one [`LocalEntry`] to an already-prepared [`UPSERT_ENTRY_SQL`] statement.
+/// Taking the statement lets the batch path prepare and bind once per transaction.
+fn upsert_entry_with(
+    stmt: &mut rusqlite::Statement<'_>,
+    space_id: &str,
+    entry: &LocalEntry,
+) -> Result<()> {
+    let blocks_blob = encode_blocks(&entry.blocks)?;
+    stmt.execute(params![
+        space_id,
+        entry.path.as_str(),
+        entry.casefold_key.as_str(),
+        entry.file_type.as_u8() as i64,
+        entry.exec as i64,
+        entry.size as i64,
+        entry.mtime,
+        entry.pcid.map(|p| p.as_bytes().to_vec()),
+        entry.base_seq,
+        blocks_blob,
+        entry.local_only as i64,
+    ])?;
+    Ok(())
+}
+
+/// Restricts the index file to its owner (`0600`), overriding the `0644 & ~umask`
+/// `Connection::open` would leave behind.
+///
+/// Best-effort on purpose: a Space can live on a volume with no POSIX modes
+/// (exFAT, SMB), where `chmod` fails and where a mode could not protect anything
+/// anyway — refusing to open the Space there would be a worse bug than the
+/// permissive mode. The index is metadata (path names), not key material.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 /// CBOR-encodes the ordered `{pcid, cid}` Block list for the `blocks` BLOB column.
@@ -594,6 +842,11 @@ mod tests {
             ],
             local_only: false,
         }
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
     }
 
     // ----- open -----
@@ -705,6 +958,182 @@ mod tests {
                 .last_synced_revision_id,
             Some("rev-after-migration".to_string())
         );
+    }
+
+    // ----- concurrency, durability and permissions of the open connection -----
+
+    #[test]
+    fn open_on_disk_uses_wal_a_busy_timeout_and_synchronous_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let idx = Index::open(&path).unwrap();
+        let conn = idx.connection();
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "daemon + CLI need reader/writer concurrency");
+        // Ours, not the 5000 `rusqlite` installs by default.
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, BUSY_TIMEOUT.as_millis() as i64);
+        // 1 = NORMAL.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn a_second_writer_waits_for_the_lock_instead_of_failing_with_database_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let held = Index::open(&path).unwrap();
+        // Take and HOLD the write lock, the way the daemon does mid-scan.
+        let tx = held.connection().unchecked_transaction().unwrap();
+        held.upsert_entry("space-1", &sample_entry("held.txt", "held.txt"))
+            .unwrap();
+
+        // The other process (a one-shot `filething sync`) writes meanwhile.
+        let other_path = path.clone();
+        let other = std::thread::spawn(move || {
+            let idx = Index::open(&other_path).unwrap();
+            idx.upsert_entry("space-1", &sample_entry("waited.txt", "waited.txt"))
+        });
+
+        // Long enough for it to hit the lock and start waiting on it.
+        std::thread::sleep(Duration::from_millis(250));
+        tx.commit().unwrap();
+
+        other
+            .join()
+            .unwrap()
+            .expect("the second writer must WAIT for the lock, not surface `database is locked`");
+        assert!(held
+            .get_entry("space-1", &CanonicalPath("waited.txt".to_string()))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_index_file_and_its_wal_sidecar_are_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let idx = Index::open(&path).unwrap();
+        // A committed write forces the `-wal` sidecar into existence.
+        idx.upsert_space_state(&sample_state()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "index holds every synced path name, got {mode:o}"
+        );
+        let wal = dir.path().join("index.sqlite-wal");
+        let wal_mode = std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            wal_mode & 0o077,
+            0,
+            "the -wal sidecar holds the same names, got {wal_mode:o}"
+        );
+    }
+
+    // ----- schema version gate (§9) -----
+
+    #[test]
+    fn a_fresh_database_is_stamped_with_the_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.sqlite");
+        let idx = Index::open(&path).unwrap();
+        assert_eq!(user_version(idx.connection()), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_an_index_stamped_by_a_newer_filething_fails_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 7)
+                .unwrap();
+        }
+        // The mode the newer build left the file in. `journal_mode` is PERSISTENT
+        // (it lives in the file header), so this is part of the file's state.
+        let mode_before: String = {
+            let conn = Connection::open(&path).unwrap();
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(mode_before, "delete", "sanity: a fresh DB is not in WAL");
+
+        let err = match Index::open(&path) {
+            Ok(_) => panic!("a too-new index must not open"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, Error::SchemaTooNew { found, supported }
+                if *found == SCHEMA_VERSION + 7 && *supported == SCHEMA_VERSION),
+            "{err:?}"
+        );
+        // The message must tell the user what to DO about it.
+        assert!(err.to_string().contains("filething update"), "{err}");
+
+        // And the newer DB must be left exactly as it was: no §9 table created
+        // under it, no re-stamp — and no FILE-FORMAT change either. Switching the
+        // journal mode to WAL rewrites the file header and creates the `-wal`/`-shm`
+        // sidecars, so doing it before the gate would modify the very file this
+        // error promises not to touch.
+        let conn = Connection::open(&path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        assert_eq!(user_version(&conn), SCHEMA_VERSION + 7);
+        let mode_after: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mode_after, mode_before,
+            "the refused DB's journal mode must be untouched"
+        );
+        assert!(
+            !path.with_extension("sqlite-wal").exists(),
+            "a refused open must not leave a -wal sidecar behind"
+        );
+    }
+
+    #[test]
+    fn an_unversioned_database_is_migrated_forward_and_stamped_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unstamped.sqlite");
+        {
+            // What a ≤0.3.0 binary leaves behind: the right shape, no stamp.
+            let idx = Index::open(&path).unwrap();
+            idx.upsert_space_state(&sample_state()).unwrap();
+            idx.upsert_entry("space-1", &sample_entry("kept.txt", "kept.txt"))
+                .unwrap();
+            idx.connection()
+                .pragma_update(None, "user_version", 0)
+                .unwrap();
+        }
+
+        let idx = Index::open(&path).unwrap();
+        assert_eq!(user_version(idx.connection()), SCHEMA_VERSION);
+        assert_eq!(
+            idx.get_space_state("space-1").unwrap().unwrap(),
+            sample_state()
+        );
+        assert_eq!(idx.list_entries("space-1").unwrap().len(), 1);
     }
 
     // ----- space_state roundtrip -----
@@ -859,6 +1288,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn upsert_entries_writes_every_row_of_the_batch() {
+        let idx = Index::open_in_memory().unwrap();
+        let batch = vec![
+            sample_entry("a.txt", "a.txt"),
+            sample_entry("b.txt", "b.txt"),
+            sample_entry("c.txt", "c.txt"),
+        ];
+        idx.upsert_entries("space-1", &batch).unwrap();
+        assert_eq!(idx.list_entries("space-1").unwrap(), batch);
+
+        // Re-running the batch upserts (as a re-scan does) instead of failing on
+        // the primary key.
+        let mut again = batch.clone();
+        again[1].size = 4242;
+        idx.upsert_entries("space-1", &again).unwrap();
+        assert_eq!(idx.list_entries("space-1").unwrap().len(), 3);
+        assert_eq!(
+            idx.get_entry("space-1", &CanonicalPath("b.txt".to_string()))
+                .unwrap()
+                .unwrap()
+                .size,
+            4242
+        );
+
+        // An empty batch is a no-op, not an error (a scan with no changes).
+        idx.upsert_entries("space-1", &[]).unwrap();
+        assert_eq!(idx.list_entries("space-1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn upsert_entries_rolls_back_the_whole_batch_when_one_row_fails() {
+        let idx = Index::open_in_memory().unwrap();
+        // Two paths sharing a casefold_key is LEGAL in §9 (that is the collision
+        // case), so make it illegal for this test only to get a mid-batch failure.
+        idx.connection()
+            .execute_batch(
+                "CREATE UNIQUE INDEX tmp_unique_casefold ON local_entry(space_id, casefold_key)",
+            )
+            .unwrap();
+
+        let batch = vec![
+            sample_entry("ok.txt", "ok.txt"),
+            sample_entry("README.md", "readme.md"),
+            sample_entry("readme.md", "readme.md"),
+        ];
+        assert!(idx.upsert_entries("space-1", &batch).is_err());
+        // One transaction ⇒ the rows written before the failure went with it.
+        assert!(idx.list_entries("space-1").unwrap().is_empty());
     }
 
     #[test]
@@ -1021,6 +1501,65 @@ mod tests {
         let mut got = idx.list_blocks("space-1").unwrap();
         got.sort();
         assert_eq!(got, vec![Cid::new([1u8; 32]), Cid::new([2u8; 32])]);
+    }
+
+    #[test]
+    fn put_blocks_marks_every_block_present_and_is_idempotent() {
+        let idx = Index::open_in_memory().unwrap();
+        let cids = [
+            Cid::new([1u8; 32]),
+            Cid::new([2u8; 32]),
+            Cid::new([3u8; 32]),
+        ];
+        idx.put_blocks("space-1", &cids).unwrap();
+        idx.put_blocks("space-1", &cids).unwrap();
+        let mut got = idx.list_blocks("space-1").unwrap();
+        got.sort();
+        assert_eq!(got, cids.to_vec());
+        assert!(!idx.has_block("space-2", &cids[0]).unwrap());
+        idx.put_blocks("space-1", &[]).unwrap();
+        assert_eq!(idx.list_blocks("space-1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn prune_blocks_drops_only_the_blocks_no_entry_references() {
+        let idx = Index::open_in_memory().unwrap();
+        // `sample_entry` references Blocks 1 and 2; 0xEE is left over from a
+        // superseded version of some file.
+        idx.upsert_entry("space-1", &sample_entry("kept.bin", "kept.bin"))
+            .unwrap();
+        idx.put_blocks(
+            "space-1",
+            &[
+                Cid::new([1u8; 32]),
+                Cid::new([2u8; 32]),
+                Cid::new([0xEE; 32]),
+            ],
+        )
+        .unwrap();
+        // Another Space's rows are off limits even for the same cid.
+        idx.put_block("space-2", &Cid::new([0xEE; 32])).unwrap();
+
+        assert_eq!(idx.prune_blocks("space-1").unwrap(), 1);
+        let mut got = idx.list_blocks("space-1").unwrap();
+        got.sort();
+        assert_eq!(got, vec![Cid::new([1u8; 32]), Cid::new([2u8; 32])]);
+        assert!(idx.has_block("space-2", &Cid::new([0xEE; 32])).unwrap());
+        // Nothing left to reclaim on a second pass.
+        assert_eq!(idx.prune_blocks("space-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_blocks_reclaims_the_rows_of_a_deleted_entry() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_entry("space-1", &sample_entry("gone.bin", "gone.bin"))
+            .unwrap();
+        idx.put_blocks("space-1", &[Cid::new([1u8; 32]), Cid::new([2u8; 32])])
+            .unwrap();
+        idx.delete_entry("space-1", &CanonicalPath("gone.bin".to_string()))
+            .unwrap();
+        assert_eq!(idx.prune_blocks("space-1").unwrap(), 2);
+        assert!(idx.list_blocks("space-1").unwrap().is_empty());
     }
 
     // ----- CBOR serialization of the `blocks` column -----

@@ -23,8 +23,9 @@ pub enum Merge3 {
     /// The three versions reconciled cleanly; carries the merged bytes (never
     /// containing conflict markers).
     Clean(Vec<u8>),
-    /// Both sides edited the same line region with different content (or a
-    /// size/line budget was exceeded): decline, let the caller keep both.
+    /// Both sides edited the same line region with different content, the two
+    /// sides disagree about which copy of a run of identical lines survived, or a
+    /// size/line budget was exceeded: decline, let the caller keep both.
     Conflict,
     /// At least one side is not valid UTF-8 text (or carries a NUL byte): no
     /// textual merge is meaningful. The caller keeps both.
@@ -104,16 +105,25 @@ pub fn merge3(base: &[u8], local: &[u8], remote: &[u8]) -> Merge3 {
     let sync = find_sync_regions(&blocks_l, &blocks_r);
 
     let mut out: Vec<u8> = Vec::with_capacity(local.len().max(remote.len()));
+    // Every gap decision, kept for the run post-condition below.
+    let mut picks: Vec<Pick<'_>> = Vec::with_capacity(sync.len() + 1);
     let (mut bp, mut lp, mut rp) = (0usize, 0usize, 0usize);
     for reg in &sync {
         // Unstable gap immediately before this stable region.
         let gap_base = &b[bp..reg.base_start];
         let gap_local = &l[lp..reg.local_start];
         let gap_remote = &r[rp..reg.remote_start];
-        if let Some(chunk) = merge_gap(gap_base, gap_local, gap_remote) {
-            out.extend_from_slice(&chunk);
-        } else {
-            return Merge3::Conflict;
+        match merge_gap(gap_base, gap_local, gap_remote) {
+            Some((lines, side)) => {
+                extend_lines(&mut out, lines);
+                picks.push(Pick {
+                    base_start: bp,
+                    base_end: reg.base_start,
+                    lines,
+                    side,
+                });
+            }
+            None => return Merge3::Conflict,
         }
         // Stable region: identical in all three, copy verbatim from base.
         extend_lines(&mut out, &b[reg.base_start..reg.base_end]);
@@ -124,38 +134,160 @@ pub fn merge3(base: &[u8], local: &[u8], remote: &[u8]) -> Merge3 {
 
     // Trailing unstable gap after the last stable region (there is no sentinel
     // stable region; the tail is flushed here).
-    if let Some(chunk) = merge_gap(&b[bp..], &l[lp..], &r[rp..]) {
-        out.extend_from_slice(&chunk);
-    } else {
+    match merge_gap(&b[bp..], &l[lp..], &r[rp..]) {
+        Some((lines, side)) => {
+            extend_lines(&mut out, lines);
+            picks.push(Pick {
+                base_start: bp,
+                base_end: b.len(),
+                lines,
+                side,
+            });
+        }
+        None => return Merge3::Conflict,
+    }
+
+    // Each gap was decided in isolation; that reasoning only holds while the two
+    // alignments agree on WHICH base line each gap covers. Runs of identical base
+    // lines break that, so audit them before promising a clean merge (`§10`).
+    if !runs_are_reconciled(&b, &picks) {
         return Merge3::Conflict;
     }
 
     Merge3::Clean(out)
 }
 
+/// Which side's lines a gap contributed. Recorded per gap because the run
+/// post-condition ([`runs_are_reconciled`]) has to know WHO made each edit it
+/// sees in the fused output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapSide {
+    /// Local's lines (remote left the gap at base).
+    Local,
+    /// Remote's lines (local left the gap at base).
+    Remote,
+    /// Both sides made the identical change, so the edit belongs to both.
+    Both,
+}
+
+/// One gap's decision: the base lines it replaces, the lines actually emitted and
+/// the side they came from.
+struct Pick<'a> {
+    base_start: usize,
+    base_end: usize,
+    lines: &'a [&'a [u8]],
+    side: GapSide,
+}
+
 /// Reconciles one unstable gap (`base`/`local`/`remote` line slices between two
-/// stable regions). Returns the chosen bytes, or `None` when both sides changed
-/// the gap differently (an overlap ⇒ conflict). An empty gap yields `Some(empty)`.
-fn merge_gap(gap_base: &[&[u8]], gap_local: &[&[u8]], gap_remote: &[&[u8]]) -> Option<Vec<u8>> {
+/// stable regions). Returns the chosen lines and their side, or `None` when both
+/// sides changed the gap differently (an overlap ⇒ conflict). An empty gap yields
+/// no lines.
+fn merge_gap<'a>(
+    gap_base: &'a [&'a [u8]],
+    gap_local: &'a [&'a [u8]],
+    gap_remote: &'a [&'a [u8]],
+) -> Option<(&'a [&'a [u8]], GapSide)> {
     if gap_base.is_empty() && gap_local.is_empty() && gap_remote.is_empty() {
-        return Some(Vec::new());
+        return Some((&[], GapSide::Both));
     }
-    let mut out = Vec::new();
     if gap_local == gap_base {
         // Local left this region at base ⇒ take the remote side.
-        extend_lines(&mut out, gap_remote);
-        Some(out)
+        Some((gap_remote, GapSide::Remote))
     } else if gap_remote == gap_base {
         // Remote left this region at base ⇒ take the local side.
-        extend_lines(&mut out, gap_local);
-        Some(out)
+        Some((gap_local, GapSide::Local))
     } else if gap_local == gap_remote {
         // Both sides made the identical change ⇒ clean.
-        extend_lines(&mut out, gap_local);
-        Some(out)
+        Some((gap_local, GapSide::Both))
     } else {
         None
     }
+}
+
+/// Post-condition on the fused picks: no run of identical `base` lines may end up
+/// shorter (or longer) than BOTH sides made it.
+///
+/// The two sides are aligned against base INDEPENDENTLY ([`matching_blocks`]), so
+/// inside a run of identical lines each side's LCS may keep a DIFFERENT copy of
+/// the run. [`find_sync_regions`] then splits the run into gaps that look
+/// disjoint: [`merge_gap`] takes local in one and remote in the other and applies
+/// BOTH edits, so a file ending in three identical `}` where each side drops one
+/// fuses with a single `}` — a line neither side dropped, written to the real path
+/// with no conflict copy. `§10` never loses an edit silently, so an ambiguous run
+/// declines to [`Merge3::Conflict`] and the caller keeps both versions.
+///
+/// Copies inside a run are interchangeable, so the only sound test is a count per
+/// run: the fused run may lose (or gain) at most as many copies as the side that
+/// lost (or gained) the most. Only runs of two or more copies need it — a single
+/// base line lies in exactly one gap, so exactly one pick decides its fate.
+/// Line texts that merely REPEAT in base without being adjacent are not runs:
+/// their copies have distinct context, each side's edit is unambiguous, and
+/// applying both is what `git merge-file` does.
+fn runs_are_reconciled(base: &[&[u8]], picks: &[Pick<'_>]) -> bool {
+    // Both lists are sorted by base position (gaps are emitted in base order and
+    // never overlap), so walk them together: a long common prefix/suffix full of
+    // runs costs nothing because no pick reaches it.
+    let mut first = 0;
+    let mut start = 0;
+    while start < base.len() {
+        let mut end = start + 1;
+        while end < base.len() && base[end] == base[start] {
+            end += 1;
+        }
+        if end - start >= 2 {
+            // A pure insertion covers no base line, so a gap touching either end of
+            // the run counts too: that is where an extra copy gets attached.
+            while first < picks.len() && picks[first].base_end < start {
+                first += 1;
+            }
+            let mut last = first;
+            while last < picks.len() && picks[last].base_start <= end {
+                last += 1;
+            }
+            if !run_is_reconciled(base, start, end, &picks[first..last]) {
+                return false;
+            }
+        }
+        start = end;
+    }
+    true
+}
+
+/// The per-run count test of [`runs_are_reconciled`] for the run `base[start..end]`.
+/// `picks` are exactly the gaps touching that run.
+fn run_is_reconciled(base: &[&[u8]], start: usize, end: usize, picks: &[Pick<'_>]) -> bool {
+    let text = base[start];
+    let (mut lost, mut lost_local, mut lost_remote) = (0usize, 0usize, 0usize);
+    let (mut gained, mut gained_local, mut gained_remote) = (0usize, 0usize, 0usize);
+    for pick in picks {
+        let in_base = count_copies(&base[pick.base_start..pick.base_end], text);
+        let in_pick = count_copies(pick.lines, text);
+        // Clamp losses to the copies of THIS run the gap actually covers, so a gap
+        // reaching past the run cannot charge another region's copies to it.
+        let covered = pick
+            .base_end
+            .min(end)
+            .saturating_sub(pick.base_start.max(start));
+        let lost_here = in_base.saturating_sub(in_pick).min(covered);
+        let gained_here = in_pick.saturating_sub(in_base);
+        lost += lost_here;
+        gained += gained_here;
+        if pick.side != GapSide::Remote {
+            lost_local += lost_here;
+            gained_local += gained_here;
+        }
+        if pick.side != GapSide::Local {
+            lost_remote += lost_here;
+            gained_remote += gained_here;
+        }
+    }
+    lost <= lost_local.max(lost_remote) && gained <= gained_local.max(gained_remote)
+}
+
+/// Lines in `lines` byte-identical to `text`.
+fn count_copies(lines: &[&[u8]], text: &[u8]) -> usize {
+    lines.iter().filter(|line| **line == text).count()
 }
 
 /// True when `data` is not treatable as UTF-8 text: invalid UTF-8 anywhere, or a
@@ -531,5 +663,96 @@ mod tests {
     fn oversized_side_declines_to_conflict() {
         let big = vec![b'a'; MAX_MERGE_BYTES + 1];
         assert_eq!(merge3(b"a\n", &big, b"b\n"), Merge3::Conflict);
+    }
+
+    /// Copies of `line` in `data`, for the run assertions below.
+    fn copies(data: &[u8], line: &[u8]) -> usize {
+        split_lines(data).into_iter().filter(|l| *l == line).count()
+    }
+
+    #[test]
+    fn deletions_around_different_copies_of_a_repeated_line_never_lose_one() {
+        // Base ends in a run of three identical `}`. Local renames the first line
+        // AND drops one `}`; remote only drops one `}`. The two sides are aligned
+        // against base INDEPENDENTLY, so their LCS keep DIFFERENT copies of the
+        // run: the drops land in two gaps that look disjoint and BOTH get applied,
+        // fusing a file with one `}` less than either side has. `§10` forbids
+        // silently losing a line, so this must never merge to a thinner run.
+        let base = b"a\nb\nc\n}\n}\n}\n";
+        let local = b"A!\nb\nc\n}\n}\n";
+        let remote = b"a\nb\nc\n}\n}\n";
+        match merge3(base, local, remote) {
+            Merge3::Conflict => {}
+            Merge3::Clean(out) => assert_eq!(
+                copies(&out, b"}\n"),
+                2,
+                "merged away a `}}` neither side dropped: {:?}",
+                String::from_utf8_lossy(&out)
+            ),
+            other => panic!("expected Clean or Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insertions_around_a_run_of_identical_lines_never_duplicate_one() {
+        // Mirror of the deletion case: base ends in a run of two `}`, both sides
+        // add a third one (local also renames a line). Their alignments attach the
+        // new copy to different ends of the run, so both insertions are applied
+        // and the run grows to FOUR — content neither side has.
+        let base = b"h1\na\nh2\n}\n}\n";
+        let local = b"h1\nA!\nh2\n}\n}\n}\n";
+        let remote = b"h1\na\nh2\n}\n}\n}\n";
+        match merge3(base, local, remote) {
+            Merge3::Conflict => {}
+            Merge3::Clean(out) => assert_eq!(
+                copies(&out, b"}\n"),
+                3,
+                "merged in a `}}` neither side added: {:?}",
+                String::from_utf8_lossy(&out)
+            ),
+            other => panic!("expected Clean or Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_sides_dropping_one_copy_of_a_repeated_line_is_clean() {
+        // Same run of three `}`, but each side drops ONE copy and edits a distinct
+        // anchored line: the run's fate is decided by a single gap where both sides
+        // agree, so the merge is clean and keeps two `}`.
+        let base = b"h1\na\nh2\nb\nh3\n}\n}\n}\n";
+        let local = b"h1\nA!\nh2\nb\nh3\n}\n}\n";
+        let remote = b"h1\na\nh2\nB!\nh3\n}\n}\n";
+        assert_eq!(
+            clean(merge3(base, local, remote)),
+            b"h1\nA!\nh2\nB!\nh3\n}\n}\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_whole_run_deleted_on_one_side_with_a_distant_edit_on_the_other_is_clean() {
+        // Local deletes BOTH copies of the run; remote edits an anchored line far
+        // away. Every copy lost is one local actually lost ⇒ clean.
+        let base = b"h1\nx\nx\nh2\nc\nh3\n";
+        let local = b"h1\nh2\nc\nh3\n";
+        let remote = b"h1\nx\nx\nh2\nC!\nh3\n";
+        assert_eq!(
+            clean(merge3(base, local, remote)),
+            b"h1\nh2\nC!\nh3\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn duplicate_lines_in_separate_regions_still_merge_cleanly() {
+        // The same line text (`}` and the blank line) occurs twice in base but NOT
+        // adjacently: the two copies sit in different regions with different
+        // context, so each side's edit is unambiguous and dropping both blanks is
+        // exactly what `git merge-file` does. The run guard must not reach here.
+        let base = b"fn a() {\n\n}\nfn b() {\n\n}\n";
+        let local = b"fn a() {\n  x;\n}\nfn b() {\n\n}\n";
+        let remote = b"fn a() {\n\n}\nfn b() {\n  y;\n}\n";
+        assert_eq!(
+            clean(merge3(base, local, remote)),
+            b"fn a() {\n  x;\n}\nfn b() {\n  y;\n}\n".to_vec()
+        );
     }
 }

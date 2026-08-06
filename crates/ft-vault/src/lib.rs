@@ -18,10 +18,12 @@
 //! Coordinator never reads the Vault (§6.1).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 // ---------------------------------------------------------------------------
 // Errors (docs/BUILD-PLAN.md §3 — thiserror per crate)
@@ -156,6 +158,16 @@ pub trait Vault: Send + Sync {
 // FsVault — local-filesystem backend (tests, single-machine gates)
 // ---------------------------------------------------------------------------
 
+/// Name prefix of the temporary file [`FsVault::put`] writes before renaming it
+/// into place. Reserved: `list` hides it and [`validate_key`] refuses to create
+/// it, so a half-written object can never surface to the GC as a Vault object.
+const FS_TMP_PREFIX: &str = ".ft-tmp-";
+
+/// Per-process counter that makes each [`FsVault::put`] temporary file unique, so
+/// two concurrent `put`s of the SAME content-addressed key cannot write over each
+/// other's half-finished bytes.
+static FS_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A [`Vault`] backed by a local directory: each `key` becomes the file
 /// `root/<key>` (parent dirs created on demand). Lets the single-machine gates
 /// and unit tests run with no Docker / MinIO. `docs/BUILD-PLAN.md §3`.
@@ -173,15 +185,62 @@ impl FsVault {
 
     /// Resolves a Vault `key` to its on-disk path under `root`. The key uses
     /// forward slashes (the fan-out format) which map directly to path segments.
-    fn path_for(&self, key: &str) -> PathBuf {
-        self.root.join(key)
+    /// Rejects a key that would not stay under `root` — see [`validate_key`].
+    fn path_for(&self, key: &str) -> VaultResult<PathBuf> {
+        validate_key(key)?;
+        Ok(self.root.join(key))
+    }
+}
+
+/// Rejects a Vault key that must not be turned into a path under an [`FsVault`]
+/// root.
+///
+/// Keys normally come from `ft-hash` (`blocks|manifest|blocklist|meta/<aa>/<cid>`,
+/// `keys/<space>/<aa>/<cid>`), but `FsVault` also backs self-hosting, where the
+/// key can originate off-machine — and `Path::join` ADOPTS an absolute argument
+/// wholesale while a `..` component walks out of the root, either of which turns a
+/// Vault key into arbitrary filesystem access. Only the SHAPE is checked, not the
+/// hex length: the gates and the GC legitimately address objects whose last
+/// component is not a full CID.
+fn validate_key(key: &str) -> VaultResult<()> {
+    let reason = if key.is_empty() {
+        Some("empty key")
+    } else if key.contains('\0') {
+        Some("NUL byte")
+    } else if key.contains('\\') {
+        // A backslash separates components on Windows, so `a\..\..\b` would escape
+        // there while looking like one harmless component to the checks below.
+        Some("backslash")
+    } else if key.starts_with('/') {
+        Some("absolute key")
+    } else if key.as_bytes().get(1) == Some(&b':') {
+        // `C:x` is drive-relative and `C:\x` absolute on Windows.
+        Some("drive prefix")
+    } else {
+        key.split('/').find_map(|component| match component {
+            "" => Some("empty component"),
+            "." => Some("`.` component"),
+            ".." => Some("`..` component"),
+            c if c.starts_with(FS_TMP_PREFIX) => Some("reserved temporary-file prefix"),
+            _ => None,
+        })
+    };
+    match reason {
+        None => Ok(()),
+        Some(reason) => Err(VaultError::Io {
+            key: key.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe vault key: {reason}"),
+            ),
+        }),
     }
 }
 
 #[async_trait]
 impl Vault for FsVault {
     async fn head(&self, key: &str) -> VaultResult<bool> {
-        let path = self.path_for(key);
+        let path = self.path_for(key)?;
         // `try_exists` distinguishes "absent" (Ok(false)) from a real IO error.
         match tokio::fs::try_exists(&path).await {
             Ok(exists) => Ok(exists),
@@ -193,7 +252,7 @@ impl Vault for FsVault {
     }
 
     async fn get(&self, key: &str) -> VaultResult<Vec<u8>> {
-        let path = self.path_for(key);
+        let path = self.path_for(key)?;
         match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(bytes),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -209,18 +268,38 @@ impl Vault for FsVault {
     }
 
     async fn put(&self, key: &str, body: Vec<u8>) -> VaultResult<()> {
-        let path = self.path_for(key);
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent, key).await?;
+        let path = self.path_for(key)?;
+        let parent = path.parent().unwrap_or(&self.root);
+        create_dir_all(parent, key).await?;
+
+        // Publish atomically (tmp file in the same directory + rename) instead of
+        // writing in place. Under content addressing the key IS the hash of the
+        // bytes, so a reader that observes a half-written file reads WRONG content
+        // under a valid CID — silent corruption, strictly worse than an absent
+        // object, which the caller would simply re-`put`.
+        let tmp = parent.join(format!(
+            "{FS_TMP_PREFIX}{}-{}",
+            std::process::id(),
+            FS_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let published = match write_and_sync(&tmp, &body).await {
+            // Content-addressed: renaming over an existing object replaces it with
+            // identical bytes — the idempotent `put` the trait promises.
+            Ok(()) => tokio::fs::rename(&tmp, &path).await,
+            Err(source) => Err(source),
+        };
+        match published {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                // Leave no orphan tmp file behind: `list` hides it from the GC, so
+                // nothing else would ever clean it up.
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(VaultError::Io {
+                    key: key.to_string(),
+                    source,
+                })
+            }
         }
-        // Content-addressed: if the object is already there, the write simply
-        // rewrites identical bytes — a safe no-op for the caller.
-        tokio::fs::write(&path, &body)
-            .await
-            .map_err(|source| VaultError::Io {
-                key: key.to_string(),
-                source,
-            })
     }
 
     async fn list(&self, prefix: &str) -> VaultResult<Vec<VaultObject>> {
@@ -254,6 +333,15 @@ impl Vault for FsVault {
                     stack.push(path);
                     continue;
                 }
+                // An in-flight `put`'s tmp file is not an object: the GC would
+                // otherwise diff a half-written file against the reachable set.
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(FS_TMP_PREFIX)
+                {
+                    continue;
+                }
                 // Reconstruct the Vault key from the path relative to root, always
                 // with forward slashes (the fan-out key shape) regardless of OS.
                 let Ok(rel) = path.strip_prefix(&self.root) else {
@@ -275,7 +363,7 @@ impl Vault for FsVault {
     }
 
     async fn delete(&self, key: &str) -> VaultResult<()> {
-        let path = self.path_for(key);
+        let path = self.path_for(key)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             // Idempotent: an already-absent object is a successful delete.
@@ -296,6 +384,16 @@ async fn create_dir_all(dir: &Path, key: &str) -> VaultResult<()> {
             key: key.to_string(),
             source,
         })
+}
+
+/// Writes `body` to `path` and flushes it to the device. The `fsync` is what makes
+/// [`FsVault::put`]'s rename safe across a crash: if the rename survived but the
+/// bytes did not, the vault would hold WRONG content under a content-addressed
+/// key, whereas losing both just makes the object absent.
+async fn write_and_sync(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(body).await?;
+    file.sync_all().await
 }
 
 // ---------------------------------------------------------------------------
@@ -395,13 +493,12 @@ impl Vault for S3Vault {
             Ok(_) => Ok(true),
             Err(err) => {
                 // A missing object is NOT an error: NoSuchKey / NotFound / 404.
-                let service_err = err.into_service_error();
-                if service_err.is_not_found() {
+                if err.as_service_error().is_some_and(|e| e.is_not_found()) {
                     return Ok(false);
                 }
                 Err(VaultError::S3 {
                     key: key.to_string(),
-                    message: format!("{service_err}"),
+                    message: describe_sdk_error(&err),
                 })
             }
         }
@@ -418,22 +515,21 @@ impl Vault for S3Vault {
         {
             Ok(resp) => resp,
             Err(err) => {
-                let service_err = err.into_service_error();
-                if service_err.is_no_such_key() {
+                if err.as_service_error().is_some_and(|e| e.is_no_such_key()) {
                     return Err(VaultError::NotFound {
                         key: key.to_string(),
                     });
                 }
                 return Err(VaultError::S3 {
                     key: key.to_string(),
-                    message: format!("{service_err}"),
+                    message: describe_sdk_error(&err),
                 });
             }
         };
 
         let data = resp.body.collect().await.map_err(|source| VaultError::S3 {
             key: key.to_string(),
-            message: format!("reading object body: {source}"),
+            message: format!("reading object body: {}", error_chain(&source)),
         })?;
         Ok(data.into_bytes().to_vec())
     }
@@ -450,7 +546,7 @@ impl Vault for S3Vault {
             .await
             .map_err(|err| VaultError::S3 {
                 key: key.to_string(),
-                message: format!("{}", err.into_service_error()),
+                message: describe_sdk_error(&err),
             })?;
         Ok(())
     }
@@ -469,7 +565,7 @@ impl Vault for S3Vault {
             }
             let resp = req.send().await.map_err(|err| VaultError::S3 {
                 key: format!("list {prefix}"),
-                message: format!("{}", err.into_service_error()),
+                message: describe_sdk_error(&err),
             })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
@@ -499,10 +595,47 @@ impl Vault for S3Vault {
             .await
             .map_err(|err| VaultError::S3 {
                 key: key.to_string(),
-                message: format!("{}", err.into_service_error()),
+                message: describe_sdk_error(&err),
             })?;
         Ok(())
     }
+}
+
+/// Renders `err` and its whole `source` chain on one line (`"outer: inner: root"`).
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Renders an AWS SDK error into the message of [`VaultError::S3`].
+///
+/// `SdkError::into_service_error` folds every non-service failure (DNS, TLS,
+/// refused connection, timeout) into the operation enum's `Unhandled` variant,
+/// whose `Display` is the bare string `"unhandled error"` — and the HTTP status
+/// and S3 error code live outside that `Display` even for a real service error.
+/// `apps/cli/src/errors.rs` has no typed case for `VaultError`, so this message is
+/// the ONLY thing the user sees: it has to separate a bad endpoint from a 403 from
+/// a wrong bucket name.
+fn describe_sdk_error<E>(err: &aws_sdk_s3::error::SdkError<E>) -> String
+where
+    E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+{
+    let mut message = error_chain(err);
+    let status = err.raw_response().map(|resp| resp.status().as_u16());
+    let code = aws_sdk_s3::error::ProvideErrorMetadata::code(err);
+    match (status, code) {
+        (Some(status), Some(code)) => message.push_str(&format!(" (http {status}, code {code})")),
+        (Some(status), None) => message.push_str(&format!(" (http {status})")),
+        (None, Some(code)) => message.push_str(&format!(" (code {code})")),
+        (None, None) => {}
+    }
+    message
 }
 
 /// Converts an S3 SDK [`DateTime`](aws_sdk_s3::primitives::DateTime) to a
@@ -630,6 +763,115 @@ mod tests {
         // Deleting an already-absent object succeeds (idempotent).
         vault.delete(key).await.unwrap();
         vault.delete("blocks/00/never-existed").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_vault_rejects_keys_that_escape_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        let vault = FsVault::new(dir.path().join("vault"));
+
+        // Every one of these lands outside `root` once joined (or is a shape that
+        // could, on another OS): none may reach the filesystem at all.
+        for key in [
+            "",
+            "../outside/stolen",
+            "blocks/../../outside/stolen",
+            "blocks/9f/..",
+            "/etc/passwd",
+            "C:/windows/system32",
+            "blocks\\..\\..\\outside\\stolen",
+            "blocks//9f",
+            "./blocks/9f/aa",
+            "blocks/9f/aa\0",
+            "blocks/9f/.ft-tmp-1",
+        ] {
+            for err in [
+                vault.put(key, b"stolen".to_vec()).await.unwrap_err(),
+                vault.get(key).await.unwrap_err(),
+                vault.head(key).await.unwrap_err(),
+                vault.delete(key).await.unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string().contains("unsafe vault key"),
+                    "key {key:?} was not rejected: {err}"
+                );
+            }
+        }
+
+        assert!(!tokio::fs::try_exists(outside.join("stolen")).await.unwrap());
+        assert!(vault.list("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fs_vault_put_publishes_atomically_instead_of_writing_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FsVault::new(dir.path().join("vault"));
+        let key = "blocks/9f/9f86aa";
+
+        vault.put(key, b"first".to_vec()).await.unwrap();
+
+        // A hard link pins the inode `put` published first. An in-place rewrite
+        // would truncate and refill THAT inode, which is exactly the window in
+        // which a concurrent `get` reads wrong content under a content-addressed
+        // key; an atomic rename leaves the pinned bytes intact.
+        let link = dir.path().join("pinned");
+        std::fs::hard_link(dir.path().join("vault").join(key), &link).unwrap();
+
+        vault.put(key, b"second".to_vec()).await.unwrap();
+
+        assert_eq!(std::fs::read(&link).unwrap(), b"first");
+        assert_eq!(vault.get(key).await.unwrap(), b"second");
+        // The tmp files left no litter for the GC to trip over.
+        let listed = vault.list("").await.unwrap();
+        assert_eq!(
+            listed.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+            vec![key]
+        );
+    }
+
+    // ----- S3Vault error rendering (no network: SdkErrors built by hand) -----
+
+    #[test]
+    fn s3_error_message_keeps_the_transport_cause_of_a_dispatch_failure() {
+        // `into_service_error` renders any DNS/connect/TLS failure as the bare
+        // "unhandled error", which tells the user nothing they can act on.
+        let cause = std::io::Error::other("dns error: failed to lookup vault.example");
+        let err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError> =
+            aws_sdk_s3::error::SdkError::dispatch_failure(aws_sdk_s3::error::ConnectorError::io(
+                Box::new(cause),
+            ));
+
+        let message = describe_sdk_error(&err);
+        assert!(
+            message.contains("dns error: failed to lookup vault.example"),
+            "cause was dropped: {message}"
+        );
+        assert!(message.starts_with("dispatch failure: "), "got {message}");
+    }
+
+    #[test]
+    fn s3_error_message_keeps_the_http_status_and_code_of_a_service_error() {
+        let meta = aws_sdk_s3::error::ErrorMetadata::builder()
+            .code("AccessDenied")
+            .message("Access Denied")
+            .build();
+        let raw = aws_sdk_s3::config::http::HttpResponse::new(
+            403.try_into().unwrap(),
+            aws_sdk_s3::primitives::SdkBody::empty(),
+        );
+        let err = aws_sdk_s3::error::SdkError::service_error(
+            aws_sdk_s3::operation::get_object::GetObjectError::generic(meta),
+            raw,
+        );
+
+        // A 403 from R2 and a wrong bucket name are both "service error" to the
+        // SDK's own Display; the status + code are what tell them apart.
+        let message = describe_sdk_error(&err);
+        assert!(message.contains("http 403"), "got {message}");
+        assert!(message.contains("code AccessDenied"), "got {message}");
+        assert!(message.contains("Access Denied"), "got {message}");
     }
 
     // ----- S3Vault: env-gated, only runs against a live MinIO -----

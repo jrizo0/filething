@@ -49,7 +49,10 @@ pub use error::{EngineError, Result};
 pub use gc::{GcOptions, GcReport, DEFAULT_GRACE};
 pub use metrics::SyncMetrics;
 pub use pull::PullOutcome;
-pub use scan::{ScanResult, CONTROL_DIR, IGNORE_FILE};
+// `SkipReason`/`SkippedPath` come with `ScanResult`: a path the scan declined is
+// a path that is NOT syncing, so the CLI has to be able to MATCH on the cause —
+// "deferred to the next scan" is routine, "could not be read" needs the user.
+pub use scan::{ScanResult, SkipReason, SkippedPath, CONTROL_DIR, IGNORE_FILE};
 pub use secrets::{load_meta_blob, write_meta_blob, MetaBlob};
 
 // Re-export the coordinator id/outcome types a caller needs to drive commit, so

@@ -28,3 +28,9 @@ dist/
 .DS_Store
 *.swp
 *~
+
+# Local scratch artifacts (agent-generated visualizations, not source)
+/visualizations/
+/.codex/
+/filething-e2e-flow.html
+/filething-user-flow.html

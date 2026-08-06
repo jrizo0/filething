@@ -55,18 +55,47 @@ const DONE: &[&str] = &[
 ];
 
 /// Shared render state. `active` is the phase label currently shown on the open
-/// (newline-less) line; `total` and `last_len` let a later update or the finish
-/// overwrite it cleanly. Process-global because the tracing layer is installed
-/// once for the whole process and [`finish`] must reach the same line.
+/// (newline-less) line; `total`, `completed` and `last_len` let a later update or
+/// the finish overwrite it cleanly. Process-global because the tracing layer is
+/// installed once for the whole process and [`finish`] must reach the same line.
 struct State {
     active: Option<&'static str>,
     total: u64,
+    /// The last `completed` an UPDATE event reported for `active`. Needed by
+    /// [`State::final_line`] to say where an abandoned phase actually stopped.
+    completed: u64,
     last_len: usize,
+}
+
+/// How an open progress line ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// The phase reported its DONE event (or was superseded by the next phase):
+    /// everything it counted was processed.
+    Completed,
+    /// The run failed with the phase still open, so `total - completed` items were
+    /// never processed. Rendering this as `total/total` (which it used to) made a
+    /// failed `sync` end its output with what looks exactly like success.
+    Abandoned,
+}
+
+impl State {
+    /// The final text for the open line, or `None` when no line is open.
+    fn final_line(&self, outcome: Outcome) -> Option<String> {
+        let label = self.active?;
+        Some(match outcome {
+            Outcome::Completed => format!("{label} {t}/{t}", t = self.total),
+            Outcome::Abandoned => {
+                format!("{label} {}/{} (interrupted)", self.completed, self.total)
+            }
+        })
+    }
 }
 
 static PROGRESS: Mutex<State> = Mutex::new(State {
     active: None,
     total: 0,
+    completed: 0,
     last_len: 0,
 });
 
@@ -88,13 +117,13 @@ fn write_line(state: &mut State, line: &str, newline: bool) {
 }
 
 /// Terminates any open progress line with a newline. Called by `main` on the
-/// error path, where a phase may have been interrupted mid-flight before its
-/// DONE event, so the following error message does not land on the same row.
+/// ERROR path only, where a phase was interrupted mid-flight before its DONE
+/// event: the line is closed as [`Outcome::Abandoned`] so the last thing a failed
+/// run prints before the error is not an apparently-complete `total/total`.
 pub fn finish() {
     let mut state = PROGRESS.lock().expect("progress mutex poisoned");
-    if let Some(label) = state.active {
-        let total = state.total;
-        write_line(&mut state, &format!("{label} {total}/{total}"), true);
+    if let Some(line) = state.final_line(Outcome::Abandoned) {
+        write_line(&mut state, &line, true);
     }
 }
 
@@ -150,23 +179,21 @@ impl<S: Subscriber> Layer<S> for ProgressLayer {
             let completed = fields.completed.unwrap_or(0);
             let mut state = PROGRESS.lock().expect("progress mutex poisoned");
             // A new phase starting while another is open: close the old row first.
+            // The engine only starts the next phase once the previous one is done
+            // (the framing phases never tick), so that row IS complete.
             if state.active.is_some() && state.active != Some(*label) {
-                let prev_total = state.total;
-                let prev = state.active.unwrap();
-                write_line(
-                    &mut state,
-                    &format!("{prev} {prev_total}/{prev_total}"),
-                    true,
-                );
+                if let Some(line) = state.final_line(Outcome::Completed) {
+                    write_line(&mut state, &line, true);
+                }
             }
             state.active = Some(label);
             state.total = total;
+            state.completed = completed;
             write_line(&mut state, &format!("{label} {completed}/{total}"), false);
         } else if DONE.contains(&message) {
             let mut state = PROGRESS.lock().expect("progress mutex poisoned");
-            if let Some(label) = state.active {
-                let total = state.total;
-                write_line(&mut state, &format!("{label} {total}/{total}"), true);
+            if let Some(line) = state.final_line(Outcome::Completed) {
+                write_line(&mut state, &line, true);
             }
         }
     }
@@ -198,5 +225,41 @@ mod tests {
     fn encrypted_key_sidecars_have_a_visible_phase_and_terminator() {
         assert!(PHASES.contains(&"uploading key sidecars"));
         assert!(DONE.contains(&"key sidecars uploaded"));
+    }
+
+    /// A phase that never finished must not be rendered as `total/total`: `finish`
+    /// runs on the error path, so that made a FAILED sync end by printing what
+    /// looks like completion. The abandoned render keeps the real count and says
+    /// so; only a DONE event (or the next phase starting) claims completion.
+    #[test]
+    fn an_abandoned_phase_renders_its_real_count_not_completion() {
+        let state = State {
+            active: Some("uploading blocks"),
+            total: 291,
+            completed: 150,
+            last_len: 0,
+        };
+        assert_eq!(
+            state.final_line(Outcome::Abandoned).as_deref(),
+            Some("uploading blocks 150/291 (interrupted)")
+        );
+        assert_eq!(
+            state.final_line(Outcome::Completed).as_deref(),
+            Some("uploading blocks 291/291")
+        );
+    }
+
+    /// With no phase open there is nothing to close, so `finish` on the error path
+    /// of a command that never emitted progress prints nothing at all.
+    #[test]
+    fn no_open_phase_renders_no_final_line() {
+        let state = State {
+            active: None,
+            total: 7,
+            completed: 3,
+            last_len: 0,
+        };
+        assert_eq!(state.final_line(Outcome::Abandoned), None);
+        assert_eq!(state.final_line(Outcome::Completed), None);
     }
 }

@@ -144,10 +144,12 @@ El deploy (Paso 4) imprime la URL del deployment de producción, con formato
 ```bash
 scripts/cloud-deploy.sh
 ```
-Lee `infra/.env.cloud`, verifica `CONVEX_URL` + `CONVEX_DEPLOY_KEY` y corre
-`bunx convex deploy -y` desde `packages/backend`. Es idempotente: reejecutarlo vuelve a
-publicar el mismo schema/funciones. **Éxito** = el deploy termina sin error e imprime la URL
-`https://<name>.convex.cloud` (confírmala contra tu `CONVEX_URL`).
+Lee `infra/.env.cloud`, verifica `CONVEX_URL` + `CONVEX_DEPLOY_KEY`, instala las dependencias
+**desde el lockfile** (`bun install --frozen-lockfile`, para que el deploy use la versión del
+CLI de Convex que fija `bun.lock` y no una cualquiera) y corre `bunx convex deploy -y` desde
+`packages/backend`. Es idempotente: reejecutarlo vuelve a publicar el mismo schema/funciones.
+**Éxito** = el deploy termina sin error e imprime la URL `https://<name>.convex.cloud`
+(confírmala contra tu `CONVEX_URL`).
 
 ### 4.2 Smoke test end-to-end contra la nube
 ```bash
@@ -162,7 +164,19 @@ traiga el archivo valida el commit, el change feed (WebSocket), el round-trip po
 
 > El signup está deshabilitado por defecto en el deployment (ver 4.3 más abajo). El script lo
 > habilita él mismo (`convex env set FILETHING_ALLOW_SIGNUP 1`) antes de correr y lo revierte
-> al terminar (éxito o fallo) — no hace falta tocar nada a mano para correr el smoke.
+> al terminar (éxito, fallo, `Ctrl-C` o `kill`), verificando el cierre y gritando si no pudo.
+>
+> ⚠️ **Contra producción hay que pedirlo explícitamente.** Abrir el signup y crear una cuenta
+> es un cambio real sobre un sistema vivo, así que si la `CONVEX_DEPLOY_KEY` es de producción
+> (`prod:…`) el script **se niega a correr** salvo que lo autorices:
+> ```bash
+> FILETHING_SMOKE_ALLOW_PROD=1 scripts/cloud-smoke.sh
+> ```
+> Lo recomendable es apuntarlo a un deployment de dev/preview (deploy key de ese deployment en
+> `infra/.env.cloud`), donde corre sin más. Tras una corrida contra producción, confirma:
+> ```bash
+> cd packages/backend && bunx convex env get FILETHING_ALLOW_SIGNUP   # debe salir vacío
+> ```
 
 ### 4.3 Auth real (Fase 3): Better Auth en el deployment
 Desde la Fase 3 (ADR 0014) el cliente ya **no** usa el deploy key: cada Device hace
@@ -290,10 +304,13 @@ al mes en Convex). Para uso personal de unos pocos GB no deberías acercarte.
 - **El deploy key es un secreto ROOT**: da control total del deployment (puede impersonar a
   cualquier usuario). Desde la Fase 3 solo hace falta para `convex deploy` (y como fallback de
   ops del CLI); guárdalo como tal; `infra/.env.cloud` debe estar gitignoreado (Paso 3).
-- **JWT de ~15 min en el daemon**: el daemon re-mintea el JWT en cada (re)conexión del
-  websocket (`set_auth_callback`), pero una conexión muy estable >15 min no refresca
-  proactivamente; si aparecen errores de auth en daemons longevos, reiniciar el servicio los
-  resuelve (mejora futura: refresh proactivo).
+- **JWT de ~15 min en el daemon**: ya no hace falta reiniciar nada. El cliente re-mintea el
+  JWT en cada (re)conexión del websocket **y** proactivamente sobre la conexión viva, 3 min
+  antes de que expire (`apps/cli/src/env.rs`, `spawn_jwt_refresh` / `auth::JWT_REFRESH_MARGIN`,
+  issue #12). Un re-mint fallido no tumba nada: reintenta cada 30 s
+  (`auth::JWT_MIN_REFRESH_SLEEP`). Lo que sí sigue siendo un requisito operativo es que el
+  host de Better Auth sea alcanzable — en self-hosted es el puerto 3211, y un túnel SSH que
+  solo reenvía 9000/3210 rompe el re-mint (docs/MAC-SETUP.md §3).
 - **Escrow server-side**: Convex custodia `dedupSecret`/`spaceKey` (ADR 0015). El cifrado
   `alg=1` protege los bytes en R2; **no** es zero-knowledge frente al Coordinator (diferido).
 - **GC = solo huérfanos (por ahora)**: `filething gc <dir>` hace mark-and-sweep account-wide

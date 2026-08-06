@@ -4,9 +4,17 @@
 # Coordinator = Convex backend self-hosted — the control plane (Space head,
 #               Revision chain, change feed). Plus an optional dashboard.
 #
-# Everything here is local-dev only. Copy infra/.env.example -> infra/.env first.
+# Everything here is local-dev only. Run infra/scripts/up.sh — it creates
+# infra/.env with GENERATED credentials; there are deliberately no working
+# defaults for the credentials below (see infra/README.md, "Credentials").
 # Switch to managed infra (Cloudflare R2 + Convex cloud) by changing only the
 # env vars the Rust client reads (S3_* and CONVEX_URL) — no code changes.
+#
+# Every published port binds to ${FT_BIND_ADDR} (127.0.0.1 by default): MinIO,
+# the Convex backend and the dashboard are unauthenticated-or-root-credentialed
+# admin surfaces, and this compose has been run on a public VPS before. Remote
+# access goes through an SSH tunnel (docs/MAC-SETUP.md §3); set FT_BIND_ADDR=0.0.0.0
+# in infra/.env only if you have deliberately firewalled the host.
 
 name: filething
 
@@ -19,11 +27,13 @@ services:
     command: server /data --console-address ":9001"
     restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # No `:-minioadmin` fallback: an unset value here used to hand the Vault's
+      # root credentials to anyone who could reach the port.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?unset — run infra/scripts/up.sh, which generates infra/.env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?unset — run infra/scripts/up.sh, which generates infra/.env}
     ports:
-      - "${MINIO_API_PORT:-9000}:9000" # S3 API (ft-vault S3 backend)
-      - "${MINIO_CONSOLE_PORT:-9001}:9001" # web console
+      - "${FT_BIND_ADDR:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000" # S3 API (ft-vault S3 backend)
+      - "${FT_BIND_ADDR:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001" # web console
     volumes:
       - minio_data:/data
     healthcheck:
@@ -41,11 +51,13 @@ services:
     restart: unless-stopped
     stop_grace_period: 10s
     ports:
-      - "${CONVEX_BACKEND_PORT:-3210}:3210" # API the Rust ft-coordinator talks to
-      - "${CONVEX_SITE_PORT:-3211}:3211" # HTTP actions / site proxy
+      - "${FT_BIND_ADDR:-127.0.0.1}:${CONVEX_BACKEND_PORT:-3210}:3210" # API the Rust ft-coordinator talks to
+      - "${FT_BIND_ADDR:-127.0.0.1}:${CONVEX_SITE_PORT:-3211}:3211" # HTTP actions / site proxy
     environment:
       INSTANCE_NAME: filething-local
-      INSTANCE_SECRET: ${CONVEX_INSTANCE_SECRET}
+      # The admin key derives from this, so a known value = full control of the
+      # deployment. Required, never defaulted.
+      INSTANCE_SECRET: ${CONVEX_INSTANCE_SECRET:?unset — run infra/scripts/up.sh, which generates infra/.env}
       # URLs the backend advertises to clients and the dashboard.
       CONVEX_CLOUD_ORIGIN: ${CONVEX_URL:-http://localhost:3210}
       CONVEX_SITE_ORIGIN: http://localhost:${CONVEX_SITE_PORT:-3211}
@@ -70,7 +82,7 @@ services:
     image: ghcr.io/get-convex/convex-dashboard:latest
     restart: unless-stopped
     ports:
-      - "${CONVEX_DASHBOARD_PORT:-6791}:6791"
+      - "${FT_BIND_ADDR:-127.0.0.1}:${CONVEX_DASHBOARD_PORT:-6791}:6791"
     environment:
       # The dashboard (running in the browser) reaches the backend on the host.
       NEXT_PUBLIC_DEPLOYMENT_URL: ${CONVEX_URL:-http://localhost:3210}

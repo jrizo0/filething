@@ -26,6 +26,9 @@ import { requireAccount, requireOwnedSpace } from "./auth";
 // Per-Space escrow key is a fixed 32-byte secret.
 const SPACE_KEY_BYTES = 32;
 
+// A Cid is a 32-byte hash (schema.ts spaces.metaBlobCid).
+const CID_BYTES = 32;
+
 // Create a Space with no head (the first Revision is committed later via
 // revisions:commit). The owning Account comes from ctx.auth, not an arg. `name`
 // and `metaBlobCid` are bytes; MVP `name` is cleartext UTF-8, `metaBlobCid`
@@ -47,6 +50,15 @@ export const create = mutation({
       throw new ConvexError({
         code: "bad_space_key",
         message: `spaceKey must be exactly ${SPACE_KEY_BYTES} bytes`,
+      });
+    }
+    // v.bytes() accepts any length; a metaBlobCid that is not a 32-byte Cid
+    // stores fine and then fails every client that decodes it, with no way to
+    // correct it (metaBlobCid is written once, at creation).
+    if (args.metaBlobCid.byteLength !== CID_BYTES) {
+      throw new ConvexError({
+        code: "bad_meta_blob_cid",
+        message: `metaBlobCid must be exactly ${CID_BYTES} bytes`,
       });
     }
     const spaceId = await ctx.db.insert("spaces", {

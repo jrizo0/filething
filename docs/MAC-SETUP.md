@@ -37,11 +37,16 @@ bash infra/scripts/up.sh        # MinIO + Convex + bucket 'filething'
 bash scripts/demo-gates.sh      # confirma gates a–d (opcional, ~20s)
 ```
 
-Anota el admin key del Coordinator (lo necesitas en la Mac):
+Anota las credenciales que necesitas en la Mac. Desde el endurecimiento de la infra
+(`infra/scripts/up.sh`) **no hay valores por defecto**: las de MinIO son generadas y viven
+solo en `infra/.env` del VPS, igual que el admin key del Coordinator.
 
 ```bash
-grep CONVEX_SELF_HOSTED_ADMIN_KEY ~/repos/filething/infra/.env
+grep -E '^(S3_ACCESS_KEY|S3_SECRET_KEY|CONVEX_SELF_HOSTED_ADMIN_KEY)=' ~/repos/filething/infra/.env
 ```
+
+> Cópialas al shell de la Mac y ya. **No** las pegues en un archivo del repo: así se filtró un
+> admin key real a un repo público (`diary/2026-06-25.md`). CI corre gitleaks en cada push.
 
 > El `unhealthy` de `docker ps` en el contenedor de Convex es un **falso negativo**
 > (la imagen no trae `curl`); el backend funciona. No te frenes por eso.
@@ -100,18 +105,22 @@ curl -s -o /dev/null -w "MinIO HTTP %{http_code}\n" http://localhost:9000/minio/
 
 ## 4. Exportar el entorno en la Mac
 
-Pega esto (con el admin key real del paso 0):
+Pega esto, rellenando los tres valores con lo que imprimió el paso 0 (son secretos
+generados: no hay valor "por defecto" que adivinar):
 
 ```bash
 export S3_ENDPOINT="http://localhost:9000"
 export S3_REGION="us-east-1"
-export S3_ACCESS_KEY="minioadmin"
-export S3_SECRET_KEY="minioadmin"
+export S3_ACCESS_KEY="<S3_ACCESS_KEY de infra/.env del VPS>"
+export S3_SECRET_KEY="<S3_SECRET_KEY de infra/.env del VPS>"
 export S3_BUCKET="filething"
 export CONVEX_SELF_HOSTED_URL="http://localhost:3210"
-export CONVEX_SELF_HOSTED_ADMIN_KEY="<pega aquí el valor de infra/.env del VPS>"
+export CONVEX_SELF_HOSTED_ADMIN_KEY="<CONVEX_SELF_HOSTED_ADMIN_KEY de infra/.env del VPS>"
 export FILETHING_HOME="$HOME/.filething-mac"   # identidad del Device en la Mac
 ```
+
+> Guarda esto en un archivo FUERA del repo (`~/filething-test-env.sh`, que es lo que
+> `scripts/runbook-e2e-mac-vps.sh` espera) y hazle `source`.
 
 ## 5. Crear la cuenta y loguear los dos Devices (Better Auth)
 
@@ -192,7 +201,10 @@ Sin daemon, para scripts: `filething sync ~/space-demo` (pull + commit one-shot)
 
 ## Alternativa al túnel (exponer puertos) — NO recomendada para esto
 
-Apuntar el env de la Mac a `http://IP-DEL-VPS:3210` y `:9000` directamente requiere abrir esos
-puertos en el firewall del VPS y deja MinIO/Convex con credenciales por defecto (`minioadmin`)
-accesibles desde internet. Además toparías con el `CONVEX_CLOUD_ORIGIN=localhost` que el backend
+El túnel no es solo comodidad: `infra/docker-compose.yml` publica **todos** los puertos en
+`127.0.0.1` (`FT_BIND_ADDR`), así que por defecto no hay nada que alcanzar desde fuera del VPS.
+Apuntar el env de la Mac a `http://IP-DEL-VPS:3210` y `:9000` directamente exige poner
+`FT_BIND_ADDR=0.0.0.0` en `infra/.env`, abrir esos puertos en el firewall del VPS y dejar
+expuestas a internet la consola de MinIO, el backend de Convex y su dashboard — tres superficies
+de administración. Además toparías con el `CONVEX_CLOUD_ORIGIN=localhost` que el backend
 anuncia. Usa el túnel SSH salvo que tengas una razón fuerte.

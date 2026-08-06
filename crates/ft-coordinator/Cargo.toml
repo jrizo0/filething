@@ -9,6 +9,11 @@ ft-core = { workspace = true }
 convex = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+# Only for `tokio::time::timeout`: every Coordinator call needs a deadline
+# because the convex client re-sends an outstanding call on every reconnect and
+# never gives up (see `with_deadline`). The convex client already requires a
+# tokio runtime, so this adds no new runtime requirement.
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

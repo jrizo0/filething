@@ -20,13 +20,13 @@
 //! [`CommitOutcome::NoChange`] is returned without touching the Coordinator.
 
 use ft_coordinator::{AccountId, CommitError, Coordinator, DeviceId, RevisionId, SpaceId};
-use ft_core::{Cid, SpaceCrypto};
+use ft_core::{CasefoldKey, Cid, FileEntry, SpaceCrypto};
 use ft_fsmap::{LinuxFs, OsFs};
 use ft_index::{Index, SpaceState};
 
 use crate::context::{LastSynced, SpaceContext};
 use crate::error::{EngineError, Result};
-use crate::scan::ScanResult;
+use crate::scan::{ScanResult, CONTROL_DIR};
 use crate::secrets::{generate_chunk_secret, write_meta_blob};
 
 /// Block PUTs carry meaningful payload bytes, so keep their fan-out conservative
@@ -35,6 +35,48 @@ const BLOCK_UPLOAD_CONCURRENCY: usize = 16;
 /// Key sidecars are tiny (~100 B) and latency-bound; a wider fan-out hides the
 /// per-object R2 round trip without materially increasing bandwidth or memory.
 const SIDECAR_UPLOAD_CONCURRENCY: usize = 64;
+
+/// Below this many tracked paths a Space is TRIVIAL for the purposes of the
+/// mass-delete guard: clearing out a handful of files by hand is ordinary work and
+/// must never need an override.
+const DELETE_GUARD_MIN_ENTRIES: usize = 50;
+
+/// The net shrink — as a percentage of the tree this Device already knew about —
+/// at or above which a commit stops looking like an edit and starts looking like a
+/// root that is not really there.
+///
+/// Deliberately high: deleting a whole directory of build output is normal
+/// (`target/`, `dist/`), so the guard must not fire on it; losing ~everything is
+/// not. 90% keeps every plausible bulk edit under the bar while still catching the
+/// cases that motivated the guard, where the observed tree is empty or a handful of
+/// stragglers (a volume that failed to mount, a root moved aside mid-sync).
+const DELETE_GUARD_MAX_SHRINK_PERCENT: usize = 90;
+
+/// The one-shot authorization file — under the control dir, so it is never itself
+/// synced — that lets a commit past [`SpaceContext::guard_mass_delete`].
+///
+/// A file rather than a flag because `commit` is driven by the daemon's `run` loop,
+/// which has no user in front of it; the CLI cannot pass an argument down a
+/// debounce timer. It is consumed on the commit that used it, so it authorizes ONE
+/// mass delete and cannot silently disable the guard forever.
+const ALLOW_MASS_DELETE_FILE: &str = "allow-mass-delete";
+
+/// True when going from `tracked_before` to `remaining` Manifest-tracked paths
+/// stops looking like an edit and starts looking like a Space root that is not
+/// really there ([`DELETE_GUARD_MIN_ENTRIES`] / [`DELETE_GUARD_MAX_SHRINK_PERCENT`]).
+///
+/// ONE rule, shared by the two places that must agree about it: the guard in
+/// [`SpaceContext::guard_mass_delete`], which refuses to publish such a Revision,
+/// and the scan, which for exactly the same shrink keeps the vanished paths' index
+/// rows so the guard still has a baseline on the next commit
+/// ([`ScanResult::held_deletions`](crate::ScanResult)). If they could drift, a
+/// shrink one of them called massive and the other did not would either hold rows
+/// forever or lose the evidence again.
+pub(crate) fn is_mass_delete(tracked_before: usize, remaining: usize) -> bool {
+    let deleted = tracked_before.saturating_sub(remaining);
+    tracked_before >= DELETE_GUARD_MIN_ENTRIES
+        && deleted * 100 >= tracked_before * DELETE_GUARD_MAX_SHRINK_PERCENT
+}
 
 /// The result of a [`SpaceContext::commit`] (`§7`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +132,26 @@ enum UploadStrategy {
     VerifyPresence,
 }
 
+/// Builds the Manifest of `entries` on the blocking pool.
+///
+/// [`ft_manifest::build`] is pure but O(tree): it CBOR-encodes every FileEntry and
+/// hashes every page. The daemon drives EVERY Space of the Device on ONE task (the
+/// `run` future is `!Send`, so `ft-daemon` multiplexes the Spaces with `join_all`
+/// instead of `tokio::spawn`), so doing that work inline stalls every other Space's
+/// change feed and staleness watchdog for its duration. Handing it to
+/// `spawn_blocking` lets the shared task poll the siblings while it runs.
+///
+/// A `JoinError` here means the build panicked (a bug in `ft-manifest`) or the
+/// runtime is shutting down; it is surfaced as an IO error because [`EngineError`]
+/// has no join variant and a commit must keep one error type.
+async fn build_manifest_off_task(
+    entries: Vec<(CasefoldKey, FileEntry)>,
+) -> Result<ft_manifest::ManifestBuild> {
+    tokio::task::spawn_blocking(move || ft_manifest::build(entries))
+        .await
+        .map_err(|e| EngineError::Io(std::io::Error::other(format!("manifest build task: {e}"))))
+}
+
 impl SpaceContext {
     /// Runs the §7 commit protocol against `expected_base` (the Revision id the
     /// caller believes is the current head; `None` for the very first commit).
@@ -98,12 +160,32 @@ impl SpaceContext {
     /// [`CommitOutcome::Conflict`] when the CAS fails, or
     /// [`CommitOutcome::Committed`] on success (after advancing the local base).
     pub async fn commit(&mut self, expected_base: Option<RevisionId>) -> Result<CommitOutcome> {
+        // What the last published Revision says this Space contains. Read BEFORE
+        // the scan because the scan verifies every entry it did not produce itself
+        // against it (`scan_with_base`): no Manifest this commit publishes may
+        // reference a Block that is neither uploaded by this very commit nor
+        // already reachable from the head.
+        let base = self.base_manifest_view().await?;
+
+        // How much tree this Device knew about BEFORE the scan, for the
+        // mass-delete guard below. `scan` reconciles the index with disk by
+        // deleting the rows of vanished paths (`scan.rs`) — the very evidence the
+        // guard needs — so the count is taken first AND the scan holds those rows
+        // back whenever dropping them would be a mass delete, which is what makes
+        // this baseline survive into the next commit (see `guard_mass_delete`).
+        let tracked_before = self.tracked_entry_count()?;
+
         // (a) scan the tree → FileEntries + Blocks to upload.
-        let scan = self.scan()?;
+        let mut scan = self.scan_with_base(Some(&base))?;
 
         // Build the Manifest once, up front, so we know the root before any
-        // upload. Cheap (pure) and lets us short-circuit on NoChange.
-        let manifest = ft_manifest::build(scan.entries.clone());
+        // upload. Pure, but O(tree) CBOR + hashing, so it runs on the blocking
+        // pool: every Space of this Device shares ONE task (see
+        // `build_manifest_off_task`). `entries` is MOVED out of the scan — it is
+        // not read again on this path (only `blocks_to_upload`/`sidecars` are) and
+        // a whole-tree clone is exactly the cost we are trying not to pay.
+        let entry_count = scan.entries.len();
+        let manifest = build_manifest_off_task(std::mem::take(&mut scan.entries)).await?;
         let root = manifest.root;
 
         // NoChange: only when there IS a prior sync (seq >= 0) and the tree's
@@ -112,6 +194,12 @@ impl SpaceContext {
         if self.last_synced.seq >= 0 && root == self.last_synced.root {
             return Ok(CommitOutcome::NoChange);
         }
+
+        // Refuse to publish a Revision that wipes the tree out (a root that is not
+        // really there), unless the user authorized it. Deliberately AFTER the
+        // NoChange check — an unchanged tree deletes nothing — and BEFORE any
+        // upload, so a refusal costs no Vault traffic.
+        let mass_delete_authorized = self.guard_mass_delete(tracked_before, entry_count)?;
 
         // (b)/(c)/(d) stage everything to the Vault (Blocks, then pages +
         // blocklists). INVARIANT after this: everything is in the Vault, nothing
@@ -146,6 +234,17 @@ impl SpaceContext {
                 self.last_synced = LastSynced { seq, root };
                 self.last_synced_revision_id = Some(ok.revision_id.clone());
                 self.persist_space_state()?;
+                // The Revision that carries the shrink has landed, so the rows the
+                // scan held back as the guard's evidence have served their purpose
+                // (`ScanResult::held_deletions`). Purging them now is what stops the
+                // NEXT commit from refusing a wipe that is already published.
+                self.purge_held_deletions(&scan.held_deletions);
+                // The authorization is spent only now that the mass delete really
+                // landed: consuming it earlier would leave a transient CAS/Vault
+                // failure unable to retry its own commit.
+                if mass_delete_authorized {
+                    self.consume_mass_delete_authorization();
+                }
                 Ok(CommitOutcome::Committed { seq, root })
             }
             Err(CommitError::Conflict) => {
@@ -174,8 +273,15 @@ impl SpaceContext {
     /// CAS; it is also the staging step Part 2 can reuse. It does NOT short-circuit
     /// on NoChange (that decision belongs to `commit`, which owns the base state).
     pub async fn stage_to_vault(&self) -> Result<StagedCommit> {
-        let scan = self.scan()?;
-        let manifest = ft_manifest::build(scan.entries.clone());
+        // Same base-verified scan as `commit`: this stage produces the exact
+        // Manifest a CAS would publish, so it must not reference a Block that only
+        // the local index believes in (`scan_with_base`).
+        let base = self.base_manifest_view().await?;
+        let scan = self.scan_with_base(Some(&base))?;
+        // The returned `StagedCommit` hands the caller the scan back, so the
+        // entries are cloned here rather than moved (unlike `commit`); the build
+        // itself still runs off the async task.
+        let manifest = build_manifest_off_task(scan.entries.clone()).await?;
         let strategy = if self.last_synced.seq < 0 {
             UploadStrategy::Initial
         } else {
@@ -190,6 +296,148 @@ impl SpaceContext {
             blocks_uploaded,
             scan,
         })
+    }
+
+    /// The entries of the last PUBLISHED Revision (`last_synced`), which
+    /// [`scan_with_base`](SpaceContext::scan_with_base) proves this commit's reused
+    /// and republished entries against.
+    ///
+    /// Empty — never a Vault read — for a Space with no published Revision yet
+    /// (`seq < 0`) or whose base is still the empty Manifest: the object of the
+    /// empty root must never be required (see `pull::empty_manifest_root`), and an
+    /// empty base is exactly right anyway, since nothing has been published and no
+    /// row can be proved by it.
+    ///
+    /// This costs one page-tree read per commit. It replaces per-Block `HEAD`s for
+    /// unchanged files — O(pages) instead of O(Blocks) round trips — so it keeps
+    /// the fast path's win while restoring the invariant `gc.rs` depends on.
+    async fn base_manifest_view(&self) -> Result<crate::scan::BaseEntries> {
+        if self.last_synced.seq < 0 || self.last_synced.root == crate::pull::empty_manifest_root() {
+            return Ok(crate::scan::BaseEntries::new());
+        }
+        self.read_manifest_entries(&self.last_synced.root).await
+    }
+
+    /// Drops the index rows a scan held back as the mass-delete guard's evidence
+    /// ([`ScanResult::held_deletions`](crate::ScanResult)), now that the Revision
+    /// carrying those deletions is published.
+    ///
+    /// Best-effort, like [`consume_mass_delete_authorization`](Self::consume_mass_delete_authorization):
+    /// the Revision already landed, and failing the commit over a leftover row would
+    /// be strictly worse than the (logged) cost of the next commit re-refusing a
+    /// wipe that is already public — which the user can clear with the same
+    /// authorization marker.
+    fn purge_held_deletions(&self, paths: &[ft_core::CanonicalPath]) {
+        for path in paths {
+            if let Err(e) = self.index.delete_entry(self.space_id.as_str(), path) {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.as_str(),
+                    "could not drop the index row of a path this Revision deleted; the \
+                     mass-delete guard may refuse the next commit until it is cleared"
+                );
+            }
+        }
+    }
+
+    /// How many paths the local index tracks for this Space that WOULD appear in a
+    /// Manifest — the baseline for [`guard_mass_delete`](Self::guard_mass_delete).
+    ///
+    /// Membership mirrors the scan's rule (`§5.1`, ADR 0019) via the shared
+    /// [`tracked_in_manifest`](crate::scan::tracked_in_manifest): a local-only
+    /// symlink is NOT in the Manifest, while a Derived path IS (it is `local_only`
+    /// in the index only because its bytes never travel).
+    ///
+    /// Counting ROWS rather than the base Manifest's entries is deliberate: the
+    /// count must be available before the scan and without a network read, and it
+    /// stays truthful across scans because a scan that would drop most of these rows
+    /// keeps them instead ([`ScanResult::held_deletions`](crate::ScanResult)).
+    fn tracked_entry_count(&self) -> Result<usize> {
+        Ok(self
+            .index
+            .list_entries(self.space_id.as_str())?
+            .iter()
+            .filter(|e| crate::scan::tracked_in_manifest(e))
+            .count())
+    }
+
+    /// Refuses to publish a Revision that deletes most of the Space (`§7`).
+    ///
+    /// `tracked_before` is how many Manifest-tracked paths this Device knew about
+    /// before the scan; `scanned` is how many the scan just found. A large NET
+    /// shrink of a non-trivial tree is far more often a root that is not really
+    /// there than an intentional delete: an external volume that failed to mount
+    /// leaves its mountpoint as an empty directory, so the walk SUCCEEDS and finds
+    /// nothing, and a Space root the user moved aside behaves the same. A commit is
+    /// how a delete propagates (`§8`: a delete is an absence), so publishing that
+    /// Revision would delete the files on every other Device — the safe direction is
+    /// to refuse and let a human look.
+    ///
+    /// NET shrink, not "paths that disappeared": a rename, or a generator that
+    /// rewrites a whole tree, deletes and adds in equal measure and must never trip
+    /// the guard.
+    ///
+    /// It refuses EVERY commit that would publish the wipe, not just the first.
+    /// `tracked_before` counts index rows, and the scan that runs between it and
+    /// this check used to delete the rows of every vanished path — so the refusal
+    /// destroyed its own evidence and the next commit (a daemon restart, a remount
+    /// attempt, an intervening pull) compared 0 against 0, said nothing, and
+    /// published the empty Manifest that deletes the tree on every other Device.
+    /// [`scan_with_base`](SpaceContext::scan_with_base) now HOLDS those rows
+    /// whenever dropping them would be a mass delete, and only a commit that really
+    /// published the shrink purges them, so the baseline survives every retry.
+    ///
+    /// Returns whether an explicit authorization was found, so the caller can spend
+    /// it only if the commit actually lands.
+    fn guard_mass_delete(&self, tracked_before: usize, scanned: usize) -> Result<bool> {
+        let deleted = tracked_before.saturating_sub(scanned);
+        if !is_mass_delete(tracked_before, scanned) {
+            return Ok(false);
+        }
+        let marker = self.mass_delete_marker();
+        if marker.exists() {
+            tracing::warn!(
+                space = %self.space_id,
+                deleted,
+                tracked_before,
+                marker = %marker.display(),
+                "publishing a mass delete: authorized by the marker file (consumed on success)"
+            );
+            return Ok(true);
+        }
+        Err(EngineError::Refused(format!(
+            "this commit would delete {deleted} of the {tracked_before} paths this Device tracks \
+             for the Space ({}%), leaving {scanned}. That usually means the Space root is not \
+             really there — an external volume that failed to mount, or a root that was moved \
+             aside — so nothing was published and no other Device lost anything. Check {}; if the \
+             deletion IS intended, authorize it once with: touch {}",
+            deleted * 100 / tracked_before.max(1),
+            self.local_root.display(),
+            marker.display()
+        )))
+    }
+
+    /// Path of the [`ALLOW_MASS_DELETE_FILE`] authorization for this Space.
+    fn mass_delete_marker(&self) -> std::path::PathBuf {
+        self.local_root
+            .join(CONTROL_DIR)
+            .join(ALLOW_MASS_DELETE_FILE)
+    }
+
+    /// Spends the mass-delete authorization after the Revision landed, so it can
+    /// never authorize a SECOND unintended wipe. Best-effort: the Revision is
+    /// already published, and failing the commit over a leftover marker would be
+    /// strictly worse than the (logged) risk of one extra authorized delete.
+    fn consume_mass_delete_authorization(&self) {
+        let marker = self.mass_delete_marker();
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!(
+                error = %e,
+                marker = %marker.display(),
+                "could not consume the mass-delete authorization; remove it by hand or it will \
+                 authorize the next one too"
+            );
+        }
     }
 
     /// §7 step 2: direct-PUT each unique scanned Block for the initial Revision;
@@ -547,6 +795,218 @@ impl SpaceContext {
             CommitOutcome::Conflict { .. } => Err(EngineError::SpaceState(
                 "first commit conflicted (concurrent create_space?)".to_string(),
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use ft_index::Index;
+
+    use super::*;
+
+    /// Mounts a Coordinator-less context over `root`, the same offline seam
+    /// `tests/watch_resilience.rs` uses: everything up to the CAS runs, and the CAS
+    /// itself fails with a distinctive [`EngineError::SpaceState`] — which is exactly
+    /// what tells these tests "the guard let the commit through".
+    fn mount(root: &Path, seq: i64) -> SpaceContext {
+        let index = Index::open_in_memory().unwrap();
+        let state = SpaceState {
+            space_id: "space-guard".to_string(),
+            last_synced_seq: seq,
+            last_synced_root: ft_manifest::build(Vec::new()).root,
+            last_synced_revision_id: None,
+            chunk_secret: [3u8; 32].to_vec(),
+            dedup_secret: None,
+            local_root_path: root.to_string_lossy().into_owned(),
+        };
+        index.upsert_space_state(&state).unwrap();
+        // The Vault lives under the control dir, which the scan never walks.
+        let vault = ft_vault::FsVault::new(root.join(CONTROL_DIR).join("vault"));
+        SpaceContext::mount(
+            index,
+            Box::new(vault),
+            Box::new(LinuxFs),
+            AccountId::new("acct"),
+            DeviceId::new("devA"),
+            SpaceId::new("space-guard"),
+        )
+        .unwrap()
+    }
+
+    /// Writes `n` files into `root`, PUBLISHES them (stages every Block and
+    /// Manifest page into this mount's Vault) and makes that tree the synced base —
+    /// the state a Device is in before its root goes missing. Staging rather than
+    /// merely scanning is what makes the base a real published Revision, which is
+    /// what the next scan verifies its entries against.
+    async fn populate_and_publish(ctx: &mut SpaceContext, root: &Path, n: usize) {
+        for i in 0..n {
+            std::fs::write(root.join(format!("f{i}.txt")), format!("body {i}")).unwrap();
+        }
+        let staged = ctx.stage_to_vault().await.unwrap();
+        assert_eq!(staged.scan.entries.len(), n);
+        ctx.last_synced = LastSynced {
+            seq: 0,
+            root: staged.root,
+        };
+    }
+
+    fn remove_all(root: &Path) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().and_then(|n| n.to_str()) != Some(CONTROL_DIR) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    /// THE guard: a Space root that is not really there (an external volume that
+    /// failed to mount leaves an EMPTY mountpoint, so the walk succeeds and finds
+    /// nothing) must not publish a Revision that deletes the whole tree — which is
+    /// how every other Device would then delete its copies (`§8`: a delete is an
+    /// absence). Nothing is uploaded and nothing is published.
+    #[tokio::test]
+    async fn commit_refuses_to_publish_a_revision_that_wipes_a_non_trivial_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = mount(dir.path(), 0);
+        populate_and_publish(&mut ctx, dir.path(), DELETE_GUARD_MIN_ENTRIES + 10).await;
+        remove_all(dir.path());
+
+        match ctx.commit(None).await {
+            Err(EngineError::Refused(msg)) => {
+                assert!(
+                    msg.contains(ALLOW_MASS_DELETE_FILE),
+                    "the message must say how to proceed: {msg}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The refusal must survive its own scan. The guard's baseline is the tracked
+    /// index rows, and the scan that runs just before it used to DELETE the row of
+    /// every vanished path — so the first commit refused and destroyed the evidence,
+    /// and the retry (a daemon restart, a remount attempt, an intervening pull,
+    /// anything) saw 0 tracked vs 0 scanned, said nothing, and published the empty
+    /// Manifest that deletes the tree on every other Device. Every commit after the
+    /// wipe-scan must refuse exactly like the first.
+    #[tokio::test]
+    async fn every_commit_after_the_wipe_scan_is_refused_too_not_just_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = mount(dir.path(), 0);
+        populate_and_publish(&mut ctx, dir.path(), DELETE_GUARD_MIN_ENTRIES + 10).await;
+        remove_all(dir.path());
+
+        for attempt in 1..=3 {
+            match ctx.commit(None).await {
+                Err(EngineError::Refused(msg)) => assert!(
+                    msg.contains(ALLOW_MASS_DELETE_FILE),
+                    "attempt {attempt} must still say how to proceed: {msg}"
+                ),
+                other => panic!("attempt {attempt} must be refused too, got {other:?}"),
+            }
+            assert_eq!(
+                ctx.tracked_entry_count().unwrap(),
+                DELETE_GUARD_MIN_ENTRIES + 10,
+                "attempt {attempt} scanned away the very baseline the next one needs"
+            );
+        }
+
+        // And the escape hatch still works: the user authorizes the wipe once, and
+        // the commit runs all the way to the CAS (which this Coordinator-less mount
+        // then rejects).
+        let marker = ctx.mass_delete_marker();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        match ctx.commit(None).await {
+            Err(EngineError::SpaceState(_)) => {}
+            other => panic!("the authorization must let the commit through, got {other:?}"),
+        }
+    }
+
+    /// Clearing out a handful of files is ordinary work and must never need an
+    /// override: the guard stays out of the way and the commit runs all the way to
+    /// the CAS (which this Coordinator-less mount then rejects).
+    #[tokio::test]
+    async fn clearing_a_trivial_tree_needs_no_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = mount(dir.path(), 0);
+        populate_and_publish(&mut ctx, dir.path(), 5).await;
+        remove_all(dir.path());
+
+        match ctx.commit(None).await {
+            Err(EngineError::SpaceState(_)) => {}
+            other => panic!("the guard must not fire on a trivial tree, got {other:?}"),
+        }
+    }
+
+    /// A genuinely empty Space still commits: with nothing tracked there is nothing
+    /// to delete, so the guard is silent even at seq -1 (the first Revision of a new
+    /// Space, which `init_space` publishes from a possibly-empty folder).
+    #[tokio::test]
+    async fn a_genuinely_empty_space_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = mount(dir.path(), -1);
+        match ctx.commit(None).await {
+            Err(EngineError::SpaceState(_)) => {}
+            other => panic!("an empty first commit must reach the CAS, got {other:?}"),
+        }
+    }
+
+    /// The marker file authorizes the wipe — and survives a commit that did NOT land
+    /// (here the CAS is unreachable), so the retry still has its authorization. It is
+    /// spent only by a Revision that really published, which needs a live Coordinator
+    /// (covered by the E2E runbook, like the other CAS-dependent behaviors).
+    #[tokio::test]
+    async fn the_marker_file_authorizes_a_mass_delete_and_survives_a_commit_that_did_not_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = mount(dir.path(), 0);
+        populate_and_publish(&mut ctx, dir.path(), DELETE_GUARD_MIN_ENTRIES + 10).await;
+        remove_all(dir.path());
+
+        let marker = ctx.mass_delete_marker();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+
+        match ctx.commit(None).await {
+            Err(EngineError::SpaceState(_)) => {}
+            other => panic!("the authorization must let the commit reach the CAS, got {other:?}"),
+        }
+        assert!(
+            marker.exists(),
+            "an unpublished commit must keep its authorization, or the retry is refused"
+        );
+    }
+
+    /// The threshold itself: only a LARGE shrink of a NON-TRIVIAL tree is refused.
+    /// Deleting a directory of build output (even most of the tree) stays legal;
+    /// losing ~everything does not. Net shrink, so a rename — which deletes and adds
+    /// in equal measure — can never trip it.
+    #[tokio::test]
+    async fn the_delete_guard_fires_only_on_a_large_shrink_of_a_non_trivial_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = mount(dir.path(), 0);
+        // (tracked_before, scanned, refused?)
+        let cases = [
+            (5_000, 0, true),      // an unmounted volume: nothing left
+            (5_000, 100, true),    // a partially populated root
+            (5_000, 500, true),    // exactly at the 90% bar
+            (5_000, 501, false),   // just under it: a big but plausible cleanup
+            (5_000, 4_999, false), // one file deleted
+            (5_000, 5_000, false), // a rename: net zero
+            (5_000, 6_000, false), // the tree grew
+            (49, 0, false),        // a trivial tree, wiped by hand
+            (60, 0, true),         // non-trivial, wiped
+        ];
+        for (before, scanned, refused) in cases {
+            let got = ctx.guard_mass_delete(before, scanned);
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "guard_mass_delete({before}, {scanned}) = {got:?}"
+            );
         }
     }
 }

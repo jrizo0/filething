@@ -64,6 +64,33 @@ export const createAuth = (ctx: GenericCtx<DataModel>) => {
       // create the owner's account(s), then unset it.
       disableSignUp: !isTruthyEnv(process.env.FILETHING_ALLOW_SIGNUP),
     },
+    // The account password is the ENCRYPTION boundary, not just a login: it is
+    // what gates the escrowed spaceKey / dedupSecret a second Device needs to
+    // decrypt a Space (schema.ts, format.md §6.2). An unthrottled
+    // /sign-in/email is therefore a guessing oracle against the Space keys, so
+    // it must be throttled. Better Auth ships the throttle — we only have to
+    // turn it on: `enabled` defaults to `isProduction`, which reads NODE_ENV,
+    // and Convex does not set NODE_ENV, so on a real deployment it defaulted
+    // OFF.
+    rateLimit: {
+      enabled: true,
+      // "memory" (the default) is per-isolate: Convex serves HTTP actions from
+      // isolates that are recycled and not shared, so a memory counter is both
+      // lossy and trivially outrun. The Better Auth component ships a
+      // `rateLimit` table for exactly this.
+      storage: "database",
+      customRules: {
+        // Tighter than the library's default rule for these paths (3 per 10s),
+        // which bounds a burst but leaves sustained guessing wide open. Keyed
+        // per client IP where one can be resolved; where it cannot, Better Auth
+        // falls back to ONE shared bucket per path — hence a window short
+        // enough (60s) that a shared bucket recovers on its own instead of
+        // locking every Device out.
+        "/sign-in/email": { window: 60, max: 5 },
+        // Sign-up is a rare, operator-driven event (see disableSignUp above).
+        "/sign-up/email": { window: 3600, max: 5 },
+      },
+    },
     plugins: [convex({ authConfig })],
   });
 };

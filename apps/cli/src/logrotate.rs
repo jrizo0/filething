@@ -15,10 +15,14 @@
 //! [`SharedRotatingWriter`] wraps it in an `Arc<Mutex<…>>` and implements
 //! `tracing_subscriber::fmt::MakeWriter`, so the daemon's fmt subscriber can write
 //! through it directly.
+//!
+//! [`rotate_if_oversized`] applies the same generation scheme to a log this
+//! process does NOT hold open — `daemon.err.log`, which the SUPERVISOR writes
+//! (`crate::service`) and which had no bound at all.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// A file writer that rotates the target path once a write would push it past
@@ -56,17 +60,8 @@ impl RotatingFileWriter {
         })
     }
 
-    /// `self.path` with `.{n}` appended, e.g. `daemon.log` → `daemon.log.1`.
-    fn indexed_path(&self, n: usize) -> PathBuf {
-        let mut s = self.path.clone().into_os_string();
-        s.push(format!(".{n}"));
-        PathBuf::from(s)
-    }
-
-    /// Shift the generations down and start a fresh live file: delete the oldest
-    /// backup (`.{keep-1}`), rename `.{i}` → `.{i+1}` down to `live` → `.1`, then
-    /// recreate the live file empty. With `keep == 1` there are no backups, so
-    /// this just removes and recreates the live file (dropping its old contents).
+    /// Shift the generations down and start a fresh live file: see
+    /// [`shift_generations`] for the shift, then recreate the live file empty.
     ///
     /// Returns `Err` on the first IO failure; callers treat that as "keep
     /// appending to the current file" — no data is lost, the file just grows past
@@ -74,43 +69,7 @@ impl RotatingFileWriter {
     fn rotate(&mut self) -> io::Result<()> {
         // Flush anything buffered into the live file before we move it.
         let _ = self.file.flush();
-
-        if self.keep >= 2 {
-            // Drop the oldest backup (missing is fine — first rotations have none).
-            let oldest = self.indexed_path(self.keep - 1);
-            match std::fs::remove_file(&oldest) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            // Shift the surviving backups down: .{i} -> .{i+1}, highest first.
-            for i in (1..self.keep - 1).rev() {
-                let from = self.indexed_path(i);
-                if from.exists() {
-                    std::fs::rename(&from, self.indexed_path(i + 1))?;
-                }
-            }
-            // The live file becomes .1. A missing live file is fine (someone
-            // deleted it externally while we held the old inode open): skip the
-            // rename and just recreate it below — otherwise this rotation would
-            // fail `NotFound` forever and the daemon would keep appending to the
-            // deleted, invisible inode.
-            match std::fs::rename(&self.path, self.indexed_path(1)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        } else {
-            // keep == 1: no backups — drop the old contents so the fresh open
-            // below starts an empty file. (append+truncate is an invalid
-            // OpenOptions combination, so remove instead of truncating.)
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-
+        shift_generations(&self.path, self.keep)?;
         // Fresh, empty live file (the path is gone by now in every branch), in
         // append mode like the initial open.
         self.file = OpenOptions::new()
@@ -119,6 +78,78 @@ impl RotatingFileWriter {
             .open(&self.path)?;
         self.current_size = 0;
         Ok(())
+    }
+}
+
+/// `path` with `.{n}` appended, e.g. `daemon.log` → `daemon.log.1`.
+fn indexed_path(path: &Path, n: usize) -> PathBuf {
+    let mut s = path.to_path_buf().into_os_string();
+    s.push(format!(".{n}"));
+    PathBuf::from(s)
+}
+
+/// Shift the generations of `path` down, leaving `path` itself GONE: delete the
+/// oldest backup (`.{keep-1}`), rename `.{i}` → `.{i+1}` down to `live` → `.1`.
+/// With `keep == 1` there are no backups, so the live file is simply removed
+/// (dropping its contents).
+///
+/// Shared by [`RotatingFileWriter::rotate`] (which then reopens the live path) and
+/// [`rotate_if_oversized`] (which leaves recreating it to whoever writes it next).
+fn shift_generations(path: &Path, keep: usize) -> io::Result<()> {
+    let keep = keep.max(1);
+    if keep >= 2 {
+        // Drop the oldest backup (missing is fine — first rotations have none).
+        match std::fs::remove_file(indexed_path(path, keep - 1)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        // Shift the surviving backups down: .{i} -> .{i+1}, highest first.
+        for i in (1..keep - 1).rev() {
+            let from = indexed_path(path, i);
+            if from.exists() {
+                std::fs::rename(&from, indexed_path(path, i + 1))?;
+            }
+        }
+        // The live file becomes .1. A missing live file is fine (someone deleted
+        // it externally while we held the old inode open): skip the rename —
+        // otherwise this rotation would fail `NotFound` forever and the daemon
+        // would keep appending to the deleted, invisible inode.
+        match std::fs::rename(path, indexed_path(path, 1)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        // keep == 1: no backups — drop the old contents. (append+truncate is an
+        // invalid OpenOptions combination, so remove instead of truncating.)
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Rotates `path` — same generation scheme as [`RotatingFileWriter`] — when it is
+/// already larger than `max_bytes`. Returns whether it rotated.
+///
+/// For a log THIS process does not write: `daemon.err.log`, whose writer is
+/// launchd itself (`crate::service`). Nothing is recreated, because the next
+/// writer opens it `O_CREAT`; callers must therefore only call this at a moment
+/// the writer will reopen the path (service install/restart), or a live writer
+/// would keep appending to the renamed inode.
+pub fn rotate_if_oversized(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > max_bytes => {
+            shift_generations(path, keep)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        // Not there yet (no crash has ever written to it) — nothing to rotate.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -186,11 +217,9 @@ mod tests {
         s
     }
 
-    /// Test-only helper mirroring [`RotatingFileWriter::indexed_path`] for assertions.
+    /// Shorthand for the generation paths the assertions below check.
     fn indexed(path: &std::path::Path, n: usize) -> PathBuf {
-        let mut s = path.to_path_buf().into_os_string();
-        s.push(format!(".{n}"));
-        PathBuf::from(s)
+        indexed_path(path, n)
     }
 
     /// Writes that stay under the limit all land in the live file; no backups appear.
@@ -276,6 +305,50 @@ mod tests {
         w.flush().unwrap();
         assert_eq!(read(&indexed(&path, 1)), "oversized-line");
         assert_eq!(read(&path), "next");
+    }
+
+    /// The supervisor-owned log (`daemon.err.log`) had no bound at all: rotating a
+    /// file this process does not hold open must move it aside once it is over the
+    /// limit, keeping the previous generation.
+    #[test]
+    fn rotate_if_oversized_moves_an_over_limit_file_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.err.log");
+        std::fs::write(&path, b"panicked at 'boom'\n").unwrap();
+        assert!(rotate_if_oversized(&path, 4, 2).unwrap());
+        assert_eq!(read(&indexed(&path, 1)), "panicked at 'boom'\n");
+        // Deliberately NOT recreated: launchd reopens it with O_CREAT on the next
+        // (re)start, which is the only moment this is called.
+        assert!(!path.exists());
+    }
+
+    /// A file at or under the limit is left alone, and a missing one is not an
+    /// error — `install`/`restart` call this unconditionally, including on a Device
+    /// where the daemon has never crashed.
+    #[test]
+    fn rotate_if_oversized_leaves_small_and_missing_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.err.log");
+        assert!(!rotate_if_oversized(&path, 10, 2).unwrap(), "missing file");
+        std::fs::write(&path, b"tiny").unwrap(); // exactly 4 bytes, limit 4
+        assert!(!rotate_if_oversized(&path, 4, 2).unwrap(), "at the limit");
+        assert_eq!(read(&path), "tiny");
+        assert!(!indexed(&path, 1).exists());
+    }
+
+    /// Repeated rotations keep exactly `keep` generations, so the err log cannot
+    /// grow without bound across a long crash-loop.
+    #[test]
+    fn rotate_if_oversized_keeps_only_the_requested_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.err.log");
+        for generation in ["g0", "g1", "g2"] {
+            std::fs::write(&path, format!("{generation}-oversized")).unwrap();
+            assert!(rotate_if_oversized(&path, 4, 2).unwrap());
+        }
+        // keep = 2 ⇒ live (absent, awaiting the next write) + .1 only.
+        assert_eq!(read(&indexed(&path, 1)), "g2-oversized");
+        assert!(!indexed(&path, 2).exists());
     }
 
     /// REGRESSION: if the live file is deleted externally while the writer holds

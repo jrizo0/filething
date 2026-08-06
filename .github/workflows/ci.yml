@@ -12,6 +12,8 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # Rust workspace: format, lint (clippy as hard errors), test.
+  # `--locked` everywhere: without it cargo is free to update Cargo.lock in the
+  # runner, so CI would be testing dependency versions nobody committed.
   # ---------------------------------------------------------------------------
   rust:
     name: Rust (fmt + clippy + test)
@@ -31,10 +33,86 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerabilities (RustSec advisory DB) against the committed
+  # Cargo.lock. Separate job so an advisory published upstream fails the build
+  # loudly instead of hiding behind a green test run.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Rust deps (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Reads Cargo.lock; exits non-zero on any vulnerability. Unmaintained /
+      # yanked crates stay warnings on purpose — an unmaintained transitive dep
+      # is not a reason to block a release.
+      #
+      # The three ignores are all rustls-webpki 0.101.7, which arrives ONLY as
+      # `aws-smithy-http-client -> rustls 0.21` under aws-config/aws-sdk-s3
+      # (`cargo tree -i rustls@0.21.12`). We cannot bump it from here — it needs
+      # the AWS SDK to drop its rustls-0.21 path, or ft-vault to stop pulling that
+      # TLS feature — and all three are CRL-parsing bugs in code this workspace
+      # never calls. They are listed explicitly so a NEW advisory still fails the
+      # job; drop them the moment the dep moves. Ignored advisories are still
+      # printed in the log.
+      - name: cargo audit
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning. A real CONVEX_SELF_HOSTED_ADMIN_KEY was once committed in a
+  # diary transcript (diary/2026-06-25.md), which the Rust/TS jobs cannot see:
+  # the risky files here are PROSE. Scans the checked-out tree (not history — the
+  # already-leaked commit is in it and rewriting history is the owner's call), so
+  # the gate is "nothing reaches HEAD with a secret in it".
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release binary + its published checksum, rather than the marketplace
+      # action: pinned by version AND content, and no license key needed.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        # Unpacked into RUNNER_TEMP, not the workspace — the scan below walks the
+        # checkout and has no business finding the scanner in it.
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          cd "$RUNNER_TEMP"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          ./gitleaks version
+
+      # Rules + allowlist live in .gitleaks.toml, which gitleaks picks up from the
+      # scanned path, so a local run reproduces this exactly. Exits 1 on a finding.
+      - name: gitleaks dir
+        run: |
+          "${RUNNER_TEMP}/gitleaks" dir . --no-banner --redact --exit-code 1 --verbose
 
   # ---------------------------------------------------------------------------
   # Convex backend (Coordinator): install deps + typecheck the schema/functions.
@@ -55,3 +133,11 @@ jobs:
 
       - name: tsc --noEmit
         run: bun run --cwd packages/backend typecheck
+
+      # The handler tests (authorization, byte-length validation, the GC's
+      # revision-window bound) run against the in-memory ctx stub, so they need no
+      # deployment. `bun test` reports "0 tests" because the checks are plain
+      # top-level asserts rather than `bun:test` cases — it still exits non-zero
+      # when one throws, which is what gates the build.
+      - name: bun test (backend handlers)
+        run: bun run --cwd packages/backend test

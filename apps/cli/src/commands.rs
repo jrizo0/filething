@@ -6,6 +6,7 @@
 //! ([`crate::env`]), open the Space's local index, drive a `SpaceContext`, and
 //! print a clear result.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use anyhow::Context as _;
 use convex::ConvexClient;
 use ft_core::SpaceCrypto;
 use ft_engine::{
-    AccountId, CommitOutcome, DeviceId, GcOptions, PullOutcome, SpaceContext, SpaceId, SyncMetrics,
+    AccountId, CommitOutcome, DeviceId, EngineError, GcOptions, GcReport, PullOutcome,
+    SpaceContext, SpaceId, SyncMetrics,
 };
 use futures::future::LocalBoxFuture;
 
@@ -22,13 +24,77 @@ use crate::credentials::{self, Credentials};
 use crate::service::ServiceAction;
 use crate::{auth, env};
 
-/// A reasonable default Device name when `--name` is omitted: the machine
-/// hostname, else a generic label.
+/// Pre-approves every confirmation prompt in this run — the scriptable twin of a
+/// `--yes`/`--force` flag, following the same pattern as `--no-daemon` and its
+/// `FILETHING_NO_AUTO_DAEMON` twin. Set to yes per [`env::env_flag_enabled`], so
+/// `=0`/`false`/`no`/`off` deny instead of approving.
+const ENV_ASSUME_YES: &str = "FILETHING_YES";
+
+/// A reasonable default Device name when `--name` is omitted: this machine's real
+/// hostname.
+///
+/// `auth:ensureDevice` keys Devices BY NAME, so a name that is not per-machine
+/// silently MERGES two machines into one Device record — which makes the retention
+/// floor (`min(baseSeqInUse)`) describe the wrong Device and makes both machines
+/// write colliding conflict-copy names (`§10`, they embed the Device name).
+/// `$HOSTNAME` cannot carry that weight on its own: it is a SHELL variable, not
+/// part of the environment on macOS or under launchd/systemd, so relying on it
+/// named nearly every Device the same constant. It is still honored when
+/// explicitly exported (a container/CI that names the box that way); otherwise the
+/// name comes from `gethostname(2)`.
 fn default_device_name() -> String {
-    std::env::var("HOSTNAME")
+    let from_env = std::env::var("HOSTNAME")
         .ok()
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "filething-device".to_string())
+        .and_then(|h| clean_hostname(&h));
+    let from_os = machine_hostname();
+    device_name_from(from_env.as_deref(), from_os.as_deref())
+}
+
+/// The pure resolver behind [`default_device_name`]. The last resort is UNIQUE
+/// rather than a shared constant: a duplicate Device record is recoverable, two
+/// machines merged into one is not.
+fn device_name_from(env_hostname: Option<&str>, machine_hostname: Option<&str>) -> String {
+    if let Some(h) = env_hostname {
+        return h.to_string();
+    }
+    if let Some(h) = machine_hostname {
+        return h.to_string();
+    }
+    format!(
+        "filething-device-{}",
+        hex::encode(&credentials::generate_secret()[..4])
+    )
+}
+
+/// This machine's hostname via `gethostname(2)` — the value `$HOSTNAME` fails to
+/// expose outside an interactive shell. `None` if the call fails or yields nothing
+/// usable.
+fn machine_hostname() -> Option<String> {
+    // Declared here instead of taking a `libc`/`hostname` dependency, mirroring how
+    // `ft_engine`'s per-Space lock declares `flock(2)`: filething ships for macOS
+    // and Linux only, both expose `gethostname` from the libc every Rust binary
+    // already links, and the signature is identical on the two.
+    extern "C" {
+        fn gethostname(name: *mut std::os::raw::c_char, len: usize) -> std::os::raw::c_int;
+    }
+    // POSIX guarantees HOST_NAME_MAX >= 255; the extra byte is for the NUL.
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a live, writable allocation of exactly `buf.len()` bytes and
+    // `gethostname` writes at most that many into it.
+    if unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    // Truncation is not reported as an error on every platform, so a name that
+    // filled the buffer with no NUL is treated as untrustworthy rather than cut.
+    let nul = buf.iter().position(|b| *b == 0)?;
+    clean_hostname(&String::from_utf8_lossy(&buf[..nul]))
+}
+
+/// Normalizes a hostname for use as a Device name: trims surrounding whitespace
+/// and the trailing dot of a fully-qualified name. `None` when nothing is left.
+fn clean_hostname(raw: &str) -> Option<String> {
+    let h = raw.trim().trim_end_matches('.');
+    (!h.is_empty()).then(|| h.to_string())
 }
 
 /// `login` — authenticate this Device and register it (`docs/adr/0014`).
@@ -41,10 +107,23 @@ fn default_device_name() -> String {
 /// `config.json`; the session token + `dedup_secret` land in `credentials.json`
 /// (`0600`). The password comes from `$FILETHING_PASSWORD` or an interactive
 /// prompt.
+///
+/// Logging in as a DIFFERENT Account than the one already stored is a REBIND and is
+/// confirmed first — see [`confirm_account_rebind`].
 pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow::Result<()> {
     let url = env::coordinator_url_from_env();
     let base = auth::auth_base_url(&url)?;
     let device_name = name.clone().unwrap_or_else(default_device_name);
+
+    // (0) Rebind check, BEFORE the password prompt so a mistyped email costs the
+    // user nothing. The by-id counterpart runs after `ensureDevice` below.
+    let config = Config::load()?;
+    let mut rebind_confirmed = false;
+    if let Some(from) = config.email.clone().filter(|e| rebinds_account(e, &email)) {
+        confirm_account_rebind(&config, &from, &email)?;
+        rebind_confirmed = true;
+    }
+
     let password = read_password()?;
 
     // (1) Better Auth: signup or login → a session token.
@@ -81,7 +160,28 @@ pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow:
         .await
         .context("auth:ensureDevice")?;
 
+    // The same rebind caught by ID instead of email: the SAME email in a
+    // re-deployed Coordinator is a DIFFERENT Account document, and the Spaces
+    // mapped here break identically. Skipped if the email check already asked.
+    if !rebind_confirmed {
+        if let Some(from) = config
+            .account_id
+            .clone()
+            .filter(|a| rebinds_account(a, ensured.account_id.as_str()))
+        {
+            confirm_account_rebind(&config, &from, ensured.account_id.as_str())?;
+        }
+    }
+
     // (4) Persist: identity in config.json, secrets in credentials.json (0600).
+    //
+    // RE-LOADED first: the snapshot taken in (0) predates the password prompt (a
+    // human typing, unbounded) and the network round-trips above, so saving it
+    // would write back the config as it was minutes ago and silently undo any
+    // `init`/`clone`/`unmap` run meanwhile in another terminal. Only the identity
+    // fields set below belong to this command; everything else must come from the
+    // file as it is NOW. The rebind check keeps using the (0) snapshot on purpose:
+    // it must run before the password prompt.
     let mut config = Config::load()?;
     config.set_identity(
         &url,
@@ -111,9 +211,58 @@ pub async fn login(email: String, signup: bool, name: Option<String>) -> anyhow:
     Ok(())
 }
 
+/// Whether `login` would REBIND this Device: it already recorded `stored` and the
+/// incoming identity differs. Compared case-insensitively after trimming, so the
+/// same email typed with different case is not a rebind. Used for both the email
+/// and the Account id.
+fn rebinds_account(stored: &str, incoming: &str) -> bool {
+    !stored.trim().eq_ignore_ascii_case(incoming.trim())
+}
+
+/// Explains what rebinding this Device to another Account does to the Spaces mapped
+/// on it, then asks. Returns `Ok(())` only if the user (or [`ENV_ASSUME_YES`])
+/// approved; otherwise it is an error, so the stored identity is left untouched.
+///
+/// The mappings are the reason this matters: they point at Spaces the NEW Account
+/// does not own, and the Coordinator deliberately cannot distinguish "no such Space"
+/// from "someone else's Space", so every one of them starts failing with the same
+/// opaque "not found or no access" until it is unmapped.
+fn confirm_account_rebind(config: &Config, from: &str, to: &str) -> anyhow::Result<()> {
+    println!("This Device is already logged in as {from}.");
+    if config.spaces.is_empty() {
+        println!("Logging in as {to} replaces that identity (no Space is mapped here).");
+    } else {
+        println!(
+            "Logging in as {to} replaces that identity, but the {} Space(s) mapped here belong to \
+             {from}. {to} cannot read them, so each will start failing with \"Space not found or \
+             no access\" until you `filething unmap` it:",
+            config.spaces.len()
+        );
+        for m in &config.spaces {
+            println!("  {}", m.local_root);
+        }
+        println!(
+            "(To keep both accounts on this machine, give each one its own FILETHING_HOME instead.)"
+        );
+    }
+    if !confirm(&format!("Log in as {to} and rebind this Device?"))? {
+        anyhow::bail!(
+            "aborted: this Device is still logged in as {from} and nothing changed. Re-run with \
+             {ENV_ASSUME_YES}=1 to confirm non-interactively."
+        );
+    }
+    Ok(())
+}
+
 /// Reads the login password from `$FILETHING_PASSWORD` (scripts/CI) or, failing
-/// that, an interactive prompt on stderr. Note: the interactive read is NOT
-/// hidden — prefer the env var for anything scripted.
+/// that, an interactive prompt on stderr.
+///
+/// The interactive read is HIDDEN whenever stdin is a terminal (see [`EchoGuard`]):
+/// this password unlocks the server-escrowed `space_key`/`dedup_secret`, i.e. it is
+/// the encryption boundary (`§4.4`, `§4.5`, `docs/adr/0015`), so it must not survive
+/// in scrollback or in a `script`/tmux capture. A PIPED stdin (`echo pw |
+/// filething login`, CI) is read verbatim exactly as before — there is no terminal
+/// to configure and nothing on screen to hide.
 fn read_password() -> anyhow::Result<String> {
     if let Ok(p) = std::env::var("FILETHING_PASSWORD") {
         if !p.is_empty() {
@@ -123,10 +272,17 @@ fn read_password() -> anyhow::Result<String> {
     use std::io::Write as _;
     eprint!("Password: ");
     std::io::stderr().flush().ok();
+    let hidden = EchoGuard::suppress();
     let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("reading the password from stdin")?;
+    let read = std::io::stdin().read_line(&mut line);
+    // Restore echo BEFORE printing anything else, and close the prompt line
+    // ourselves: with echo off the terminal never echoed the user's Enter.
+    let was_hidden = hidden.is_some();
+    drop(hidden);
+    if was_hidden {
+        eprintln!();
+    }
+    read.context("reading the password from stdin")?;
     let p = line.trim_end_matches(['\n', '\r']).to_string();
     anyhow::ensure!(
         !p.is_empty(),
@@ -135,13 +291,257 @@ fn read_password() -> anyhow::Result<String> {
     Ok(p)
 }
 
+/// What an interactive password read can do about terminal echo.
+#[derive(Debug, PartialEq, Eq)]
+enum EchoPlan {
+    /// Echo is off for the read: the password never reaches the screen.
+    Hidden,
+    /// stdin is not a terminal (a pipe, a file, CI): nothing to hide, read as-is.
+    PipedStdin,
+    /// stdin IS a terminal but echo could not be turned off: read anyway (refusing
+    /// would leave the user unable to log in at all) and WARN, because what they
+    /// type will be visible.
+    EchoUnavailable,
+}
+
+/// Pure decision behind [`EchoGuard::suppress`].
+fn echo_plan(stdin_is_terminal: bool, echo_turned_off: bool) -> EchoPlan {
+    match (stdin_is_terminal, echo_turned_off) {
+        (false, _) => EchoPlan::PipedStdin,
+        (true, true) => EchoPlan::Hidden,
+        (true, false) => EchoPlan::EchoUnavailable,
+    }
+}
+
+/// Terminal echo turned OFF for as long as this guard lives, restored on drop —
+/// including on the error paths, so a failed read never leaves the terminal mute.
+///
+/// Echo is toggled with `stty`, the same shell-out style [`crate::service`] uses
+/// for `launchctl`/`systemctl`/`ps`, rather than a hand-rolled `termios` FFI whose
+/// `struct` layout differs between macOS and Linux — the two platforms filething
+/// ships for, both of which have `stty` in the base system.
+///
+/// `Drop` alone is NOT enough, though: SIGINT (Ctrl-C at the prompt, the obvious
+/// way to back out of typing a password) kills the process outright, so no
+/// destructor runs and the user's SHELL inherits a terminal with echo off —
+/// invisible typing until they blindly run `stty sane`. So the guard also owns a
+/// SIGINT disposition for as long as the prompt is up (see [`SigintRestore`]).
+struct EchoGuard {
+    /// Live only while echo is actually off; restores the previous disposition on
+    /// drop, before this guard turns echo back on.
+    _sigint: SigintRestore,
+}
+
+impl EchoGuard {
+    /// Turns echo off, or returns `None` when there is no terminal to configure
+    /// (piped stdin) or `stty` could not do it (warned about, since the password
+    /// is then visible as typed).
+    fn suppress() -> Option<Self> {
+        let is_terminal = std::io::stdin().is_terminal();
+        // Snapshot the terminal BEFORE `stty -echo`, so the SIGINT handler has
+        // something to put back; it is a no-op when there is no terminal.
+        let sigint = SigintRestore::arm();
+        match echo_plan(is_terminal, is_terminal && set_terminal_echo(false)) {
+            EchoPlan::Hidden => Some(Self { _sigint: sigint }),
+            EchoPlan::PipedStdin => None,
+            EchoPlan::EchoUnavailable => {
+                eprintln!(
+                    "\nwarning: could not turn off terminal echo (`stty` unavailable) — what you \
+                     type WILL be visible. Set FILETHING_PASSWORD instead if that matters."
+                );
+                eprint!("Password: ");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        set_terminal_echo(true);
+    }
+}
+
+/// `SIGINT` handled, for as long as this value lives, by putting the terminal back
+/// the way it was and then dying the way the shell expects (128 + SIGINT = 130).
+///
+/// It exists ONLY for the hidden password prompt: with echo off, the default SIGINT
+/// disposition (terminate immediately, no destructors) is what leaves the user's
+/// shell mute. Everywhere else filething keeps the default disposition, so this is
+/// armed for the prompt and disarmed right after.
+///
+/// The handler restores with `tcsetattr(3)` rather than the `stty` shell-out used
+/// elsewhere: a signal handler may only call async-signal-safe functions, and
+/// fork/exec-ing a child from one is not that. The `termios` layout still is not
+/// hard-coded — it is captured verbatim by `tcgetattr` into an oversized opaque
+/// buffer and handed straight back — so the macOS/Linux difference stays the
+/// libc's problem.
+struct SigintRestore {
+    /// The disposition replaced by [`SigintRestore::arm`], or `None` when nothing
+    /// was installed (no terminal, or `tcgetattr` failed).
+    previous: Option<usize>,
+}
+
+/// POSIX bits used by the SIGINT path. Declared here instead of taking a `libc`
+/// dependency, exactly like [`machine_hostname`]'s `gethostname`: filething ships
+/// for macOS and Linux only and both agree on these.
+mod sigint_ffi {
+    use std::os::raw::{c_int, c_void};
+
+    pub const SIGINT: c_int = 2;
+    pub const SIG_DFL: usize = 0;
+    pub const SIG_ERR: usize = usize::MAX;
+    pub const TCSANOW: c_int = 0;
+    pub const STDIN_FILENO: c_int = 0;
+
+    extern "C" {
+        pub fn tcgetattr(fd: c_int, termios_p: *mut c_void) -> c_int;
+        pub fn tcsetattr(fd: c_int, optional_actions: c_int, termios_p: *const c_void) -> c_int;
+        /// `sighandler_t` is a function pointer; it is passed and returned here as
+        /// the pointer-sized integer it is so `SIG_DFL`/`SIG_ERR` stay writable.
+        pub fn signal(signum: c_int, handler: usize) -> usize;
+        pub fn raise(sig: c_int) -> c_int;
+    }
+}
+
+/// The terminal state captured before echo was turned off, for the signal handler
+/// to hand back. Oversized on purpose: `struct termios` is ~72 bytes at most on the
+/// supported platforms and its contents are never inspected here.
+static mut SAVED_TERMIOS: [u64; 32] = [0; 32];
+/// Whether [`SAVED_TERMIOS`] holds a real capture the handler may restore.
+static TERMIOS_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Puts the terminal back as it was and re-raises `SIGINT` with the default
+/// disposition, so the process dies from the signal and the shell reports the
+/// conventional 130 instead of a normal exit.
+extern "C" fn restore_terminal_on_sigint(sig: std::os::raw::c_int) {
+    use std::sync::atomic::Ordering;
+    if TERMIOS_SAVED.load(Ordering::SeqCst) {
+        // SAFETY: async-signal-safe call; the pointer is a live static of at least
+        // `sizeof(struct termios)` bytes filled by `tcgetattr` in `arm()`, and the
+        // handler is only installed after that capture succeeded.
+        unsafe {
+            sigint_ffi::tcsetattr(
+                sigint_ffi::STDIN_FILENO,
+                sigint_ffi::TCSANOW,
+                std::ptr::addr_of!(SAVED_TERMIOS).cast(),
+            );
+        }
+    }
+    // SAFETY: `signal`/`raise` are async-signal-safe.
+    unsafe {
+        sigint_ffi::signal(sig, sigint_ffi::SIG_DFL);
+        sigint_ffi::raise(sig);
+    }
+}
+
+impl SigintRestore {
+    /// Captures the current terminal state and installs the handler. A no-op (and
+    /// harmless) when stdin is not a terminal or the capture fails: the prompt then
+    /// has nothing to restore anyway.
+    fn arm() -> Self {
+        use std::sync::atomic::Ordering;
+        // SAFETY: `tcgetattr` writes at most `sizeof(struct termios)` bytes, far
+        // less than the buffer; nothing else touches it while the prompt is up
+        // (the CLI reads the password on one thread, before any daemon starts).
+        let captured = unsafe {
+            sigint_ffi::tcgetattr(
+                sigint_ffi::STDIN_FILENO,
+                std::ptr::addr_of_mut!(SAVED_TERMIOS).cast(),
+            ) == 0
+        };
+        TERMIOS_SAVED.store(captured, Ordering::SeqCst);
+        if !captured {
+            return Self { previous: None };
+        }
+        // SAFETY: installing a disposition for one signal; the handler is `extern
+        // "C"` and async-signal-safe.
+        let handler = restore_terminal_on_sigint as *const () as usize;
+        let previous = unsafe { sigint_ffi::signal(sigint_ffi::SIGINT, handler) };
+        Self {
+            previous: (previous != sigint_ffi::SIG_ERR).then_some(previous),
+        }
+    }
+}
+
+impl Drop for SigintRestore {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(previous) = self.previous.take() {
+            // SAFETY: same call as in `arm`, putting back what it replaced.
+            unsafe { sigint_ffi::signal(sigint_ffi::SIGINT, previous) };
+        }
+        TERMIOS_SAVED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Turns the controlling terminal's echo on/off via `stty`, which reads the
+/// terminal from its INHERITED stdin — the same one we are about to read the
+/// password from. Returns whether it worked.
+fn set_terminal_echo(on: bool) -> bool {
+    std::process::Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Asks a yes/no question on stderr and reads the answer from stdin, for the
+/// commands that would otherwise do something destructive or surprising in
+/// silence.
+///
+/// `true` only on an explicit `y`/`yes`. A NON-TTY stdin (a script, CI, the
+/// daemon) has nobody to answer, so it never blocks: it returns `false` and the
+/// caller must refuse, naming [`ENV_ASSUME_YES`] as the non-interactive
+/// pre-approval.
+fn confirm(question: &str) -> anyhow::Result<bool> {
+    if assume_yes() {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    use std::io::Write as _;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading the confirmation from stdin")?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+/// Whether [`ENV_ASSUME_YES`] pre-approved this run's confirmations. `=0`/`false`/
+/// `no`/`off` mean NO — see [`env::env_flag_enabled`].
+fn assume_yes() -> bool {
+    env::env_flag_enabled(ENV_ASSUME_YES)
+}
+
 /// Loads the paired identity from the config, erroring with a `login` hint if the
 /// Device has not logged in yet. Returns `(coordinator_url, account, device)`.
+///
+/// The STORED Coordinator URL WINS over the environment once `login` has run, and
+/// that is deliberate: the account/device ids in the config are documents of THAT
+/// deployment and mean nothing in another one, so following a stray `CONVEX_URL`
+/// here would turn every command into "Space not found or no access". A `CONVEX_URL`
+/// / `CONVEX_SELF_HOSTED_URL` explicitly set to something ELSE used to be ignored in
+/// complete silence, which is the surprising half — so it is reported, with the two
+/// ways out.
 fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, DeviceId)> {
     let url = config
         .coordinator_url
         .clone()
         .unwrap_or_else(env::coordinator_url_from_env);
+    if let Some(warning) = coordinator_url_mismatch(
+        config.coordinator_url.as_deref(),
+        explicit_env_coordinator_url().as_deref(),
+    ) {
+        eprintln!("{warning}");
+    }
     let account_id = config
         .account_id
         .clone()
@@ -151,6 +551,30 @@ fn require_identity(config: &Config) -> anyhow::Result<(String, AccountId, Devic
         .clone()
         .ok_or_else(|| anyhow::anyhow!("not logged in yet — run `filething login` first"))?;
     Ok((url, AccountId::new(account_id), DeviceId::new(device_id)))
+}
+
+/// The Coordinator URL as EXPLICITLY set in the environment. The two names are
+/// repeated from [`env::coordinator_url_from_env`] on purpose: that helper folds in
+/// the baked-in build default and the localhost fallback, and only a URL the user
+/// really set is worth warning about.
+fn explicit_env_coordinator_url() -> Option<String> {
+    ["CONVEX_URL", "CONVEX_SELF_HOSTED_URL"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
+/// The warning for a stored-vs-environment Coordinator URL disagreement, or `None`
+/// when they agree (a trailing slash is not a disagreement) or nothing is set.
+fn coordinator_url_mismatch(stored: Option<&str>, env_url: Option<&str>) -> Option<String> {
+    let (stored, env_url) = (stored?, env_url?);
+    if stored.trim_end_matches('/') == env_url.trim_end_matches('/') {
+        return None;
+    }
+    Some(format!(
+        "warning: CONVEX_URL points at {env_url}, but this Device is logged in against {stored}, \
+         which WINS — the stored account/device ids only exist there. Run `filething login` to \
+         move this Device to {env_url}, or unset the variable."
+    ))
 }
 
 /// Loads this Device's secrets, erroring with a `login` hint when absent. Used by
@@ -239,6 +663,61 @@ pub fn unmap(dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why `root` may NOT become (or contain) a Space, or `None` when it is free.
+///
+/// Nesting is refused in BOTH directions, because two engines over one file tree
+/// fight: each sees the other's writes as local edits and each materializes into
+/// the other's root, so both Spaces end up with a mixture of the two trees plus
+/// conflict copies. Refused cases:
+///
+/// - an ANCESTOR of `root` is a Space root (`root` would live inside it);
+/// - a DESCENDANT of `root` is a mapped Space root (it would live inside `root`).
+///
+/// Ancestors are also probed on disk, so a Space whose mapping this config lost
+/// still counts (an unreadable index is NOT evidence of a Space — a guard must not
+/// make `init` fail because of an unrelated folder). Descendants come from the
+/// config alone: walking the whole subtree looking for a stray control dir would
+/// re-scan the tree just to answer a guard.
+fn nested_space_conflict(root: &Path, config: &Config) -> Option<String> {
+    for ancestor in root.ancestors().skip(1) {
+        let id = config
+            .spaces
+            .iter()
+            .find(|m| Path::new(&m.local_root) == ancestor)
+            .map(|m| m.space_id.clone())
+            .or_else(|| {
+                env::existing_space_id_at(ancestor)
+                    .unwrap_or(None)
+                    .map(|id| id.as_str().to_string())
+            });
+        if let Some(id) = id {
+            return Some(format!(
+                "{} is INSIDE {}, which is already a filething Space ({id}) — nesting Spaces makes \
+                 two engines sync the same files and overwrite each other. Pick a folder outside \
+                 it, or run `filething unmap {}` first.",
+                root.display(),
+                ancestor.display(),
+                ancestor.display()
+            ));
+        }
+    }
+    for m in &config.spaces {
+        let mapped = Path::new(&m.local_root);
+        if mapped != root && mapped.starts_with(root) {
+            return Some(format!(
+                "{} CONTAINS {}, which is already a filething Space ({}) — nesting Spaces makes \
+                 two engines sync the same files and overwrite each other. Pick a folder that does \
+                 not contain it, or run `filething unmap {}` first.",
+                root.display(),
+                mapped.display(),
+                m.space_id,
+                mapped.display()
+            ));
+        }
+    }
+    None
+}
+
 /// `init <dir>` — make a local folder a fresh Space and commit its first Revision
 /// (`docs/BUILD-PLAN.md §3`).
 pub async fn init(dir: PathBuf, name: Option<String>, no_daemon: bool) -> anyhow::Result<()> {
@@ -256,6 +735,9 @@ pub async fn init(dir: PathBuf, name: Option<String>, no_daemon: bool) -> anyhow
              a new backend), delete its .filething/ dir first.",
             root.display()
         );
+    }
+    if let Some(conflict) = nested_space_conflict(&root, &config) {
+        anyhow::bail!("{conflict}");
     }
 
     let space_name = name.unwrap_or_else(|| {
@@ -336,6 +818,16 @@ pub async fn clone(
             root.display()
         );
     }
+    if let Some(conflict) = nested_space_conflict(&root, &config) {
+        anyhow::bail!("{conflict}");
+    }
+    // A non-empty target is ABSORBED into the Space, which must be asked for — see
+    // [`confirm_absorption`]. Listed before `open_index` below, which creates the
+    // control dir this check ignores anyway.
+    let absorbed = absorbable_entries(&root)?;
+    if !absorbed.is_empty() {
+        confirm_absorption(&root, &absorbed, &space_id)?;
+    }
 
     let index = env::open_index(&root)?;
     let (mut coordinator, vault) = env::connect_and_vault(&url, Some(&creds)).await?;
@@ -345,7 +837,7 @@ pub async fn clone(
     // `alg=1` Blocks; a legacy Space has no key (materializes cleartext).
     env::ensure_space_key_cached(&mut coordinator, &space_id, &root).await?;
 
-    let ctx = SpaceContext::clone_space(
+    let mut ctx = SpaceContext::clone_space(
         index,
         vault,
         coordinator,
@@ -374,7 +866,117 @@ pub async fn clone(
         hex32(ctx.last_synced.root.as_bytes())
     );
     println!("  {} path(s) materialized", entries.len());
+    if !absorbed.is_empty() {
+        print_absorption_conflicts(&mut ctx)?;
+    }
     ensure_background_daemon(true, no_daemon);
+    Ok(())
+}
+
+/// The names directly inside `root` that a `clone` would ABSORB into the Space.
+///
+/// Ignores filething's own control dir and the platform junk the engine's scan
+/// discards anyway (its `JUNK_NAMES` — repeated by name because the const is
+/// private): a folder holding only a Finder `.DS_Store` is empty as far as the
+/// Space is concerned, and refusing there would be a pure false alarm on macOS.
+/// A folder that does not exist yet is empty, not an error — `clone` creates it.
+fn absorbable_entries(root: &Path) -> anyhow::Result<Vec<String>> {
+    const IGNORED: [&str; 4] = [env::CONTROL_DIR, ".DS_Store", "Thumbs.db", "desktop.ini"];
+    let read = match std::fs::read_dir(root) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", root.display())),
+    };
+    let mut names = Vec::new();
+    for entry in read {
+        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !IGNORED.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Explains what cloning into a NON-EMPTY folder does, then asks.
+///
+/// Absorption is not a small side effect: the first pull reconciles the head
+/// against an EMPTY base, so every pre-existing path counts as a local change to
+/// upload — and the daemon this command auto-installs commits on startup, which
+/// replicates the whole folder to every other Device of the Account. Colliding
+/// paths lose the real path to the Space's version and survive as conflict copies
+/// (`§10`). `filething clone sp_x ~/Documents`, a plausible typo for
+/// `~/Documents/notes`, does all of that to the user's whole Documents folder,
+/// which is why this is the one place the command stops and asks.
+///
+/// A `--force` flag should short-circuit this check once `main.rs` parses one (see
+/// the handoff note); [`ENV_ASSUME_YES`] is the pre-approval scripts have today.
+fn confirm_absorption(root: &Path, absorbed: &[String], space_id: &SpaceId) -> anyhow::Result<()> {
+    const SHOW: usize = 20;
+    println!(
+        "{} is not empty: it holds {} existing entr{}.",
+        root.display(),
+        absorbed.len(),
+        if absorbed.len() == 1 { "y" } else { "ies" }
+    );
+    for name in absorbed.iter().take(SHOW) {
+        println!("    {name}");
+    }
+    if absorbed.len() > SHOW {
+        println!("    … and {} more", absorbed.len() - SHOW);
+    }
+    println!(
+        "Cloning {space_id} here ABSORBS them into the Space: they will be uploaded and \
+         replicated to every other Device of this account, and anything whose path also exists in \
+         the Space is renamed to a conflict copy (the Space's version wins the real path)."
+    );
+    if !confirm("Absorb this folder into the Space?")? {
+        anyhow::bail!(
+            "aborted: nothing was cloned. Clone into a fresh (empty) folder, or re-run with \
+             {ENV_ASSUME_YES}=1 to absorb {} on purpose.",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Names the conflict copies an absorbing clone left behind.
+///
+/// `clone_space` drops the [`PullOutcome`] of its materializing pull (unlike
+/// `sync`, which prints its own), so a reconcile that renamed the user's files was
+/// invisible. Re-scanning is the cheapest way to recover the list here, and the
+/// index cache written by that same pull keeps it from re-reading file content.
+fn print_absorption_conflicts(ctx: &mut SpaceContext) -> anyhow::Result<()> {
+    const SHOW: usize = 20;
+    let scan = ctx
+        .scan()
+        .context("re-scanning the Space to list its conflict copies")?;
+    let mut copies: Vec<&str> = scan
+        .entries
+        .iter()
+        .map(|(_, entry)| entry.p.as_str())
+        .filter(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p);
+            ft_engine::is_conflict_copy_name(name)
+        })
+        .collect();
+    copies.sort_unstable();
+    if copies.is_empty() {
+        println!("  absorbed this folder's existing files (no path collided with the Space)");
+        return Ok(());
+    }
+    println!(
+        "  {} absorbed path(s) collided and were kept as conflict copies (the Space's version won \
+         the real path):",
+        copies.len()
+    );
+    for p in copies.iter().take(SHOW) {
+        println!("    conflict copy: {p}");
+    }
+    if copies.len() > SHOW {
+        println!("    … and {} more", copies.len() - SHOW);
+    }
     Ok(())
 }
 
@@ -435,16 +1037,30 @@ pub async fn status(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
     // all of them.
     let client = env::connect_client(&url, creds.as_ref()).await.ok();
 
+    // Sampled ONCE per run — each probe shells out to launchctl/systemctl — and
+    // shared by every Space reported below (they are all served by the one service).
+    let installed = crate::service::is_installed();
+    let running = installed && crate::service::is_running();
+
     for (i, root) in roots.iter().enumerate() {
         if i > 0 {
             println!();
         }
+        let watch = DaemonWatch {
+            installed,
+            running,
+            mapped: config
+                .spaces
+                .iter()
+                .any(|m| Path::new(&m.local_root) == root.as_path()),
+        };
         let res = status_one(
             root,
             &account_id,
             &device_id,
             creds.as_ref(),
             client.clone(),
+            &watch,
             verbose,
         )
         .await;
@@ -462,16 +1078,68 @@ pub async fn status(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether anything is actually SYNCING a given Space in the background, as seen
+/// from outside: the OS service's install/run state plus whether this Space is one
+/// of the folders the daemon resolves from `config.json` at startup.
+struct DaemonWatch {
+    /// The unit/plist exists (see `crate::service::is_installed`).
+    installed: bool,
+    /// A live daemon process is running.
+    running: bool,
+    /// This Space is mapped in `config.json`, so a running daemon covers it.
+    mapped: bool,
+}
+
+impl DaemonWatch {
+    /// The `daemon:` line for [`status_one`]. `status` used to describe a perfectly
+    /// healthy Space while NOTHING was syncing it — which reads as "you are backed
+    /// up" — so every state other than "watching" says so plainly and names the
+    /// command that explains it.
+    fn line(&self) -> &'static str {
+        match (self.installed, self.running, self.mapped) {
+            (true, true, true) => "watching this Space (background service running)",
+            (true, true, false) => {
+                "running, but NOT watching this Space — this folder is not mapped in config.json \
+                 (`filething clone`/`init` maps it; `filething sync` syncs it by hand)"
+            }
+            (true, false, _) => {
+                "installed but NOT running — nothing is syncing this Space (`filething service \
+                 status` says why)"
+            }
+            (false, _, _) => {
+                "NOT installed — nothing syncs this Space in the background (`filething service \
+                 install`, or run `filething sync` yourself)"
+            }
+        }
+    }
+}
+
+/// The `encryption:` line for [`status_one`]. `init` prints the Space's state at
+/// creation and nothing showed it afterwards, so a legacy CLEARTEXT Space was
+/// indistinguishable from an `alg=1` one. The cached per-Space escrow key (`§4.5`)
+/// is the local evidence of `alg=1` — the same evidence `env::load_space_crypto`
+/// treats as authoritative.
+fn encryption_line(space_key_cached: bool) -> &'static str {
+    if space_key_cached {
+        "on (alg=1)"
+    } else {
+        "off (cleartext alg=0 — no escrow key cached here; `filething sync` recovers one if the \
+         Space has it)"
+    }
+}
+
 /// Reports one Space for [`status`]: the local synced base + change detection
 /// (offline), then the best-effort remote verdict. Errors only on a genuinely
 /// broken Space (not a Space folder, unreadable index/tree); an unreachable
 /// Coordinator is NOT an error here — it degrades to "remote: unavailable".
+#[allow(clippy::too_many_arguments)]
 async fn status_one(
     root: &Path,
     account_id: &AccountId,
     device_id: &DeviceId,
     creds: Option<&Credentials>,
     client: Option<ConvexClient>,
+    watch: &DaemonWatch,
     verbose: bool,
 ) -> anyhow::Result<()> {
     let space_id = env::space_id_at(root)?;
@@ -503,6 +1171,10 @@ async fn status_one(
 
     println!("Space {space_id}");
     println!("  local: {}", root.display());
+    println!(
+        "  encryption: {}",
+        encryption_line(credentials::read_space_key(root)?.is_some())
+    );
 
     // Local change detection: build the scanned tree's root and compare.
     let scan = ctx.scan().context("scanning the Space")?;
@@ -551,6 +1223,10 @@ async fn status_one(
 
     // The remote verdict (issue #17): up to date / behind by N. Best-effort.
     print_remote_verdict(client, &space_id, &ctx, verbose).await;
+
+    // Everything above can look perfectly healthy while NOTHING is syncing this
+    // Space, so say which it is.
+    println!("  daemon: {}", watch.line());
 
     // If the background daemon has quarantined this Space (issue #8), say so — it
     // explains why sync appears stuck even though the config looks fine.
@@ -717,7 +1393,7 @@ pub async fn sync(dir: PathBuf, no_daemon: bool) -> anyhow::Result<()> {
         device_id,
         space_id.clone(),
     )
-    .context("opening Space")?;
+    .map_err(|e| open_space_error(&root, e))?;
     let crypto = env::load_space_crypto(&root, &space_id, creds.as_ref())?;
     // Refuse to commit an encrypted Space in cleartext if crypto could not be
     // attached (Fix A: e.g. a deploy-key ops fallback with no Device session).
@@ -907,24 +1583,30 @@ pub async fn daemon(dirs: Vec<PathBuf>) -> anyhow::Result<()> {
 /// `gc <dir>` — mark-and-sweep the Space's Vault objects, dry-run by default
 /// (`docs/format.md §6.3`, `docs/adr/0007`). Requires a Coordinator (retained
 /// roots + retention floor). Pass `--apply` to actually delete.
+///
+/// `--apply` is destructive and irreversible, so on a TTY it shows the plan and
+/// asks first ([`ENV_ASSUME_YES`] pre-approves it for scripts). A run that CANNOT
+/// collect anything fails instead of exiting 0, so "gc said nothing" is never
+/// mistaken for "gc ran".
 pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::Result<()> {
     // In the managed deployment this Device holds no direct storage credentials
     // (S3_*); its data plane is the presigned SignedVault, which cannot `list`
     // or `delete` across the bucket, so gc is operator-side only there. Detect
     // that mode UP FRONT — before requiring a login, opening the index, or
     // spending ~5s minting `vault:sign` URLs only to fail on the first `list()`
-    // with a duplicated operator-only error — and stop with a friendly note:
-    // gc is simply not this user's job in a managed deployment (issue #21).
+    // with a duplicated operator-only error (issue #21).
+    //
+    // This is an ERROR, not a friendly note with exit 0: nothing was collected, and
+    // a zero exit told every caller (a user, a cron job, a monitoring script) that a
+    // GC had run when none had.
     if !env::direct_s3_configured() {
-        println!(
-            "gc: in the managed deployment, garbage collection runs on the operator \
-             side; you don't need to run it."
+        anyhow::bail!(
+            "gc did NOT run: it needs direct S3_* storage credentials this Device does not have \
+             (its data plane is the one signed by the Coordinator, and presigned URLs cannot \
+             list or delete across the bucket).\n  \u{2192} In the managed deployment garbage \
+             collection runs on the operator side and you don't need to run it. To run it \
+             yourself, set S3_ENDPOINT / S3_REGION / S3_ACCESS_KEY / S3_SECRET_KEY / S3_BUCKET."
         );
-        println!(
-            "  (gc needs direct S3_* storage credentials this Device does not have; its \
-             data plane is the one signed by the Coordinator.)"
-        );
-        return Ok(());
     }
 
     let config = Config::load()?;
@@ -940,13 +1622,58 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     // gc is operator-only, run it with the direct `S3_*` env vars set.
     let (coordinator, vault) = env::connect_and_vault(&url, creds.as_ref()).await?;
     let mut ctx = SpaceContext::open(index, vault, coordinator, account_id, device_id, space_id)
-        .context("opening Space")?;
+        .map_err(|e| open_space_error(&root, e))?;
 
     let grace = grace_secs
         .map(Duration::from_secs)
         .unwrap_or(ft_engine::DEFAULT_GRACE);
-    let report = ctx.gc(GcOptions { apply, grace }).await.context("gc")?;
+    // The clock-skew allowance keeps its safe default. The max-sweep fraction — the
+    // guard that refuses an `--apply` whose delete set is implausibly large — is
+    // overridable, because the engine's refusal tells the operator to raise it and
+    // a CLI with no way to do that would be a dead end (see [`sweep_fraction_override`]).
+    let opts = |apply: bool| -> anyhow::Result<GcOptions> {
+        let mut opts = GcOptions {
+            apply,
+            grace,
+            ..Default::default()
+        };
+        if let Some(fraction) = sweep_fraction_override()? {
+            opts.max_sweep_fraction = fraction;
+        }
+        Ok(opts)
+    };
 
+    // `--apply` deletes irreversibly, so a human at a terminal sees the PLAN and
+    // approves it before anything goes: a dry run first, then the real sweep. A
+    // script (no TTY) or an explicit pre-approval sweeps in one pass — there is
+    // nobody to ask, and the plan is still printed with the result.
+    if apply && !assume_yes() && std::io::stdin().is_terminal() {
+        let plan = ctx.gc(opts(false)?).await.map_err(gc_error)?;
+        print_gc_report(&plan, &root);
+        if plan.sweepable.is_empty() {
+            println!("nothing to sweep — no objects were deleted.");
+            return Ok(());
+        }
+        if !confirm(&format!(
+            "Delete {} object(s) from the Vault? This cannot be undone.",
+            plan.sweepable.len()
+        ))? {
+            anyhow::bail!(
+                "aborted: nothing was deleted. Re-run with {ENV_ASSUME_YES}=1 to skip this \
+                 confirmation (e.g. from a script)."
+            );
+        }
+    }
+
+    let report = ctx.gc(opts(apply)?).await.map_err(gc_error)?;
+    print_gc_report(&report, &root);
+    Ok(())
+}
+
+/// Prints one [`GcReport`] — the plan in a dry run, the plan plus what it deleted
+/// after an `--apply`.
+fn print_gc_report(report: &GcReport, root: &Path) {
+    const SHOW: usize = 20;
     let mode = if report.applied { "APPLIED" } else { "dry run" };
     println!(
         "GC ({mode}) — account-wide Vault, selected via {}",
@@ -970,7 +1697,6 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
     } else if report.sweepable.is_empty() {
         println!("  nothing to sweep.");
     } else {
-        const SHOW: usize = 20;
         println!(
             "  would delete {} object(s) (re-run with --apply):",
             report.sweepable.len()
@@ -982,7 +1708,64 @@ pub async fn gc(dir: PathBuf, apply: bool, grace_secs: Option<u64>) -> anyhow::R
             println!("    … and {} more", report.sweepable.len() - SHOW);
         }
     }
-    Ok(())
+}
+
+/// Renders a `gc` failure.
+///
+/// An [`EngineError::Refused`] is a SAFETY GUARD declining (no reachability roots,
+/// a Space the login does not own, a delete set too large, a head that moved
+/// mid-sweep). Its message already states what was refused, why, and what to do, so
+/// it is surfaced VERBATIM rather than under a `gc:` context that would read like a
+/// plumbing failure — and, being an `Err`, it can never be mistaken for a
+/// successful empty sweep.
+fn gc_error(err: EngineError) -> anyhow::Error {
+    match err {
+        EngineError::Refused(message) => anyhow::anyhow!("{message}"),
+        other => anyhow::Error::new(other).context("gc"),
+    }
+}
+
+/// The `max_sweep_fraction` override from `$FILETHING_GC_MAX_SWEEP_FRACTION` — the
+/// scriptable twin of a `--max-sweep-fraction` flag (see the handoff note), needed
+/// because the engine's proportion guard tells the operator to raise the threshold
+/// and only `1.0` disables it. A value that does not parse is an ERROR rather than a
+/// silent fall back to the default, and a NaN is rejected outright: the engine maps
+/// NaN back to the default, so accepting one would look like an override that did
+/// nothing.
+fn sweep_fraction_override() -> anyhow::Result<Option<f64>> {
+    const ENV: &str = "FILETHING_GC_MAX_SWEEP_FRACTION";
+    let Some(raw) = std::env::var(ENV).ok().filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let fraction: f64 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("{ENV} must be a fraction between 0 and 1, got {raw:?}"))?;
+    anyhow::ensure!(
+        fraction.is_finite() && (0.0..=1.0).contains(&fraction),
+        "{ENV} must be a fraction between 0 and 1 (1 disables the guard), got {raw:?}"
+    );
+    Ok(Some(fraction))
+}
+
+/// Renders a failure to open a Space for a ONE-SHOT command.
+///
+/// [`EngineError::SpaceLocked`] is not a bug: another process (almost always the
+/// background daemon) holds this Space's `flock(2)`, and the engine fails fast
+/// instead of racing it into a Revision built from a half-applied tree. Its own
+/// message says who holds the lock, so all this adds is what to do about it — under
+/// no `opening Space` context, which would make a normal, expected refusal read like
+/// a broken index.
+fn open_space_error(root: &Path, err: EngineError) -> anyhow::Error {
+    match err {
+        EngineError::SpaceLocked { .. } => anyhow::anyhow!(
+            "{err}\n  \u{2192} the background daemon usually holds it, and it is already syncing \
+             this Space — `filething status {}` shows where it is at. To run one-shot commands \
+             here instead, stop the service (`filething service uninstall`).",
+            root.display()
+        ),
+        other => anyhow::Error::new(other).context("opening Space"),
+    }
 }
 
 /// `metrics [<dir>]` — print the persisted sync counters for a Space (or every
@@ -1193,8 +1976,11 @@ pub async fn update() -> anyhow::Result<()> {
 /// Makes sure the daemon keeps running in the background after a successful
 /// `init`/`clone`/`sync`, so day-to-day use never needs a separate `filething
 /// service install` step (`TODO.md` Fase 6, "daemon por defecto"). ALWAYS
-/// best-effort: any failure is a `tracing::warn!`, never propagated — the command
-/// that called this already succeeded and must not fail because of it.
+/// best-effort: no failure is ever propagated — the command that called this
+/// already succeeded and must not fail because of it. What it does NOT do is stay
+/// quiet: whether the background sync is really running is the user's business, so
+/// the outcome is VERIFIED and reported (see [`report_daemon_state`] /
+/// [`report_daemon_failure`]), with the technical detail left to `tracing::warn!`.
 ///
 /// Skips entirely when `no_daemon` (the `--no-daemon` flag) is set, or when
 /// `FILETHING_NO_AUTO_DAEMON` is a non-empty env var (the integration scripts set
@@ -1223,23 +2009,76 @@ fn ensure_background_daemon(new_space: bool, no_daemon: bool) {
 
     if !crate::service::is_installed() {
         match crate::service::install() {
-            Ok(()) => println!("daemon: running in background (service installed)"),
-            Err(e) => tracing::warn!("could not install the background daemon service: {e:#}"),
+            Ok(()) => report_daemon_state("installed"),
+            Err(e) => report_daemon_failure("install", &e),
         }
         return;
     }
 
     if new_space {
         match crate::service::restart() {
-            Ok(()) => println!("daemon: restarted to pick up the new Space"),
-            Err(e) => tracing::warn!("could not restart the background daemon service: {e:#}"),
+            Ok(()) => report_daemon_state("restarted to pick up the new Space"),
+            Err(e) => report_daemon_failure("restart", &e),
         }
     } else if !crate::service::is_running() {
         match crate::service::restart() {
-            Ok(()) => println!("daemon: running in background (was stopped; restarted)"),
-            Err(e) => tracing::warn!("could not start the background daemon service: {e:#}"),
+            Ok(()) => report_daemon_state("was stopped; restarted"),
+            Err(e) => report_daemon_failure("start", &e),
         }
     }
+}
+
+/// Reports the daemon state after [`ensure_background_daemon`] acted — VERIFIED,
+/// not assumed.
+///
+/// `launchctl load` / `systemctl enable --now` exiting 0 only means the supervisor
+/// accepted the job; the daemon can still fail to come up (a bad env file, a unit
+/// that will not start, no `loginctl enable-linger`). Claiming "running in
+/// background" without checking told the user their files were syncing when
+/// nothing was.
+fn report_daemon_state(what: &str) {
+    if service_came_up() {
+        println!("daemon: running in background ({what})");
+        return;
+    }
+    println!(
+        "daemon: WARNING — the service was {what} but is NOT running, so nothing is syncing in \
+         the background yet."
+    );
+    println!(
+        "  \u{2192} run `filething service status` to see why (it reports the last exit code and \
+         the tail of the daemon log), or `filething sync <dir>` meanwhile."
+    );
+}
+
+/// Reports that a service lifecycle step failed, on stdout as well as in the log:
+/// this is the difference between "your folders keep syncing by themselves" and
+/// "they do not", so it must not depend on the log level in effect.
+fn report_daemon_failure(action: &str, err: &anyhow::Error) {
+    tracing::warn!("could not {action} the background daemon service: {err:#}");
+    println!("daemon: could not {action} the background service ({err})");
+    println!(
+        "  \u{2192} nothing is syncing in the background; run `filething service install` to \
+         retry, or `filething sync <dir>` by hand."
+    );
+}
+
+/// Whether the service actually came up, polling briefly because both supervisors
+/// load asynchronously — `launchctl load` returns before the job is spawned, and a
+/// systemd unit reaches `active` a moment after `enable --now`. Blocking is fine
+/// here: this is the last step of a one-shot command that has nothing left to do.
+fn service_came_up() -> bool {
+    const TRIES: usize = 6;
+    const WAIT: Duration = Duration::from_millis(250);
+    for attempt in 0..TRIES {
+        if crate::service::is_running() {
+            return true;
+        }
+        if attempt + 1 < TRIES {
+            std::thread::sleep(WAIT);
+        }
+    }
+    false
 }
 
 /// Restarts the background daemon after an `unmap` so it stops watching the
@@ -1276,6 +2115,289 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SIGINT disposition is armed only for the duration of the password
+    /// prompt: whatever it replaced must be back once the guard is dropped, or
+    /// Ctrl-C would keep re-raising through this handler for the rest of the run.
+    /// (Under `cargo test` stdin is not a terminal, so `arm` also has to be a
+    /// harmless no-op.)
+    #[test]
+    fn sigint_restore_puts_the_previous_disposition_back() {
+        // SAFETY: single-signal disposition calls; no other test touches SIGINT.
+        unsafe {
+            sigint_ffi::signal(sigint_ffi::SIGINT, sigint_ffi::SIG_DFL);
+            let guard = SigintRestore::arm();
+            drop(guard);
+            let after = sigint_ffi::signal(sigint_ffi::SIGINT, sigint_ffi::SIG_DFL);
+            assert_eq!(after, sigint_ffi::SIG_DFL, "SIGINT was left hooked");
+        }
+        assert!(
+            !TERMIOS_SAVED.load(std::sync::atomic::Ordering::SeqCst),
+            "the saved terminal state must not outlive the prompt"
+        );
+    }
+
+    /// `auth:ensureDevice` keys Devices by NAME, so the default must be this
+    /// machine's real hostname — `$HOSTNAME` is not exported on macOS or under
+    /// launchd/systemd, and falling back to one shared constant merged every
+    /// machine into a single Device record.
+    #[test]
+    fn default_device_name_uses_the_real_hostname_not_a_shared_constant() {
+        let host = machine_hostname().expect("gethostname(2) works on macOS and Linux");
+        assert!(!host.is_empty());
+        assert_ne!(host, "filething-device");
+        // With no exported $HOSTNAME (the normal case) the OS hostname is used…
+        assert_eq!(device_name_from(None, Some(&host)), host);
+        // …and an explicitly exported one still wins over it.
+        assert_eq!(device_name_from(Some("box-7"), Some(&host)), "box-7");
+    }
+
+    /// If NO hostname can be had at all, the generated name must still be unique
+    /// per machine: a duplicate Device record is recoverable, two machines silently
+    /// sharing one is not.
+    #[test]
+    fn device_name_fallback_is_unique_instead_of_a_shared_constant() {
+        let a = device_name_from(None, None);
+        let b = device_name_from(None, None);
+        assert_ne!(a, "filething-device");
+        assert!(a.starts_with("filething-device-"), "unexpected name: {a}");
+        assert_ne!(a, b, "the fallback name must not be a shared constant");
+    }
+
+    /// A hostname is trimmed and loses the trailing dot of an FQDN; nothing usable
+    /// left is `None` (so the caller falls through instead of naming the Device "").
+    #[test]
+    fn clean_hostname_rejects_blank_and_trims_fqdn_dot() {
+        assert_eq!(
+            clean_hostname("  mac.local \n").as_deref(),
+            Some("mac.local")
+        );
+        assert_eq!(
+            clean_hostname("host.example.com.").as_deref(),
+            Some("host.example.com")
+        );
+        assert_eq!(clean_hostname("   "), None);
+        assert_eq!(clean_hostname(""), None);
+    }
+
+    /// The password gates the escrowed `space_key`/`dedup_secret`, so an
+    /// interactive read must be HIDDEN — while the piped-stdin path (CI, `echo pw |
+    /// filething login`) keeps reading verbatim, and a terminal where echo cannot be
+    /// turned off is warned about rather than silently echoing.
+    #[test]
+    fn echo_plan_hides_an_interactive_password_and_keeps_the_piped_path() {
+        assert_eq!(echo_plan(true, true), EchoPlan::Hidden);
+        assert_eq!(echo_plan(false, false), EchoPlan::PipedStdin);
+        assert_eq!(echo_plan(true, false), EchoPlan::EchoUnavailable);
+    }
+
+    /// The clone guard's notion of "not empty": anything the user put there counts,
+    /// filething's own control dir and platform junk do not (refusing on a Finder
+    /// `.DS_Store` would be a pure false alarm), and a folder that does not exist
+    /// yet is empty rather than an error.
+    #[test]
+    fn absorbable_entries_ignores_the_control_dir_and_platform_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(absorbable_entries(&root.join("not-created-yet"))
+            .unwrap()
+            .is_empty());
+        assert!(absorbable_entries(root).unwrap().is_empty());
+
+        std::fs::create_dir_all(root.join(env::CONTROL_DIR)).unwrap();
+        std::fs::write(root.join(".DS_Store"), b"junk").unwrap();
+        assert!(
+            absorbable_entries(root).unwrap().is_empty(),
+            "the control dir and platform junk are not the user's files"
+        );
+
+        std::fs::write(root.join("taxes.pdf"), b"mine").unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        assert_eq!(
+            absorbable_entries(root).unwrap(),
+            vec!["notes".to_string(), "taxes.pdf".to_string()]
+        );
+    }
+
+    /// A Space may be created neither INSIDE an existing Space nor AROUND one: two
+    /// engines over the same files overwrite each other.
+    #[test]
+    fn nested_space_conflict_refuses_both_an_ancestor_and_a_descendant_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let mut config = Config::default();
+        assert!(nested_space_conflict(&inner, &config).is_none());
+
+        // An ancestor is already a Space: refuse, and say which one.
+        config.upsert_space("sp_outer", &outer.to_string_lossy());
+        let msg = nested_space_conflict(&inner, &config).expect("nesting must be refused");
+        assert!(msg.contains("INSIDE"), "unexpected message: {msg}");
+        assert!(msg.contains("sp_outer"), "unexpected message: {msg}");
+
+        // The other direction: the target CONTAINS a mapped Space.
+        let mut config = Config::default();
+        config.upsert_space("sp_inner", &inner.to_string_lossy());
+        let msg = nested_space_conflict(&outer, &config).expect("nesting must be refused");
+        assert!(msg.contains("CONTAINS"), "unexpected message: {msg}");
+        assert!(msg.contains("sp_inner"), "unexpected message: {msg}");
+
+        // The Space's OWN root is not nested inside itself.
+        let mut config = Config::default();
+        config.upsert_space("sp_inner", &inner.to_string_lossy());
+        assert!(nested_space_conflict(&inner, &config).is_none());
+    }
+
+    /// `status` must never imply a Space is being synced when nothing watches it:
+    /// only the fully-healthy combination reads as "watching".
+    #[test]
+    fn daemon_watch_line_only_claims_watching_when_something_actually_is() {
+        let watching = DaemonWatch {
+            installed: true,
+            running: true,
+            mapped: true,
+        };
+        assert!(watching.line().starts_with("watching this Space"));
+
+        for (installed, running, mapped) in [
+            (true, true, false),
+            (true, false, true),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let w = DaemonWatch {
+                installed,
+                running,
+                mapped,
+            };
+            assert!(
+                w.line().contains("NOT"),
+                "({installed},{running},{mapped}) must not read as healthy: {}",
+                w.line()
+            );
+        }
+    }
+
+    /// The encryption state is reported, and the two cases are distinguishable — a
+    /// legacy cleartext Space used to look exactly like an `alg=1` one.
+    #[test]
+    fn encryption_line_distinguishes_alg1_from_a_legacy_cleartext_space() {
+        assert!(encryption_line(true).contains("alg=1"));
+        assert!(encryption_line(false).contains("cleartext"));
+        assert_ne!(encryption_line(true), encryption_line(false));
+    }
+
+    /// A second `login` as a different Account is a REBIND (orphaning the mappings
+    /// of the old one); the same identity re-typed, in any case, is not.
+    #[test]
+    fn rebinds_account_only_when_the_identity_actually_changes() {
+        assert!(rebinds_account("a@example.com", "b@example.com"));
+        assert!(rebinds_account("acc_1", "acc_2"));
+        assert!(!rebinds_account("a@example.com", "a@example.com"));
+        assert!(!rebinds_account("A@Example.com", " a@example.com "));
+    }
+
+    /// An explicitly-set `CONVEX_URL` that disagrees with the stored one is
+    /// REPORTED (it used to be ignored in silence); agreement — trailing slash and
+    /// all — stays quiet, and so does having no config yet.
+    #[test]
+    fn coordinator_url_mismatch_is_reported_instead_of_silently_ignored() {
+        let m = coordinator_url_mismatch(
+            Some("https://stored.convex.cloud"),
+            Some("http://localhost:3210"),
+        )
+        .expect("a disagreement must be reported");
+        assert!(m.contains("localhost:3210"), "unexpected warning: {m}");
+        assert!(m.contains("stored.convex.cloud"), "unexpected warning: {m}");
+        assert!(
+            m.contains("WINS"),
+            "the warning must say which one is used: {m}"
+        );
+
+        assert!(coordinator_url_mismatch(
+            Some("https://x.convex.cloud/"),
+            Some("https://x.convex.cloud")
+        )
+        .is_none());
+        assert!(coordinator_url_mismatch(None, Some("https://x.convex.cloud")).is_none());
+        assert!(coordinator_url_mismatch(Some("https://x.convex.cloud"), None).is_none());
+    }
+
+    /// A gc REFUSAL is a safety guard declining, so its own explanation must reach
+    /// the user intact — not buried under a `gc:` context that reads like plumbing —
+    /// and it must stay an error, never a report that looks like an empty sweep.
+    #[test]
+    fn gc_error_surfaces_a_refusal_verbatim() {
+        let refused = gc_error(EngineError::Refused(
+            "gc: the logged-in Account owns NO Spaces, so the sweep would delete the entire bucket"
+                .to_string(),
+        ));
+        assert_eq!(
+            refused.to_string(),
+            "gc: the logged-in Account owns NO Spaces, so the sweep would delete the entire bucket"
+        );
+        // Anything else keeps its context so the cause chain still reads.
+        let other = gc_error(EngineError::MetaBlob("bad cbor".to_string()));
+        assert_eq!(other.to_string(), "gc");
+        assert!(other.chain().any(|c| c.to_string().contains("bad cbor")));
+    }
+
+    /// The sweep-fraction override parses a real fraction and REJECTS anything else
+    /// instead of silently keeping the default — including a NaN, which the engine
+    /// maps back to the default and which would therefore look like an override
+    /// that did nothing. (Mutates its own env var, like `config`'s tests.)
+    #[test]
+    fn sweep_fraction_override_rejects_anything_that_is_not_a_fraction() {
+        const ENV: &str = "FILETHING_GC_MAX_SWEEP_FRACTION";
+        let saved = std::env::var(ENV).ok();
+        std::env::remove_var(ENV);
+        assert_eq!(sweep_fraction_override().unwrap(), None);
+
+        std::env::set_var(ENV, "0.9");
+        assert_eq!(sweep_fraction_override().unwrap(), Some(0.9));
+        std::env::set_var(ENV, "1");
+        assert_eq!(sweep_fraction_override().unwrap(), Some(1.0));
+        for bad in ["nan", "-0.1", "1.5", "half", "0.5x"] {
+            std::env::set_var(ENV, bad);
+            assert!(
+                sweep_fraction_override().is_err(),
+                "{bad:?} must be rejected, not silently ignored"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(ENV, v),
+            None => std::env::remove_var(ENV),
+        }
+    }
+
+    /// A Space held by another process is an expected refusal with its own clear
+    /// message plus what to do; anything else keeps the `opening Space` context.
+    #[test]
+    fn open_space_error_explains_a_locked_space() {
+        let locked = open_space_error(
+            Path::new("/home/u/proj"),
+            EngineError::SpaceLocked {
+                root: "/home/u/proj".to_string(),
+                holder: "pid 4242".to_string(),
+            },
+        );
+        let msg = locked.to_string();
+        assert!(msg.contains("pid 4242"), "unexpected message: {msg}");
+        assert!(msg.contains("daemon"), "unexpected message: {msg}");
+        assert!(
+            !msg.starts_with("opening Space"),
+            "unexpected message: {msg}"
+        );
+
+        let other = open_space_error(
+            Path::new("/home/u/proj"),
+            EngineError::SpaceState("no row".to_string()),
+        );
+        assert_eq!(other.to_string(), "opening Space");
+    }
 
     /// The examples from issue #18 plus the unit boundaries: below a minute is a
     /// single unit, otherwise the two largest units, dropping a zero lower unit.

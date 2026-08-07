@@ -656,7 +656,9 @@ fn data_plane_id() -> String {
 /// and friends): their non-empty semantics are already documented and scripted
 /// against, and they gate nothing destructive.
 pub fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name).map(|v| flag_is_yes(&v)).unwrap_or(false)
+    std::env::var(name)
+        .map(|v| flag_is_yes(&v))
+        .unwrap_or(false)
 }
 
 /// The pure predicate behind [`env_flag_enabled`], testable without mutating

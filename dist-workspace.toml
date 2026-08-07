@@ -19,6 +19,9 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 # not CARGO_HOME; the installer adds it to PATH via the shell profile).
 install-path = "~/.local/bin"
 # Steps injected into every build job: bakes the managed Coordinator URL.
-github-build-setup = "release-build-setup.yml"
+# Lives in a subdirectory because GitHub parses every top-level file in
+# .github/workflows/ as a workflow and marks this fragment as a failed run on
+# every push; the path is resolved relative to .github/workflows/ by dist.
+github-build-setup = "setup/release-build-setup.yml"
 # Whether to install an updater program
 install-updater = false

@@ -130,6 +130,9 @@ jobs:
       - name: "Bake managed Coordinator URL into the release binary"
         run: "echo \"FILETHING_DEFAULT_CONVEX_URL=https://knowing-giraffe-699.convex.cloud\" >> \"$GITHUB_ENV\""
         shell: "bash"
+      - name: "Verify Cargo.lock is current (release must build what CI tested)"
+        run: "cargo fetch --locked"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
